@@ -1326,7 +1326,6 @@ fn compute_criteria_mask(
         _ => return None,
     };
 
-    let ne_matches_blank = text_kind == 1 && !text_pat.is_empty();
     let pat = StringArray::new_scalar(text_pat);
     let mut bool_parts: Vec<BooleanArray> = Vec::new();
 
@@ -1349,7 +1348,7 @@ fn compute_criteria_mask(
             None => {
                 #[cfg(test)]
                 criteria_mask_test_hooks::inc_all_null();
-                if (text_kind == 0 && empty_special) || ne_matches_blank {
+                if text_kind == 0 && empty_special {
                     // Eq("") treats nulls (Empty) as equal.
                     let mut bb = BooleanBuilder::with_capacity(cs.row_len);
                     bb.append_n(cs.row_len, true);
@@ -1370,7 +1369,7 @@ fn compute_criteria_mask(
             _ => return None,
         };
 
-        if (text_kind == 0 && empty_special) || ne_matches_blank {
+        if text_kind == 0 && empty_special {
             // Treat nulls as equal to empty string
             let mut bb = BooleanBuilder::with_capacity(seg_sa.len());
             for i in 0..seg_sa.len() {
@@ -2345,6 +2344,98 @@ where
 
     pub fn vertex_for_cell(&self, cell: &CellRef) -> Option<VertexId> {
         self.graph.get_vertex_for_cell(cell)
+    }
+
+    /// Get the direct dependents of a cell (cells that reference this cell
+    /// in their formula).
+    ///
+    /// Returns a list of `(sheet_name, row, col)` tuples for each dependent
+    /// cell. Row and col are 1-indexed, matching the formualizer coordinate
+    /// convention. Returns an empty vec if the cell has no dependents or
+    /// doesn't exist in the graph.
+    pub fn get_dependents(&self, sheet: &str, row: u32, col: u32) -> Vec<(String, u32, u32)> {
+        let cell_ref = self.graph.make_cell_ref(sheet, row, col);
+        let Some(vertex) = self.graph.get_vertex_for_cell(&cell_ref) else {
+            return Vec::new();
+        };
+        self.graph
+            .get_dependents(vertex)
+            .into_iter()
+            .filter_map(|v| {
+                let cr = self.graph.get_cell_ref_for_vertex(v)?;
+                let dep_sheet = self.graph.sheet_name(cr.sheet_id).to_string();
+                let coord = self.graph.get_coord(v);
+                Some((dep_sheet, coord.row() + 1, coord.col() + 1))
+            })
+            .collect()
+    }
+
+    /// Get the direct dependencies of a cell (cells that this cell's formula
+    /// references).
+    ///
+    /// Returns a list of `(sheet_name, row, col)` tuples for each dependency.
+    /// Row and col are 1-indexed. Returns empty vec if cell has no formula
+    /// or doesn't exist.
+    pub fn get_dependencies(&self, sheet: &str, row: u32, col: u32) -> Vec<(String, u32, u32)> {
+        let cell_ref = self.graph.make_cell_ref(sheet, row, col);
+        let Some(vertex) = self.graph.get_vertex_for_cell(&cell_ref) else {
+            return Vec::new();
+        };
+        self.graph
+            .get_dependencies(vertex)
+            .into_iter()
+            .filter_map(|v| {
+                let cr = self.graph.get_cell_ref_for_vertex(v)?;
+                let dep_sheet = self.graph.sheet_name(cr.sheet_id).to_string();
+                let coord = self.graph.get_coord(v);
+                Some((dep_sheet, coord.row() + 1, coord.col() + 1))
+            })
+            .collect()
+    }
+
+    /// Get all transitive dependents of a cell (BFS walk through the
+    /// dependency graph).
+    ///
+    /// Returns all cells that directly or indirectly depend on the given
+    /// cell. Useful for determining the full "affected set" when a cell
+    /// value changes. Row and col are 1-indexed. Returns empty vec if
+    /// cell has no dependents.
+    pub fn get_transitive_dependents(
+        &self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+    ) -> Vec<(String, u32, u32)> {
+        let cell_ref = self.graph.make_cell_ref(sheet, row, col);
+        let Some(start_vertex) = self.graph.get_vertex_for_cell(&cell_ref) else {
+            return Vec::new();
+        };
+
+        use std::collections::{HashSet, VecDeque};
+        let mut visited: HashSet<VertexId> = HashSet::new();
+        let mut queue: VecDeque<VertexId> = VecDeque::new();
+        let mut result: Vec<(String, u32, u32)> = Vec::new();
+
+        for dep in self.graph.get_dependents(start_vertex) {
+            if visited.insert(dep) {
+                queue.push_back(dep);
+            }
+        }
+
+        while let Some(vid) = queue.pop_front() {
+            if let Some(cr) = self.graph.get_cell_ref_for_vertex(vid) {
+                let dep_sheet = self.graph.sheet_name(cr.sheet_id).to_string();
+                let coord = self.graph.get_coord(vid);
+                result.push((dep_sheet, coord.row() + 1, coord.col() + 1));
+            }
+            for dep in self.graph.get_dependents(vid) {
+                if visited.insert(dep) {
+                    queue.push_back(dep);
+                }
+            }
+        }
+
+        result
     }
 
     pub fn evaluation_vertices(&self) -> Vec<VertexId> {

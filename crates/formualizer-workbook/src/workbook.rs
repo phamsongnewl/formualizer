@@ -2298,6 +2298,32 @@ impl Workbook {
             .and_then(|(ast, _)| ast.map(|a| formualizer_parse::pretty::canonical_formula(&a)))
     }
 
+    /// Get cells that directly depend on the given cell (cells whose formula
+    /// references it). Returns `(sheet_name, row, col)` tuples with 1-indexed
+    /// coordinates.
+    pub fn get_dependents(&self, sheet: &str, row: u32, col: u32) -> Vec<(String, u32, u32)> {
+        self.engine.get_dependents(sheet, row, col)
+    }
+
+    /// Get cells that the given cell directly depends on (cells referenced by
+    /// its formula). Returns `(sheet_name, row, col)` tuples with 1-indexed
+    /// coordinates.
+    pub fn get_dependencies(&self, sheet: &str, row: u32, col: u32) -> Vec<(String, u32, u32)> {
+        self.engine.get_dependencies(sheet, row, col)
+    }
+
+    /// Get all cells that transitively depend on the given cell (BFS through
+    /// the dependency graph). Returns `(sheet_name, row, col)` tuples with
+    /// 1-indexed coordinates.
+    pub fn get_transitive_dependents(
+        &self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+    ) -> Vec<(String, u32, u32)> {
+        self.engine.get_transitive_dependents(sheet, row, col)
+    }
+
     // Ranges
     pub fn read_range(&self, addr: &RangeAddress) -> Vec<Vec<LiteralValue>> {
         let mut out = Vec::with_capacity(addr.height() as usize);
