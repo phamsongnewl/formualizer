@@ -1576,6 +1576,7 @@ version = "0.8.4"
 dependencies = [
  "calamine",
  "chrono",
+ "criterion",
  "csv",
  "formualizer-common",
  "formualizer-eval",

@@ -2017,12 +2017,23 @@ impl Workbook {
             .sheet_mut(sheet)
             .expect("ArrowSheet must exist");
 
-        // Ensure rows first so nrows is set before inserting columns
+        // On an empty-width sheet, add columns before the rows so later sparse
+        // overlay writes can grow their tail chunks amortized instead of eagerly
+        // creating dense Arrow chunks for every setter call.
+        if asheet.columns.is_empty() {
+            if min_cols > 0 {
+                asheet.insert_columns(0, min_cols);
+            }
+            if min_rows > asheet.nrows as usize {
+                asheet.ensure_row_capacity(min_rows);
+            }
+            return;
+        }
+
+        // Existing columns need their current chunks extended before adding columns.
         if min_rows > asheet.nrows as usize {
             asheet.ensure_row_capacity(min_rows);
         }
-
-        // Then ensure columns - they will get properly sized chunks since nrows is set
         let cur_cols = asheet.columns.len();
         if min_cols > cur_cols {
             asheet.insert_columns(cur_cols, min_cols - cur_cols);
@@ -2030,7 +2041,6 @@ impl Workbook {
     }
 
     fn mirror_value_to_overlay(&mut self, sheet: &str, row: u32, col: u32, value: &LiteralValue) {
-        use formualizer_eval::arrow_store::OverlayValue;
         if !(self.engine.config.arrow_storage_enabled && self.engine.config.delta_overlay_enabled) {
             return;
         }
@@ -2044,42 +2054,51 @@ impl Workbook {
             .sheet_mut(sheet)
             .expect("ArrowSheet must exist");
         if let Some((ch_idx, in_off)) = asheet.chunk_of_row(row0) {
-            let ov = match value {
-                LiteralValue::Empty => OverlayValue::Empty,
-                LiteralValue::Int(i) => OverlayValue::Number(*i as f64),
-                LiteralValue::Number(n) => OverlayValue::Number(*n),
-                LiteralValue::Boolean(b) => OverlayValue::Boolean(*b),
-                LiteralValue::Text(s) => OverlayValue::Text(std::sync::Arc::from(s.clone())),
-                LiteralValue::Error(e) => {
-                    OverlayValue::Error(formualizer_eval::arrow_store::map_error_code(e.kind))
-                }
-                LiteralValue::Date(d) => {
-                    let dt = d.and_hms_opt(0, 0, 0).unwrap();
-                    let serial = formualizer_common::datetime_to_serial_for(date_system, &dt);
-                    OverlayValue::DateTime(serial)
-                }
-                LiteralValue::DateTime(dt) => {
-                    let serial = formualizer_common::datetime_to_serial_for(date_system, dt);
-                    OverlayValue::DateTime(serial)
-                }
-                LiteralValue::Time(t) => {
-                    let serial = formualizer_common::time_to_fraction(t);
-                    OverlayValue::DateTime(serial)
-                }
-                LiteralValue::Duration(d) => {
-                    let serial = d.num_seconds() as f64 / 86_400.0;
-                    OverlayValue::Duration(serial)
-                }
-                LiteralValue::Pending => OverlayValue::Pending,
-                LiteralValue::Array(_) => {
-                    OverlayValue::Error(formualizer_eval::arrow_store::map_error_code(
-                        formualizer_common::ExcelErrorKind::Value,
-                    ))
-                }
-            };
+            let ov = Self::overlay_value_for_literal(value, date_system);
             // Use ensure_column_chunk_mut to lazily create chunk if needed
             if let Some(ch) = asheet.ensure_column_chunk_mut(col0, ch_idx) {
                 ch.overlay.set(in_off, ov);
+            }
+        }
+    }
+
+    fn overlay_value_for_literal(
+        value: &LiteralValue,
+        date_system: formualizer_common::DateSystem,
+    ) -> formualizer_eval::arrow_store::OverlayValue {
+        use formualizer_eval::arrow_store::OverlayValue;
+
+        match value {
+            LiteralValue::Empty => OverlayValue::Empty,
+            LiteralValue::Int(i) => OverlayValue::Number(*i as f64),
+            LiteralValue::Number(n) => OverlayValue::Number(*n),
+            LiteralValue::Boolean(b) => OverlayValue::Boolean(*b),
+            LiteralValue::Text(s) => OverlayValue::Text(std::sync::Arc::from(s.clone())),
+            LiteralValue::Error(e) => {
+                OverlayValue::Error(formualizer_eval::arrow_store::map_error_code(e.kind))
+            }
+            LiteralValue::Date(d) => {
+                let dt = d.and_hms_opt(0, 0, 0).unwrap();
+                let serial = formualizer_common::datetime_to_serial_for(date_system, &dt);
+                OverlayValue::DateTime(serial)
+            }
+            LiteralValue::DateTime(dt) => {
+                let serial = formualizer_common::datetime_to_serial_for(date_system, dt);
+                OverlayValue::DateTime(serial)
+            }
+            LiteralValue::Time(t) => {
+                let serial = formualizer_common::time_to_fraction(t);
+                OverlayValue::DateTime(serial)
+            }
+            LiteralValue::Duration(d) => {
+                let serial = d.num_seconds() as f64 / 86_400.0;
+                OverlayValue::Duration(serial)
+            }
+            LiteralValue::Pending => OverlayValue::Pending,
+            LiteralValue::Array(_) => {
+                OverlayValue::Error(formualizer_eval::arrow_store::map_error_code(
+                    formualizer_common::ExcelErrorKind::Value,
+                ))
             }
         }
     }
@@ -2578,6 +2597,14 @@ impl Workbook {
         start_col: u32,
         rows: &[Vec<LiteralValue>],
     ) -> Result<(), IoError> {
+        #[cfg(feature = "benchmark_internal")]
+        let profile_batch = std::env::var_os("FORMUALIZER_WORKBOOK_PROFILE_BATCH").is_some()
+            && rows.iter().map(Vec::len).sum::<usize>() >= 1_000;
+        #[cfg(feature = "benchmark_internal")]
+        let mut profile_started = profile_batch.then(std::time::Instant::now);
+        #[cfg(feature = "benchmark_internal")]
+        let mut profile_phases = [std::time::Duration::ZERO; 4];
+
         // Pre-allocate the Arrow sheet to the full batch extent ONCE, so the
         // per-cell `mirror_value_to_overlay` → `ensure_row_capacity` → `grow_len_to`
         // (which rebuilds the whole column's type-tag/lanes on every call) is
@@ -2594,6 +2621,8 @@ impl Workbook {
             let end_col = start_col.saturating_add((width - 1) as u32);
             self.ensure_arrow_sheet_capacity(sheet, end_row as usize, end_col as usize);
         }
+        #[cfg(feature = "benchmark_internal")]
+        Self::record_set_values_profile_phase(&mut profile_started, &mut profile_phases, 0);
 
         if self.enable_changelog {
             let sheet_id = self
@@ -2604,19 +2633,23 @@ impl Workbook {
             // Capture old state from Arrow truth BEFORE applying the batch.
             // `staged_before` is the cell's staged formula text prior to the edit,
             // used to record a per-cell staged-formula delta for undo/redo (see #126).
+            let item_capacity = rows
+                .iter()
+                .fold(0usize, |total, row| total.saturating_add(row.len()));
             #[allow(clippy::type_complexity)]
             let mut items: Vec<(
                 u32,
                 u32,
-                LiteralValue,
+                usize,
+                usize,
                 formualizer_eval::reference::CellRef,
                 Option<LiteralValue>,
                 Option<formualizer_parse::ASTNode>,
                 Option<String>,
-            )> = Vec::new();
+            )> = Vec::with_capacity(item_capacity);
             for (ri, rvals) in rows.iter().enumerate() {
                 let r = start_row + ri as u32;
-                for (ci, v) in rvals.iter().enumerate() {
+                for (ci, _v) in rvals.iter().enumerate() {
                     let c = start_col + ci as u32;
                     let cell = formualizer_eval::reference::CellRef::new(
                         sheet_id,
@@ -2625,27 +2658,33 @@ impl Workbook {
                     let old_value = self.engine.get_cell_value(sheet, r, c);
                     let old_formula = self.engine.get_cell(sheet, r, c).and_then(|(ast, _)| ast);
                     let staged_before = self.staged_formula_cell(sheet, r, c);
-                    items.push((r, c, v.clone(), cell, old_value, old_formula, staged_before));
+                    items.push((r, c, ri, ci, cell, old_value, old_formula, staged_before));
                 }
             }
+            #[cfg(feature = "benchmark_internal")]
+            Self::record_set_values_profile_phase(&mut profile_started, &mut profile_phases, 1);
 
             self.engine
                 .edit_with_logger(&mut self.log, |editor| {
-                    for (_r, _c, v, cell, old_value, old_formula, _staged_before) in items.iter() {
+                    for (_r, _c, ri, ci, cell, old_value, old_formula, _staged_before) in
+                        items.iter()
+                    {
+                        let value = &rows[*ri][*ci];
                         // Old state captured from Arrow truth rides directly on the
                         // event (graph-captured state wins; this only fills `None`).
                         editor.set_cell_value_with_old_state(
                             *cell,
-                            v.clone(),
+                            value.clone(),
                             old_value.clone(),
                             old_formula.clone(),
                         );
                     }
                 })
                 .map_err(|e| IoError::from_backend("editor", e))?;
+            #[cfg(feature = "benchmark_internal")]
+            Self::record_set_values_profile_phase(&mut profile_started, &mut profile_phases, 2);
 
-            for (r, c, v, _cell, _old_value, _old_formula, staged_before) in items {
-                self.mirror_value_to_overlay(sheet, r, c, &v);
+            for (r, c, _ri, _ci, _cell, _old_value, _old_formula, staged_before) in items {
                 self.engine.clear_staged_formula_text(sheet, r, c);
                 // Setting a literal value clears any staged formula for this cell.
                 if staged_before.is_some() {
@@ -2653,6 +2692,16 @@ impl Workbook {
                 }
             }
             self.engine.mark_data_edited();
+            #[cfg(feature = "benchmark_internal")]
+            {
+                Self::record_set_values_profile_phase(&mut profile_started, &mut profile_phases, 3);
+                if profile_batch {
+                    eprintln!(
+                        "set_values_inner cells={item_capacity}: capacity={:?}, old_state={:?}, edit={:?}, overlay_clear={:?}",
+                        profile_phases[0], profile_phases[1], profile_phases[2], profile_phases[3],
+                    );
+                }
+            }
             Ok(())
         } else {
             for (ri, rvals) in rows.iter().enumerate() {
@@ -2666,6 +2715,19 @@ impl Workbook {
                 }
             }
             Ok(())
+        }
+    }
+
+    #[cfg(feature = "benchmark_internal")]
+    fn record_set_values_profile_phase(
+        started: &mut Option<std::time::Instant>,
+        phases: &mut [std::time::Duration; 4],
+        index: usize,
+    ) {
+        if let Some(previous) = started.take() {
+            let now = std::time::Instant::now();
+            phases[index] = now.duration_since(previous);
+            *started = Some(now);
         }
     }
 

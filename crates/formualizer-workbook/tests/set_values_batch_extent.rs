@@ -5,7 +5,7 @@
 //! reported sheet extent, and for a batch anchored at the last grid row it
 //! reserves a row that cannot exist at all.
 
-use formualizer_common::LiteralValue as LV;
+use formualizer_common::{LiteralValue as LV, RangeAddress};
 use formualizer_workbook::Workbook;
 
 const LAST_GRID_ROW: u32 = 1_048_576;
@@ -99,4 +99,58 @@ fn set_formulas_at_the_last_grid_row_does_not_reserve_past_it() {
     w.set_formulas("S", LAST_GRID_ROW, 1, &[vec!["=13".to_string()], vec![]])
         .unwrap();
     assert_eq!(w.sheet_dimensions("S"), Some((LAST_GRID_ROW, 1)));
+}
+
+#[test]
+fn incremental_row_batches_keep_capacity_padding_out_of_logical_reads() {
+    let mut w = wb();
+    for row in 1..=3 {
+        w.set_values("S", row, 1, &[vec![LV::Number(f64::from(row))]])
+            .unwrap();
+    }
+
+    assert_eq!(w.sheet_dimensions("S"), Some((3, 1)));
+    assert_eq!(w.get_value("S", 4, 1), None);
+    let range = RangeAddress::new("S", 1, 1, 4, 1).unwrap();
+    assert_eq!(
+        w.read_range(&range),
+        vec![
+            vec![LV::Number(1.0)],
+            vec![LV::Number(2.0)],
+            vec![LV::Number(3.0)],
+            vec![LV::Empty],
+        ]
+    );
+}
+
+#[test]
+fn fresh_sheet_batch_seed_keeps_materialized_arrow_chunks_sparse() {
+    let mut w = Workbook::new();
+    w.set_values(
+        "Sheet1",
+        1,
+        1,
+        &[
+            vec![LV::Number(1.0), LV::Number(2.0)],
+            vec![LV::Number(3.0), LV::Number(4.0)],
+        ],
+    )
+    .unwrap();
+
+    let sheet = w.engine().sheet_store().sheet("Sheet1").unwrap();
+    assert_eq!(sheet.nrows, 2);
+    assert!(sheet.columns.iter().all(|column| column.chunks.is_empty()));
+    assert!(
+        sheet
+            .columns
+            .iter()
+            .all(|column| column.has_sparse_chunks())
+    );
+    assert_eq!(
+        w.read_range(&RangeAddress::new("Sheet1", 1, 1, 2, 2).unwrap()),
+        vec![
+            vec![LV::Number(1.0), LV::Number(2.0)],
+            vec![LV::Number(3.0), LV::Number(4.0)],
+        ]
+    );
 }

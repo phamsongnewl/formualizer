@@ -1,5 +1,7 @@
 use super::common::arrow_eval_config;
 use crate::engine::Engine;
+use crate::engine::graph::editor::change_log::ChangeLog;
+use crate::reference::{CellRef, Coord};
 use crate::test_workbook::TestWorkbook;
 use formualizer_common::LiteralValue;
 
@@ -70,4 +72,49 @@ fn sparse_chunk_overlay_triggers_compaction_and_materializes_base_lanes() {
 
     // Ensure the computed chunk offset stays in-bounds.
     assert!(in_off < ch.type_tag.len());
+}
+
+#[test]
+fn logged_bulk_values_compact_sparse_chunks_at_the_absolute_overlay_bound() {
+    const ROWS: usize = 1_100;
+    let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
+    {
+        let mut ingest = engine.begin_bulk_ingest_arrow();
+        ingest.add_sheet("S", 1, ROWS);
+        for _ in 0..ROWS {
+            ingest.append_row("S", &[LiteralValue::Empty]).unwrap();
+        }
+        ingest.finish().unwrap();
+    }
+
+    let sheet_id = engine.graph.sheet_id("S").expect("seed sheet exists");
+    let mut log = ChangeLog::new();
+    log.set_enabled(true);
+    let compactions_before = engine.debug_overlay_compactions();
+    engine
+        .edit_with_logger(&mut log, |editor| {
+            for row in 0..ROWS {
+                editor.set_cell_value_with_old_state(
+                    CellRef::new(sheet_id, Coord::new(row as u32, 0, true, true)),
+                    LiteralValue::Number(row as f64),
+                    Some(LiteralValue::Empty),
+                    None,
+                );
+            }
+        })
+        .expect("bulk value edit should succeed");
+
+    assert_eq!(
+        engine.debug_overlay_compactions() - compactions_before,
+        1,
+        "bulk edits should compact once after crossing the absolute point bound"
+    );
+    assert_eq!(
+        engine.get_cell_value("S", 1, 1),
+        Some(LiteralValue::Number(0.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("S", ROWS as u32, 1),
+        Some(LiteralValue::Number((ROWS - 1) as f64))
+    );
 }

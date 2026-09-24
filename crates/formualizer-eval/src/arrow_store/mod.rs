@@ -11,6 +11,8 @@ use formualizer_common::{ExcelError, ExcelErrorKind, LiteralValue};
 use rustc_hash::FxHashMap;
 use std::collections::{BTreeMap, HashMap};
 
+const SPARSE_CHUNK_ROW_GROWTH_QUANTUM: usize = 1024;
+
 /// Compact type tag per row (UInt8 backing)
 #[repr(u8)]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -3621,6 +3623,22 @@ impl ArrowSheet {
             let end = starts.get(ch_idx + 1).copied().unwrap_or(nrows);
             Some(end.saturating_sub(start))
         };
+        let sparse_len_for = |ch_idx: usize| -> Option<usize> {
+            let start = *starts.get(ch_idx)?;
+            let end = starts.get(ch_idx + 1).copied().unwrap_or(nrows);
+            let logical_len = end.saturating_sub(start);
+            if ch_idx + 1 == starts.len() && logical_len > 0 {
+                let quantum = chunk_size.clamp(1, SPARSE_CHUNK_ROW_GROWTH_QUANTUM);
+                Some(
+                    logical_len
+                        .div_ceil(quantum)
+                        .saturating_mul(quantum)
+                        .min(chunk_size),
+                )
+            } else {
+                Some(logical_len)
+            }
+        };
 
         for col in &mut self.columns {
             for (idx, ch) in col.chunks.iter_mut().enumerate() {
@@ -3632,7 +3650,7 @@ impl ArrowSheet {
                 let keys: Vec<usize> = col.sparse_chunks.keys().copied().collect();
                 for idx in keys {
                     if let (Some(req), Some(ch)) =
-                        (required_len_for(idx), col.sparse_chunks.get_mut(&idx))
+                        (sparse_len_for(idx), col.sparse_chunks.get_mut(&idx))
                     {
                         ch.grow_len_to(req);
                     }
@@ -4663,6 +4681,31 @@ pub struct ColumnShape {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sparse_row_capacity_growth_is_amortized_within_chunk_boundaries() {
+        let mut sheet = ArrowSheet::new_sparse("S", 1, 0, 16_384);
+        sheet.set_sparse_overlay_value(0, 0, OverlayValue::Number(1.0));
+
+        let mut last_tags = Arc::clone(&sheet.columns[0].sparse_chunks[&0].type_tag);
+        let mut growths = 0;
+        for target_rows in 2..=4096 {
+            sheet.ensure_row_capacity(target_rows);
+            let tags = Arc::clone(&sheet.columns[0].sparse_chunks[&0].type_tag);
+            if !Arc::ptr_eq(&last_tags, &tags) {
+                growths += 1;
+                last_tags = tags;
+            }
+        }
+
+        assert!(
+            growths <= 4,
+            "sparse column storage should grow by capacity batches, observed {growths} rebuilds"
+        );
+        assert_eq!(sheet.nrows, 4096);
+        assert_eq!(sheet.get_cell_value(0, 0), LiteralValue::Number(1.0));
+        assert_eq!(sheet.get_cell_value(4095, 0), LiteralValue::Empty);
+    }
 
     #[test]
     fn known_error_storage_codes_are_stable() {

@@ -4846,6 +4846,12 @@ where
     ) -> Result<T, crate::engine::EditorError> {
         // Record starting log length so we can mirror only newly-recorded events.
         let start_len = log.len();
+        #[cfg(feature = "benchmark_internal")]
+        let profile = std::env::var_os("FORMUALIZER_ENGINE_EDIT_PROFILE").is_some();
+        #[cfg(feature = "benchmark_internal")]
+        let mut profile_started = profile.then(std::time::Instant::now);
+        #[cfg(feature = "benchmark_internal")]
+        let mut profile_phases = [std::time::Duration::ZERO; 4];
 
         // Provide a spill snapshot reader so VertexEditor can snapshot Arrow-truth spill values
         // (graph value cache is intentionally empty in canonical mode).
@@ -4883,17 +4889,26 @@ where
             );
             f(&mut editor)
         };
+        #[cfg(feature = "benchmark_internal")]
+        Self::record_edit_with_logger_profile_phase(&mut profile_started, &mut profile_phases, 0);
 
-        let new_events = log.events()[start_len..].to_vec();
-        if new_events.iter().any(|event| {
+        let new_events = &log.events()[start_len..];
+        let mut value_event_count = 0usize;
+        let has_unsupported_name_mutation = new_events.iter().any(|event| {
+            if matches!(event, ChangeEvent::SetValue { .. }) {
+                value_event_count += 1;
+            }
             matches!(
                 event,
                 ChangeEvent::DefineName { .. }
                     | ChangeEvent::UpdateName { .. }
                     | ChangeEvent::DeleteName { .. }
             )
-        }) {
-            self.rollback_from_change_events(&new_events)?;
+        });
+        #[cfg(feature = "benchmark_internal")]
+        Self::record_edit_with_logger_profile_phase(&mut profile_started, &mut profile_phases, 1);
+        if has_unsupported_name_mutation {
+            self.rollback_from_change_events(new_events)?;
             log.truncate(start_len);
             return Err(crate::engine::EditorError::TransactionUnsupported {
                 reason: "name mutations must use Engine's prepared logged-name APIs".to_string(),
@@ -4902,14 +4917,48 @@ where
 
         // Mirror value-impacting graph events to Arrow for forward edits.
         // This keeps Arrow overlays (delta + computed) consistent when edits clear/commit spills.
-        for ev in &new_events {
-            self.mirror_forward_change_to_arrow(ev);
+        let compaction_fraction_denominator = if value_event_count > 1 { 1 } else { 50 };
+        for ev in new_events {
+            self.mirror_forward_change_to_arrow(ev, compaction_fraction_denominator);
         }
-        for ev in &new_events {
+        #[cfg(feature = "benchmark_internal")]
+        Self::record_edit_with_logger_profile_phase(&mut profile_started, &mut profile_phases, 2);
+        for ev in new_events {
             self.record_formula_plane_change_for_event(ev);
+        }
+        #[cfg(feature = "benchmark_internal")]
+        {
+            Self::record_edit_with_logger_profile_phase(
+                &mut profile_started,
+                &mut profile_phases,
+                3,
+            );
+            if profile && new_events.len() >= 1_000 {
+                eprintln!(
+                    "edit_with_logger events={}: editor={:?}, name_check={:?}, arrow_mirror={:?}, formula_plane={:?}",
+                    new_events.len(),
+                    profile_phases[0],
+                    profile_phases[1],
+                    profile_phases[2],
+                    profile_phases[3],
+                );
+            }
         }
 
         Ok(ret)
+    }
+
+    #[cfg(feature = "benchmark_internal")]
+    fn record_edit_with_logger_profile_phase(
+        started: &mut Option<std::time::Instant>,
+        phases: &mut [std::time::Duration; 4],
+        index: usize,
+    ) {
+        if let Some(previous) = started.take() {
+            let now = std::time::Instant::now();
+            phases[index] = now.duration_since(previous);
+            *started = Some(now);
+        }
     }
 
     pub(crate) fn preflight_replay_admission(
@@ -5196,7 +5245,7 @@ where
     ) {
         // Redo applies events in forward order.
         for item in batch.iter() {
-            self.mirror_forward_change_to_arrow(&item.event);
+            self.mirror_forward_change_to_arrow(&item.event, 50);
         }
     }
 
@@ -5251,13 +5300,23 @@ where
         }
     }
 
-    fn mirror_forward_change_to_arrow(&mut self, ev: &crate::engine::ChangeEvent) {
+    fn mirror_forward_change_to_arrow(
+        &mut self,
+        ev: &crate::engine::ChangeEvent,
+        compaction_fraction_denominator: usize,
+    ) {
         use crate::engine::ChangeEvent;
 
         match ev {
             ChangeEvent::SetValue { addr, new, .. } => {
                 let (sheet, row, col) = self.cellref_to_sheet_row_col(addr);
-                self.mirror_value_to_overlay(&sheet, row, col, new);
+                self.mirror_value_to_overlay_with_compaction(
+                    &sheet,
+                    row,
+                    col,
+                    new,
+                    compaction_fraction_denominator,
+                );
             }
             ChangeEvent::SetFormula { addr, .. } => {
                 let (sheet, row, col) = self.cellref_to_sheet_row_col(addr);
@@ -15245,6 +15304,17 @@ where
     /// Mirror a single cell value into the Arrow overlay if enabled.
     /// Handles capacity growth, per-chunk overlay set, and heuristic compaction.
     fn mirror_value_to_overlay(&mut self, sheet: &str, row: u32, col: u32, value: &LiteralValue) {
+        self.mirror_value_to_overlay_with_compaction(sheet, row, col, value, 50);
+    }
+
+    fn mirror_value_to_overlay_with_compaction(
+        &mut self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        value: &LiteralValue,
+        compaction_fraction_denominator: usize,
+    ) {
         if !(self.config.arrow_storage_enabled && self.config.delta_overlay_enabled) {
             return;
         }
@@ -15293,10 +15363,15 @@ where
             } else {
                 return;
             };
-            // Heuristic compaction: > len/50 or > 1024
+            // Batched logged edits use the absolute point cap; single-cell edits
+            // retain the more aggressive density-based compaction threshold.
             let abs_threshold = 1024usize;
-            let frac_den = 50usize;
-            let freed = asheet.maybe_compact_chunk(col0, ch_idx, abs_threshold, frac_den);
+            let freed = asheet.maybe_compact_chunk(
+                col0,
+                ch_idx,
+                abs_threshold,
+                compaction_fraction_denominator,
+            );
             if freed > 0 {
                 self.overlay_compactions = self.overlay_compactions.saturating_add(1);
             }

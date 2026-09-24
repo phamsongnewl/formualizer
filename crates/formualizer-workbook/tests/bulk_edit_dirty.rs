@@ -11,6 +11,7 @@
 //! workbook surface: visit scaling, per-cell vs batch value equivalence,
 //! undo of a batched action, and flush-on-error.
 
+use formualizer_common::RangeAddress;
 use formualizer_workbook::{LiteralValue, Workbook, WorkbookConfig};
 
 const SHEET: &str = "Sheet1";
@@ -248,5 +249,55 @@ fn mid_batch_error_flushes_scope_and_later_edits_propagate() {
         num(&wb, 10, 6),
         11_000.0,
         "failed-batch survivor re-evaluates"
+    );
+}
+
+#[test]
+fn interactive_batch_values_roundtrip_through_arrow_after_overwriting_staged_formula() {
+    let mut workbook = Workbook::new();
+    workbook
+        .set_formula("Sheet1", 1, 5, "=1+1")
+        .expect("staged formula should be accepted");
+
+    let rows = vec![
+        vec![
+            LiteralValue::Int(10),
+            LiteralValue::Number(2.5),
+            LiteralValue::Text("seed".to_string()),
+            LiteralValue::Boolean(true),
+            LiteralValue::Number(9.0),
+        ],
+        vec![
+            LiteralValue::Int(11),
+            LiteralValue::Empty,
+            LiteralValue::Text("tail".to_string()),
+            LiteralValue::Boolean(false),
+            LiteralValue::Number(12.0),
+        ],
+    ];
+    workbook
+        .set_values("Sheet1", 1, 1, &rows)
+        .expect("interactive batch values should be accepted");
+
+    assert_eq!(workbook.get_formula("Sheet1", 1, 5), None);
+    let range = RangeAddress::new("Sheet1", 1, 1, 2, 5).expect("range should be valid");
+    assert_eq!(
+        workbook.read_range(&range),
+        vec![
+            vec![
+                LiteralValue::Number(10.0),
+                LiteralValue::Number(2.5),
+                LiteralValue::Text("seed".to_string()),
+                LiteralValue::Boolean(true),
+                LiteralValue::Number(9.0),
+            ],
+            vec![
+                LiteralValue::Number(11.0),
+                LiteralValue::Empty,
+                LiteralValue::Text("tail".to_string()),
+                LiteralValue::Boolean(false),
+                LiteralValue::Number(12.0),
+            ],
+        ]
     );
 }
