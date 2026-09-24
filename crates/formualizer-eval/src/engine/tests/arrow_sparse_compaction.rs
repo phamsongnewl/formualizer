@@ -118,3 +118,53 @@ fn logged_bulk_values_compact_sparse_chunks_at_the_absolute_overlay_bound() {
         Some(LiteralValue::Number((ROWS - 1) as f64))
     );
 }
+
+#[test]
+fn logged_bulk_values_compact_each_touched_chunk_once_across_many_thresholds() {
+    const ROWS: usize = 32 * 1024;
+    const WRITES: usize = 6_000;
+    let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
+    {
+        let mut ingest = engine.begin_bulk_ingest_arrow();
+        ingest.add_sheet("S", 1, ROWS);
+        for _ in 0..ROWS {
+            ingest.append_row("S", &[LiteralValue::Empty]).unwrap();
+        }
+        ingest.finish().unwrap();
+    }
+
+    let sheet_id = engine.graph.sheet_id("S").expect("seed sheet exists");
+    let mut log = ChangeLog::new();
+    log.set_enabled(true);
+    let compactions_before = engine.debug_overlay_compactions();
+    engine
+        .edit_with_logger(&mut log, |editor| {
+            for row in 0..WRITES {
+                editor.set_cell_value_with_old_state(
+                    CellRef::new(sheet_id, Coord::new(row as u32, 0, true, true)),
+                    LiteralValue::Number(row as f64),
+                    Some(LiteralValue::Empty),
+                    None,
+                );
+            }
+        })
+        .expect("bulk value edit should succeed");
+
+    let compactions = engine.debug_overlay_compactions() - compactions_before;
+    assert!(
+        compactions <= 2,
+        "6000 writes in one chunk should compact at most once per touched chunk (got {compactions}, old code rebuilt ~writes/1025)"
+    );
+    assert_eq!(
+        engine.get_cell_value("S", 1, 1),
+        Some(LiteralValue::Number(0.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("S", 3000, 1),
+        Some(LiteralValue::Number(2999.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("S", WRITES as u32, 1),
+        Some(LiteralValue::Number((WRITES - 1) as f64))
+    );
+}

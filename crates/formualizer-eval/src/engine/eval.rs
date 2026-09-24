@@ -4917,9 +4917,28 @@ where
 
         // Mirror value-impacting graph events to Arrow for forward edits.
         // This keeps Arrow overlays (delta + computed) consistent when edits clear/commit spills.
-        let compaction_fraction_denominator = if value_event_count > 1 { 1 } else { 50 };
-        for ev in new_events {
-            self.mirror_forward_change_to_arrow(ev, compaction_fraction_denominator);
+        // Large logged batches defer compaction: mirror without rebuilding,
+        // then compact each touched chunk at most once.
+        if value_event_count > 1 {
+            let mut touched_chunks: std::collections::HashSet<(String, usize, usize)> =
+                std::collections::HashSet::new();
+            for ev in new_events {
+                if let Some(key) = self.mirror_forward_change_to_arrow_deferred(ev) {
+                    touched_chunks.insert(key);
+                }
+            }
+            for (sheet, col0, ch_idx) in touched_chunks {
+                if let Some(asheet) = self.arrow_sheets.sheet_mut(&sheet) {
+                    let freed = asheet.maybe_compact_chunk(col0, ch_idx, 1024, 1);
+                    if freed > 0 {
+                        self.overlay_compactions = self.overlay_compactions.saturating_add(1);
+                    }
+                }
+            }
+        } else {
+            for ev in new_events {
+                self.mirror_forward_change_to_arrow(ev, 50);
+            }
         }
         #[cfg(feature = "benchmark_internal")]
         Self::record_edit_with_logger_profile_phase(&mut profile_started, &mut profile_phases, 2);
@@ -5338,6 +5357,97 @@ where
             _ => {
                 // Other graph structural operations do not have direct value effects in Arrow.
             }
+        }
+    }
+
+    fn mirror_value_to_overlay_deferred(
+        &mut self,
+        sheet: &str,
+        row: u32,
+        col: u32,
+        value: &LiteralValue,
+    ) -> Option<(String, usize, usize)> {
+        if !(self.config.arrow_storage_enabled && self.config.delta_overlay_enabled) {
+            return None;
+        }
+        if self.arrow_sheets.sheet(sheet).is_none() {
+            self.arrow_sheets
+                .sheets
+                .push(crate::arrow_store::ArrowSheet {
+                    name: std::sync::Arc::<str>::from(sheet),
+                    date_system: self.config.date_system,
+                    columns: Vec::new(),
+                    nrows: 0,
+                    chunk_starts: Vec::new(),
+                    chunk_rows: 32 * 1024,
+                });
+        }
+
+        let row0 = row.saturating_sub(1) as usize;
+        let col0 = col.saturating_sub(1) as usize;
+
+        let asheet = self
+            .arrow_sheets
+            .sheet_mut(sheet)
+            .expect("ArrowSheet must exist");
+
+        let cur_cols = asheet.columns.len();
+        if col0 >= cur_cols {
+            asheet.insert_columns(cur_cols, (col0 + 1) - cur_cols);
+        }
+
+        if row0 >= asheet.nrows as usize {
+            if asheet.columns.is_empty() {
+                asheet.insert_columns(0, 1);
+            }
+            asheet.ensure_row_capacity(row0 + 1);
+        }
+        if let Some((ch_idx, in_off)) = asheet.chunk_of_row(row0) {
+            let ov =
+                crate::arrow_store::OverlayValue::from_literal_value(value, asheet.date_system);
+            let ch = asheet.ensure_column_chunk_mut(col0, ch_idx)?;
+            let _ = ch.overlay.set(in_off, ov);
+            // A user edit must invalidate any computed (formula/spill) overlay entry at
+            // this cell. Otherwise, if the delta overlay later compacts into the base lanes
+            // (clearing `overlay`), a stale `computed_overlay=Empty` could incorrectly mask
+            // the edited base value under the read cascade.
+            let computed_delta = ch.computed_overlay.remove(in_off);
+            self.adjust_computed_overlay_bytes(computed_delta);
+            Some((sheet.to_owned(), col0, ch_idx))
+        } else {
+            None
+        }
+    }
+
+    fn mirror_forward_change_to_arrow_deferred(
+        &mut self,
+        ev: &crate::engine::ChangeEvent,
+    ) -> Option<(String, usize, usize)> {
+        use crate::engine::ChangeEvent;
+
+        match ev {
+            ChangeEvent::SetValue { addr, new, .. } => {
+                let (sheet, row, col) = self.cellref_to_sheet_row_col(addr);
+                self.mirror_value_to_overlay_deferred(&sheet, row, col, new)
+            }
+            ChangeEvent::SetFormula { addr, .. } => {
+                let (sheet, row, col) = self.cellref_to_sheet_row_col(addr);
+                self.clear_delta_overlay_cell(&sheet, row, col);
+                None
+            }
+            ChangeEvent::SpillCommitted { old, new, .. } => {
+                if let Some(snap) = old {
+                    self.mirror_spill_snapshot(snap, /*clear_only=*/ true);
+                }
+                self.mirror_spill_snapshot(new, /*clear_only=*/ false);
+                None
+            }
+            ChangeEvent::SpillCleared { old, .. } => {
+                self.mirror_spill_snapshot(old, /*clear_only=*/ true);
+                None
+            }
+            ChangeEvent::SetRowVisibility { .. } => None,
+            _ => None,
         }
     }
 
