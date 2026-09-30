@@ -45,3 +45,85 @@ fn dense_bulk_value_ingest_matches_legacy_seed_and_sum_probe() {
         Some(LiteralValue::Number((ROWS * COLS) as f64))
     );
 }
+
+#[derive(Debug, PartialEq)]
+struct Snapshot {
+    sheet_names: Vec<String>,
+    dimensions: (u32, u32),
+    values: Vec<Vec<LiteralValue>>,
+    formulas: Vec<Vec<Option<String>>>,
+}
+
+fn snapshot(workbook: &Workbook) -> Snapshot {
+    let dimensions = workbook
+        .sheet_dimensions(SHEET)
+        .expect("seeded sheet should have dimensions");
+    let range = RangeAddress::new(SHEET, 1, 1, dimensions.0, dimensions.1)
+        .expect("snapshot range should be valid");
+    let formulas = (1..=dimensions.0)
+        .map(|row| {
+            (1..=dimensions.1)
+                .map(|col| workbook.get_formula(SHEET, row, col))
+                .collect()
+        })
+        .collect();
+
+    Snapshot {
+        sheet_names: workbook.sheet_names(),
+        dimensions,
+        values: workbook.read_range(&range),
+        formulas,
+    }
+}
+
+fn seed_existing_cells(workbook: &mut Workbook) {
+    workbook
+        .set_value(SHEET, 1, 1, LiteralValue::Int(7))
+        .expect("existing value should be set");
+    workbook
+        .set_value(SHEET, 1, 2, LiteralValue::Int(8))
+        .expect("formula cell should be initialized");
+    workbook
+        .set_formula(SHEET, 1, 2, "=A1*2")
+        .expect("existing formula should be set");
+    workbook
+        .set_formula(SHEET, 1, 3, "=1+1")
+        .expect("staged formula text should be accepted");
+}
+
+#[test]
+fn mixed_existing_cells_match_legacy_bulk_write_snapshot() {
+    let values = vec![
+        vec![
+            LiteralValue::Number(10.0),
+            LiteralValue::Number(20.0),
+            LiteralValue::Number(30.0),
+        ],
+        vec![
+            LiteralValue::Number(40.0),
+            LiteralValue::Number(50.0),
+            LiteralValue::Number(60.0),
+        ],
+    ];
+
+    let mut bulk = Workbook::new();
+    seed_existing_cells(&mut bulk);
+    assert_eq!(bulk.get_formula(SHEET, 1, 2), Some("=A1 * 2".to_string()));
+    assert_eq!(
+        bulk.engine().get_staged_formula_text(SHEET, 1, 3),
+        Some("=1+1".to_string())
+    );
+    bulk.ingest_bulk_values(SHEET, 1, 1, &values)
+        .expect("mixed bulk values should ingest");
+
+    let mut legacy = Workbook::new();
+    seed_existing_cells(&mut legacy);
+    legacy
+        .set_values(SHEET, 1, 1, &values)
+        .expect("legacy mixed values should seed");
+
+    assert_eq!(bulk.sheet_dimensions(SHEET), Some((2, 3)));
+    assert_eq!(snapshot(&bulk), snapshot(&legacy));
+    assert_eq!(bulk.get_formula(SHEET, 1, 2), None);
+    assert_eq!(bulk.get_formula(SHEET, 1, 3), None);
+}
