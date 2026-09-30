@@ -17,6 +17,9 @@ use wasmparser::{Parser, Payload};
 #[cfg(all(feature = "wasm_runtime_wasmtime", not(target_arch = "wasm32")))]
 use crate::wasm_runtime_wasmtime::new_wasmtime_runtime;
 
+mod bulk_ingest;
+pub use bulk_ingest::BulkIngestOutcome;
+
 fn normalize_custom_fn_name(name: &str) -> Result<String, ExcelError> {
     let trimmed = name.trim();
     if trimmed.is_empty() {

@@ -62,6 +62,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+mod bulk_ingest;
+
 type StagedFormulaEntry = (u32, u32, String);
 type StagedSheetParts = (
     Vec<StagedFormulaEntry>,

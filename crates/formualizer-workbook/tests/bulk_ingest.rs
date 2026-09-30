@@ -1,7 +1,7 @@
 use formualizer_common::RangeAddress;
 use formualizer_workbook::{LiteralValue, Workbook};
 
-const SHEET: &str = "Sheet1";
+const SHEET: &str = "BulkSeed";
 const ROWS: u32 = 500;
 const COLS: u32 = 30;
 
@@ -12,8 +12,15 @@ fn dense_bulk_value_ingest_matches_legacy_seed_and_sum_probe() {
         .collect();
 
     let mut bulk = Workbook::new();
-    bulk.ingest_bulk_values(SHEET, 1, 1, &values)
+    let events_before = bulk.changelog().events().len();
+    let outcome = bulk
+        .ingest_bulk_values(SHEET, 1, 1, &values)
         .expect("dense bulk values should ingest");
+    assert_eq!(outcome.fast_lane_cells, (ROWS * COLS) as usize);
+    assert_eq!(outcome.fallback_cells, 0);
+    assert_eq!(bulk.changelog().events().len(), events_before);
+    assert!(bulk.has_sheet(SHEET));
+    assert_eq!(bulk.sheet_dimensions(SHEET), Some((ROWS, COLS)));
     bulk.set_formula(SHEET, ROWS + 1, 1, "=SUM(A1:AD500)")
         .expect("SUM probe should be accepted");
     bulk.evaluate_all()
@@ -113,8 +120,25 @@ fn mixed_existing_cells_match_legacy_bulk_write_snapshot() {
         bulk.engine().get_staged_formula_text(SHEET, 1, 3),
         Some("=1+1".to_string())
     );
-    bulk.ingest_bulk_values(SHEET, 1, 1, &values)
+    let events_before = bulk.changelog().events().len();
+    let outcome = bulk
+        .ingest_bulk_values(SHEET, 1, 1, &values)
         .expect("mixed bulk values should ingest");
+    assert_eq!(outcome.fast_lane_cells, 3);
+    assert_eq!(outcome.fallback_cells, 3);
+
+    let mut fallback_legacy = Workbook::new();
+    seed_existing_cells(&mut fallback_legacy);
+    let fallback_events_before = fallback_legacy.changelog().events().len();
+    for (col, value) in values[0].iter().take(3).enumerate() {
+        fallback_legacy
+            .set_value(SHEET, 1, col as u32 + 1, value.clone())
+            .expect("legacy fallback write should succeed");
+    }
+    assert_eq!(
+        &bulk.changelog().events()[events_before..],
+        &fallback_legacy.changelog().events()[fallback_events_before..]
+    );
 
     let mut legacy = Workbook::new();
     seed_existing_cells(&mut legacy);
