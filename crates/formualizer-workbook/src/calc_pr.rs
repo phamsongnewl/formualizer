@@ -300,6 +300,7 @@ mod tests {
     use super::*;
     use formualizer_eval::engine::{CycleDetection, CyclePolicy};
 
+    #[cfg(any(feature = "calamine", feature = "umya"))]
     #[test]
     fn parse_iterate_on_with_custom_values() {
         let xml = br#"<?xml version="1.0"?>
@@ -313,6 +314,7 @@ mod tests {
         assert_eq!(s.full_calc_on_load, Some(true));
     }
 
+    #[cfg(any(feature = "calamine", feature = "umya"))]
     #[test]
     fn parse_iterate_true_text() {
         let xml = br#"<workbook><calcPr iterate="true"/></workbook>"#;
@@ -320,6 +322,7 @@ mod tests {
         assert!(s.iterate);
     }
 
+    #[cfg(any(feature = "calamine", feature = "umya"))]
     #[test]
     fn parse_iterate_zero() {
         let xml = br#"<workbook><calcPr calcId="1" iterate="0"/></workbook>"#;
@@ -327,6 +330,7 @@ mod tests {
         assert!(!s.iterate);
     }
 
+    #[cfg(any(feature = "calamine", feature = "umya"))]
     #[test]
     fn parse_no_calc_pr_is_none() {
         let xml = br#"<workbook><sheets/></workbook>"#;
@@ -397,12 +401,16 @@ mod tests {
         assert!(out.contains("calcId=\"122211\""), "{out}");
         assert!(out.contains("calcMode=\"auto\""), "{out}");
         // Re-parse to confirm round-trip self-consistency.
-        let reparsed = parse_calc_pr(out.as_bytes()).unwrap();
-        assert!(reparsed.iterate);
-        assert_eq!(reparsed.iterate_count, Some(7));
-        assert_eq!(reparsed.calc_mode.as_deref(), Some("auto"));
+        #[cfg(any(feature = "calamine", feature = "umya"))]
+        {
+            let reparsed = parse_calc_pr(out.as_bytes()).unwrap();
+            assert!(reparsed.iterate);
+            assert_eq!(reparsed.iterate_count, Some(7));
+            assert_eq!(reparsed.calc_mode.as_deref(), Some("auto"));
+        }
     }
 
+    #[cfg(any(feature = "calamine", feature = "umya"))]
     #[test]
     fn rewrite_inserts_calc_pr_when_absent() {
         let xml = r#"<workbook><sheets/></workbook>"#;

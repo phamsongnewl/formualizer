@@ -3,6 +3,8 @@
 mod common;
 
 #[cfg(feature = "calamine")]
+mod __loader_probe;
+#[cfg(feature = "calamine")]
 mod calcpr;
 #[cfg(feature = "calamine")]
 mod criteria_ingest_blank;
