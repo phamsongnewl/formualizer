@@ -1,10 +1,11 @@
 #![cfg(target_arch = "wasm32")]
 
 use formualizer_wasm::{
-    FormulaDialect, Parser, Reference, SheetPortSession, Tokenizer, Workbook, parse, tokenize,
+    FormulaDialect, Parser, Reference, SheetPortSession, Tokenizer, Workbook, parse,
+    recalculate_xlsx_bytes, tokenize,
 };
-use js_sys::{Function, Object, Reflect};
-use std::io::{Cursor, Write};
+use js_sys::{Function, Object, Reflect, Uint8Array};
+use std::io::{Cursor, Read, Write};
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::*;
 use zip::write::SimpleFileOptions;
@@ -30,7 +31,35 @@ fn set_prop(obj: &Object, key: &str, value: JsValue) {
     Reflect::set(obj, &JsValue::from_str(key), &value).unwrap();
 }
 
+#[wasm_bindgen_test]
+fn builtin_numeric_overflow_serializes_as_catchable_error() {
+    let wb = Workbook::new(None).unwrap();
+    let sheet = wb.sheet("Overflow".to_string()).unwrap();
+    for (index, formula) in ["POWER(1E200,2)", "EXP(1000)"].iter().enumerate() {
+        let row = index as u32 + 1;
+        sheet.set_formula(row, 1, formula.to_string()).unwrap();
+        assert_eq!(
+            sheet.evaluate_cell(row, 1).unwrap().as_string().as_deref(),
+            Some("#NUM!")
+        );
+        assert_eq!(
+            sheet.get_value(row, 1).unwrap().as_string().as_deref(),
+            Some("#NUM!")
+        );
+        sheet
+            .set_formula(row, 2, format!("IFERROR({formula},77)"))
+            .unwrap();
+        assert_eq!(sheet.evaluate_cell(row, 2).unwrap().as_f64(), Some(77.0));
+    }
+    sheet.set_formula(3, 1, "EXP(-1000)".to_string()).unwrap();
+    assert_eq!(sheet.evaluate_cell(3, 1).unwrap().as_f64(), Some(0.0));
+}
+
 fn build_fixture_xlsx_bytes() -> Vec<u8> {
+    build_named_fixture_xlsx_bytes("Sheet1")
+}
+
+fn build_named_fixture_xlsx_bytes(sheet_name: &str) -> Vec<u8> {
     let mut zip = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
@@ -81,7 +110,7 @@ fn build_fixture_xlsx_bytes() -> Vec<u8> {
     <row r="1">
       <c r="A1"><v>1</v></c>
       <c r="B1"><v>2</v></c>
-      <c r="C1"><f>A1+B1</f><v>3</v></c>
+      <c r="C1" t="str"><f>A1+B1</f><v>stale</v></c>
     </row>
   </sheetData>
 </worksheet>
@@ -89,6 +118,11 @@ fn build_fixture_xlsx_bytes() -> Vec<u8> {
         ),
     ] {
         zip.start_file(path, options).unwrap();
+        let contents = if path == "xl/workbook.xml" {
+            contents.replace("name=\"Sheet1\"", &format!("name=\"{sheet_name}\""))
+        } else {
+            contents.to_owned()
+        };
         zip.write_all(contents.as_bytes()).unwrap();
     }
 
@@ -349,7 +383,59 @@ fn test_sheet_rejects_zero_based_coords() {
     let error: js_sys::Error = err.dyn_into().unwrap();
     assert!(error.message().as_string().unwrap().contains("1-based"));
 
-    assert!(sheet.get_formula(0, 1).is_none());
+    let err = sheet.get_formula(0, 1).unwrap_err();
+    let error: js_sys::Error = err.dyn_into().unwrap();
+    assert!(error.message().as_string().unwrap().contains("1-based"));
+}
+
+#[wasm_bindgen_test]
+fn test_sheet_rejects_out_of_grid_coords_and_ranges() {
+    let wb = Workbook::new(None).unwrap();
+    wb.add_sheet("Sheet1".to_string()).unwrap();
+    let sheet = wb.sheet("Sheet1".to_string()).unwrap();
+
+    let err = sheet
+        .set_value(u32::MAX, 1, JsValue::from_f64(1.0))
+        .unwrap_err();
+    let error: js_sys::Error = err.dyn_into().unwrap();
+    assert!(
+        error
+            .message()
+            .as_string()
+            .unwrap()
+            .contains("maximum supported cell"),
+        "unexpected: {:?}",
+        error.message()
+    );
+
+    let payload = js_sys::Array::new();
+    let row = js_sys::Array::new();
+    row.push(&JsValue::from_f64(1.0));
+    payload.push(&row);
+    payload.push(&row);
+    let err = sheet.set_values(1_048_576, 1, payload).unwrap_err();
+    let error: js_sys::Error = err.dyn_into().unwrap();
+    assert!(
+        error
+            .message()
+            .as_string()
+            .unwrap()
+            .contains("exceeds maximum"),
+        "unexpected: {:?}",
+        error.message()
+    );
+
+    let err = sheet.read_range(1, 1, u32::MAX, 1).unwrap_err();
+    let error: js_sys::Error = err.dyn_into().unwrap();
+    assert!(
+        error
+            .message()
+            .as_string()
+            .unwrap()
+            .contains("maximum supported cell"),
+        "unexpected: {:?}",
+        error.message()
+    );
 }
 
 #[wasm_bindgen_test]
@@ -436,7 +522,7 @@ fn test_workbook_sheet_eval() {
     let sheet = wb.sheet("Sheet2".to_string()).unwrap();
     sheet.set_value(1, 1, JsValue::from_f64(10.0)).unwrap();
     sheet.set_formula(1, 2, "=A1*3".to_string()).unwrap();
-    let formula = sheet.get_formula(1, 2).unwrap();
+    let formula = sheet.get_formula(1, 2).unwrap().unwrap();
     assert_eq!(formula, "=A1*3");
 
     let v2 = sheet.evaluate_cell(1, 2).unwrap();
@@ -448,7 +534,7 @@ fn test_workbook_from_xlsx_bytes_evaluates_formula() {
     let bytes = build_fixture_xlsx_bytes();
     let wb = Workbook::from_xlsx_bytes(bytes).unwrap();
 
-    let sheet_names = wb.sheet_names();
+    let sheet_names = wb.sheet_names().unwrap();
     assert_eq!(sheet_names.length(), 1);
     assert_eq!(sheet_names.get(0).as_string().unwrap(), "Sheet1");
 
@@ -458,8 +544,98 @@ fn test_workbook_from_xlsx_bytes_evaluates_formula() {
     let sheet = wb.sheet("Sheet1".to_string()).unwrap();
     let formula = sheet
         .get_formula(1, 3)
+        .unwrap()
         .expect("formula preserved from XLSX");
     assert_eq!(formula.replace(' ', ""), "=A1+B1");
+}
+
+#[wasm_bindgen_test]
+fn test_recalculate_xlsx_bytes_preserves_prototype_like_sheet_names() {
+    let input = Uint8Array::from(build_named_fixture_xlsx_bytes("__proto__").as_slice());
+    let result: Object = recalculate_xlsx_bytes(input, None)
+        .unwrap()
+        .unchecked_into();
+    let summary: Object = js_get(&result, "summary").unchecked_into();
+    let sheets: Object = js_get(&summary, "sheets").unchecked_into();
+    assert_eq!(
+        Object::keys(&sheets).get(0).as_string().as_deref(),
+        Some("__proto__")
+    );
+    let stats: Object = js_get(&sheets, "__proto__").unchecked_into();
+    assert_eq!(js_get_f64(&stats, "evaluated"), 1.0);
+    assert!(js_get(&Object::get_prototype_of(&sheets), "evaluated").is_undefined());
+}
+
+#[wasm_bindgen_test]
+fn test_recalculate_xlsx_bytes_returns_typed_array_and_counts() {
+    let input = Uint8Array::from(build_fixture_xlsx_bytes().as_slice());
+    let result: Object = recalculate_xlsx_bytes(input, None)
+        .unwrap()
+        .dyn_into()
+        .unwrap();
+    let bytes: Uint8Array = js_get(&result, "bytes").dyn_into().unwrap();
+    assert!(bytes.length() > 0);
+    assert_eq!(js_get_f64(&result, "formula_cells"), 1.0);
+    assert_eq!(js_get_f64(&result, "cache_cells_changed"), 1.0);
+    assert_eq!(js_get_f64(&result, "worksheet_parts_changed"), 1.0);
+    let output = bytes.to_vec();
+    let mut archive = zip::ZipArchive::new(Cursor::new(&output)).unwrap();
+    let mut xml = String::new();
+    archive
+        .by_name("xl/worksheets/sheet1.xml")
+        .unwrap()
+        .read_to_string(&mut xml)
+        .unwrap();
+    assert!(xml.contains("<v>3</v>"));
+    assert!(!xml.contains("t=\"str\""));
+    let repeated: Object = recalculate_xlsx_bytes(bytes, None)
+        .unwrap()
+        .unchecked_into();
+    let repeated_bytes: Uint8Array = js_get(&repeated, "bytes").dyn_into().unwrap();
+    assert_eq!(repeated_bytes.to_vec(), output);
+    assert_eq!(js_get_f64(&repeated, "cache_cells_changed"), 0.0);
+    let summary: Object = js_get(&result, "summary").dyn_into().unwrap();
+    assert_eq!(js_get_string(&summary, "status"), "success");
+}
+
+#[wasm_bindgen_test]
+fn test_blank_counts_keep_u64_extent_and_spill_members() {
+    let wb = Workbook::new(None).unwrap();
+    for sheet in ["Data", "Spill", "Results"] {
+        wb.add_sheet(sheet.to_string()).unwrap();
+    }
+    wb.set_value("Data".to_string(), 5, 3, JsValue::from_f64(1.0))
+        .unwrap();
+    wb.set_formula("Spill".to_string(), 10, 3, "SEQUENCE(2,3)".to_string())
+        .unwrap();
+    for (row, formula) in [
+        "COUNTBLANK(Data!A:XFD)",
+        r#"COUNTIF(Data!1:1048576,"")"#,
+        r#"COUNTIF(Spill!C:C,"")"#,
+        "COUNTBLANK(Spill!10:10)",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        wb.set_formula(
+            "Results".to_string(),
+            row as u32 + 1,
+            1,
+            formula.to_string(),
+        )
+        .unwrap();
+    }
+    wb.evaluate_all().unwrap();
+    let results = wb.sheet("Results".to_string()).unwrap();
+    for (row, expected) in [17_179_869_183.0, 17_179_869_183.0, 1_048_574.0, 16_381.0]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(
+            results.get_value(row as u32 + 1, 1).unwrap().as_f64(),
+            Some(expected)
+        );
+    }
 }
 
 #[wasm_bindgen_test]
@@ -836,6 +1012,7 @@ fn build_sheetport_workbook() -> Workbook {
 
 fn build_now_today_workbook() -> Workbook {
     let wb = Workbook::new(None).unwrap();
+    wb.set_temporal_egress("serial".to_string()).unwrap();
     wb.add_sheet("Outputs".to_string()).unwrap();
     wb.set_formula("Outputs".to_string(), 1, 1, "NOW()".to_string())
         .unwrap();
@@ -1371,4 +1548,20 @@ fn test_sheetport_session_surfaces_local_timezone_determinism_error() {
             .unwrap()
             .contains("Deterministic mode forbids `Local` timezone")
     );
+}
+
+#[wasm_bindgen_test]
+fn test_computed_date_native_by_default_and_serial_opt_out() {
+    let wb = Workbook::new(None).unwrap();
+    let sheet = wb.sheet("Sheet1".to_string()).unwrap();
+    sheet
+        .set_formula(1, 1, "=DATE(2024,12,1)".to_string())
+        .unwrap();
+    wb.evaluate_all().unwrap();
+
+    let native = sheet.get_value(1, 1).unwrap();
+    assert!(native.is_instance_of::<js_sys::Date>());
+
+    wb.set_temporal_egress("serial".to_string()).unwrap();
+    assert_eq!(sheet.get_value(1, 1).unwrap().as_f64(), Some(45_627.0));
 }

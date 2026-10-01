@@ -2,7 +2,7 @@
 
 use super::utils::ARG_ANY_ONE;
 use crate::args::ArgSchema;
-use crate::function::Function;
+use crate::function::{Function, FunctionResolution, resolution_to_reference};
 use crate::traits::{ArgumentHandle, FunctionContext};
 use formualizer_common::{ExcelError, LiteralValue};
 use formualizer_macros::func_caps;
@@ -187,6 +187,9 @@ pub struct AndFn;
 /// Caps: PURE, REDUCTION, BOOL_ONLY, SHORT_CIRCUIT
 /// [formualizer-docgen:schema:end]
 impl Function for AndFn {
+    fn family_kernel(&self) -> Option<crate::function::FamilyKernel> {
+        Some(crate::function::FamilyKernel::And)
+    }
     func_caps!(PURE, REDUCTION, BOOL_ONLY, SHORT_CIRCUIT);
 
     fn name(&self) -> &'static str {
@@ -312,6 +315,9 @@ pub struct OrFn;
 /// Caps: PURE, REDUCTION, BOOL_ONLY, SHORT_CIRCUIT
 /// [formualizer-docgen:schema:end]
 impl Function for OrFn {
+    fn family_kernel(&self) -> Option<crate::function::FamilyKernel> {
+        Some(crate::function::FamilyKernel::Or)
+    }
     func_caps!(PURE, REDUCTION, BOOL_ONLY, SHORT_CIRCUIT);
 
     fn name(&self) -> &'static str {
@@ -432,10 +438,21 @@ pub struct IfFn;
 /// Variadic: true
 /// Signature: IF(arg1...: any@scalar)
 /// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
-/// Caps: PURE, SHORT_CIRCUIT
+/// Caps: PURE, RETURNS_REFERENCE, SHORT_CIRCUIT
 /// [formualizer-docgen:schema:end]
 impl Function for IfFn {
-    func_caps!(PURE, SHORT_CIRCUIT, MAY_SPILL);
+    fn propagate_format(
+        &self,
+        result: &crate::traits::CalcValue<'_>,
+    ) -> Option<crate::format::FormatId> {
+        result.format_id()
+    }
+
+    func_caps!(PURE, SHORT_CIRCUIT, RETURNS_REFERENCE, MAY_SPILL);
+
+    fn family_kernel(&self) -> Option<crate::function::FamilyKernel> {
+        Some(crate::function::FamilyKernel::If)
+    }
 
     fn name(&self) -> &'static str {
         "IF"
@@ -452,6 +469,30 @@ impl Function for IfFn {
         // Single variadic any schema so we can enforce precise 2 or 3 arity inside eval()
         static ONE: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| vec![ArgSchema::any()]);
         &ONE[..]
+    }
+
+    fn eval_reference<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+    ) -> Option<Result<formualizer_parse::parser::ReferenceType, ExcelError>> {
+        match try_resolve_if_reference_or_value(args) {
+            Ok(Some(result)) => resolution_to_reference(Ok(result)),
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }
+    }
+
+    fn resolve_reference_or_value<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+        value_fallback: &dyn Fn() -> Result<crate::traits::CalcValue<'b>, ExcelError>,
+    ) -> Result<FunctionResolution<'b>, ExcelError> {
+        match try_resolve_if_reference_or_value(args)? {
+            Some(result) => Ok(result),
+            None => value_fallback().map(FunctionResolution::Value),
+        }
     }
 
     fn eval<'a, 'b, 'c>(
@@ -472,6 +513,9 @@ impl Function for IfFn {
             LiteralValue::Number(n) => n != 0.0,
             LiteralValue::Int(i) => i != 0,
             LiteralValue::Empty => false,
+            LiteralValue::Error(error) => {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+            }
             _ => {
                 return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                     ExcelError::new_value().with_message("IF condition must be boolean or number"),
@@ -491,6 +535,48 @@ impl Function for IfFn {
     }
 }
 
+fn try_resolve_if_reference_or_value<'b>(
+    args: &[ArgumentHandle<'_, 'b>],
+) -> Result<Option<FunctionResolution<'b>>, ExcelError> {
+    if args.len() < 2 || args.len() > 3 {
+        return Ok(Some(FunctionResolution::Value(
+            crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new_value()
+                    .with_message(format!("IF expects 2 or 3 arguments, got {}", args.len())),
+            )),
+        )));
+    }
+    let condition = args[0].value()?.into_literal();
+    let selected = match condition {
+        LiteralValue::Boolean(value) => value,
+        LiteralValue::Number(value) => value != 0.0,
+        LiteralValue::Int(value) => value != 0,
+        LiteralValue::Empty => false,
+        LiteralValue::Error(error) => {
+            return Ok(Some(FunctionResolution::Value(
+                crate::traits::CalcValue::Scalar(LiteralValue::Error(error)),
+            )));
+        }
+        LiteralValue::Array(_) => return Ok(None),
+        _ => {
+            return Ok(Some(FunctionResolution::Value(
+                crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                    ExcelError::new_value().with_message("IF condition must be boolean or number"),
+                )),
+            )));
+        }
+    };
+    if selected {
+        args[1].resolve_reference_or_value().map(Some)
+    } else if let Some(arg) = args.get(2) {
+        arg.resolve_reference_or_value().map(Some)
+    } else {
+        Ok(Some(FunctionResolution::Value(
+            crate::traits::CalcValue::Scalar(LiteralValue::Boolean(false)),
+        )))
+    }
+}
+
 pub fn register_builtins() {
     crate::function_registry::register_builtin(std::sync::Arc::new(TrueFn));
     crate::function_registry::register_builtin(std::sync::Arc::new(FalseFn));
@@ -504,9 +590,11 @@ pub fn register_builtins() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::{CycleConfig, CycleDetection, CyclePolicy, Engine, EvalConfig};
     use crate::traits::ArgumentHandle;
     use crate::{interpreter::Interpreter, test_workbook::TestWorkbook};
-    use formualizer_parse::LiteralValue;
+    use formualizer_common::ExcelErrorKind;
+    use formualizer_parse::{LiteralValue, parser::Parser, parser::parse};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -558,6 +646,22 @@ mod tests {
 
     fn interp(wb: &TestWorkbook) -> Interpreter<'_> {
         wb.interpreter()
+    }
+
+    fn evaluate_formula(formula: &str, wb: &TestWorkbook) -> LiteralValue {
+        let mut parser = Parser::new(formula).expect("parser");
+        let ast = parser.parse().expect("parse");
+        wb.interpreter()
+            .evaluate_ast(&ast)
+            .expect("evaluate")
+            .into_literal()
+    }
+
+    fn assert_error_kind(value: LiteralValue, kind: ExcelErrorKind) {
+        assert!(
+            matches!(value, LiteralValue::Error(ref error) if error.kind == kind),
+            "expected {kind:?}, got {value:?}"
+        );
     }
 
     #[test]
@@ -844,6 +948,60 @@ mod tests {
         assert_eq!(
             iff.eval(&args, &fctx).unwrap().into_literal(),
             LiteralValue::Int(20)
+        );
+    }
+
+    #[test]
+    fn if_propagates_condition_error_kind() {
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(IfFn))
+            .with_function(Arc::new(crate::builtins::info::NaFn));
+
+        assert_error_kind(evaluate_formula("=IF(NA()=0,0,1)", &wb), ExcelErrorKind::Na);
+        assert_error_kind(evaluate_formula("=IF(1/0>1,1,2)", &wb), ExcelErrorKind::Div);
+    }
+
+    #[test]
+    fn if_errored_condition_records_no_arm_edges() {
+        let config = EvalConfig::default().with_cycle(CycleConfig {
+            detection: CycleDetection::Runtime,
+            policy: CyclePolicy::Error,
+        });
+        let mut engine = Engine::new(TestWorkbook::new(), config);
+        engine
+            .set_cell_formula(
+                "Sheet1",
+                1,
+                1,
+                parse("=IF(NA()=0,INDEX(Q1:Q100,50),0)").expect("parse A1"),
+            )
+            .expect("set A1");
+        engine
+            .set_cell_formula("Sheet1", 50, 17, parse("=A1").expect("parse Q50"))
+            .expect("set Q50");
+
+        engine.evaluate_all().expect("evaluate");
+
+        assert_error_kind(
+            engine.get_cell_value("Sheet1", 1, 1).expect("A1 value"),
+            ExcelErrorKind::Na,
+        );
+        assert!(
+            !matches!(
+                engine.get_cell_value("Sheet1", 50, 17),
+                Some(LiteralValue::Error(error)) if error.kind == ExcelErrorKind::Circ
+            ),
+            "Q50 must not be circular when the IF condition errors"
+        );
+        assert_eq!(engine.last_cycle_telemetry().live_cycles_witnessed, 0);
+    }
+
+    #[test]
+    fn if_text_condition_is_value_error() {
+        let wb = TestWorkbook::new().with_function(Arc::new(IfFn));
+        assert_error_kind(
+            evaluate_formula("=IF(\"abc\",1,2)", &wb),
+            ExcelErrorKind::Value,
         );
     }
 }

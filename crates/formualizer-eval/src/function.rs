@@ -9,6 +9,29 @@ use crate::{
     traits::ArgumentHandle,
 };
 use formualizer_common::{ExcelError, LiteralValue};
+use formualizer_parse::parser::ReferenceType;
+
+/// One-pass result for a function used where either a reference or a value is valid.
+#[doc(hidden)]
+#[derive(Clone)]
+pub enum FunctionResolution<'a> {
+    Reference(ReferenceType),
+    ReferenceError(ExcelError),
+    Value(crate::traits::CalcValue<'a>),
+}
+
+pub(crate) fn resolution_to_reference(
+    result: Result<FunctionResolution<'_>, ExcelError>,
+) -> Option<Result<ReferenceType, ExcelError>> {
+    match result {
+        Ok(FunctionResolution::Reference(reference)) => Some(Ok(reference)),
+        Ok(FunctionResolution::ReferenceError(error)) | Err(error) => Some(Err(error)),
+        Ok(FunctionResolution::Value(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+            error,
+        )))) => Some(Err(error)),
+        Ok(FunctionResolution::Value(_)) => None,
+    }
+}
 
 bitflags::bitflags! {
     /// Describes the capabilities and properties of a function.
@@ -82,10 +105,59 @@ bitflags::bitflags! {
 /// This trait uses a capability-based model (`FnCaps`) to declare function
 /// properties, enabling the evaluation engine to select the most optimal
 /// execution path (e.g., scalar, vectorized, parallel).
+/// Engine-internal identity of a built-in function with a family kernel.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FamilyKernel {
+    Sum,
+    Average,
+    /// `IF`: lifted element-wise (P2-M3), not a range kernel.
+    If,
+    /// `SUMIF(S)`, `COUNTIF(S)`, `AVERAGEIF(S)`: a family run memoizes by
+    /// its varying arguments (the result is a function of them and of the
+    /// absolute ranges).
+    CriteriaAggregate,
+    /// `VLOOKUP`, `HLOOKUP`, `MATCH`: memoized like `CriteriaAggregate`.
+    Lookup,
+    /// Scalar builtins the elementwise lift runs on typed lanes (P2-M3).
+    Round,
+    Abs,
+    Min,
+    Max,
+    And,
+    Or,
+    IfError,
+    /// `COUNT`: a windowed range kernel.
+    Count,
+    /// Program 3: type tests and date parts on typed lanes (a clean
+    /// operand's result without the walk).
+    IsNumber,
+    IsText,
+    IsLogical,
+    IsBlank,
+    IsError,
+    IsErr,
+    IsNa,
+    Year,
+    Month,
+    Day,
+    Weekday,
+}
+
 pub trait Function: Send + Sync + 'static {
     /// Capability flags for this function
     fn caps(&self) -> FnCaps {
         FnCaps::PURE
+    }
+
+    /// Engine-internal: the family kernel that reproduces this function
+    /// exactly over a family run. Only the built-in implementations return
+    /// `Some`; an override registered under the same name keeps `None`, so
+    /// the engine evaluates it through `eval`.
+    #[doc(hidden)]
+    fn family_kernel(&self) -> Option<FamilyKernel> {
+        None
     }
 
     fn name(&self) -> &'static str;
@@ -145,6 +217,24 @@ pub trait Function: Send + Sync + 'static {
         crate::rng::fnv1a64(full_name.as_bytes())
     }
 
+    /// Derive an eval-internal scalar format annotation for this call.
+    /// Functions drop annotations by default; selection and temporal constructors override it.
+    fn propagate_format(
+        &self,
+        result: &crate::traits::CalcValue<'_>,
+    ) -> Option<crate::format::FormatId> {
+        let _ = result;
+        None
+    }
+
+    fn apply_format_propagation<'a>(
+        &self,
+        result: crate::traits::CalcValue<'a>,
+    ) -> crate::traits::CalcValue<'a> {
+        let format = self.propagate_format(&result);
+        result.with_format(format)
+    }
+
     /// The unified evaluation path.
     ///
     /// This method replaces the separate scalar, fold, and map paths.
@@ -169,6 +259,25 @@ pub trait Function: Send + Sync + 'static {
         _ctx: &dyn crate::traits::FunctionContext<'b>,
     ) -> Option<Result<formualizer_parse::parser::ReferenceType, ExcelError>> {
         None
+    }
+
+    /// Resolve a reference-capable function while preserving scalar-selector caching.
+    ///
+    /// The fallback deliberately re-enters the caller's ordinary value path. That
+    /// preserves dispatch validation and array lifting for existing functions whose
+    /// `eval_reference` declines a particular argument shape. Array-valued selectors
+    /// may be evaluated once by each path.
+    fn resolve_reference_or_value<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn crate::traits::FunctionContext<'b>,
+        value_fallback: &dyn Fn() -> Result<crate::traits::CalcValue<'b>, ExcelError>,
+    ) -> Result<FunctionResolution<'b>, ExcelError> {
+        match self.eval_reference(args, ctx) {
+            Some(Ok(reference)) => Ok(FunctionResolution::Reference(reference)),
+            Some(Err(error)) => Ok(FunctionResolution::ReferenceError(error)),
+            None => value_fallback().map(FunctionResolution::Value),
+        }
     }
 
     /// Dispatch to the unified evaluation path with automatic argument validation.
@@ -197,7 +306,9 @@ pub trait Function: Send + Sync + 'static {
                     ),
                 )));
             }
-            return self.eval(args, ctx);
+            return self
+                .eval(args, ctx)
+                .map(|result| self.apply_format_propagation(result));
         }
 
         // Central argument validation (includes min-arity check)
@@ -217,5 +328,6 @@ pub trait Function: Send + Sync + 'static {
         }
 
         self.eval(args, ctx)
+            .map(|result| self.apply_format_propagation(result))
     }
 }

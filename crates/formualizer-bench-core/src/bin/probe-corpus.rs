@@ -350,8 +350,9 @@ mod enabled {
 
         let phase = PhaseMetrics::start("phase_load");
         let mut config = WorkbookConfig::ephemeral();
-        config.eval = EvalConfig::default().with_formula_plane_mode(mode.eval_mode());
-        config.eval.enable_parallel = enable_parallel;
+        let mut eval = EvalConfig::default().with_formula_plane_mode(mode.eval_mode());
+        eval.enable_parallel = enable_parallel;
+        config.eval = scenario.eval_config(eval);
         let mut workbook = match backend {
             BackendMode::Umya => {
                 let backend = UmyaAdapter::open_path(&fixture.path)
@@ -907,6 +908,18 @@ mod enabled {
                     sheets: 1,
                     formula_cells: rows.saturating_sub(1),
                     value_cells: 1,
+                    has_named_ranges: false,
+                    has_tables: false,
+                }
+            }
+            "s088-error-guards-clean" | "s089-error-guards-sparse" | "s090-error-guards-dense" => {
+                let rows = formualizer_bench_core::scenarios::ErrorGuardArrays::rows(scale);
+                FixtureMetadata {
+                    rows,
+                    cols: 11,
+                    sheets: 1,
+                    formula_cells: 2 * rows + 9,
+                    value_cells: 3 * rows,
                     has_named_ranges: false,
                     has_tables: false,
                 }

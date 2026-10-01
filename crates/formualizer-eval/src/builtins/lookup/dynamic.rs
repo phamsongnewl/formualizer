@@ -29,39 +29,42 @@ use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
 use formualizer_macros::func_caps;
 use std::collections::HashMap;
 
-/* ─────────────────── generated-array allocation guard ───────────────────
- *
- * Generator functions (SEQUENCE, RANDARRAY) materialize their full result
- * as `Vec<Vec<LiteralValue>>` before the engine ever sees it, so dimension
- * args taken from user input must be guarded BEFORE allocating — e.g.
- * `=SEQUENCE(1e6,1e6)` would otherwise attempt a 10^12-cell allocation.
- *
- * Cap rationale:
- * - Per-dimension: Excel sheet limits (1,048,576 rows × 16,384 cols — the
- *   same values as `EvalConfig::default().max_sheet_rows/max_sheet_cols`).
- *   A generated array larger than a sheet can never spill successfully
- *   (`SpillBoundsPolicy::Strict`), so it is `#NUM!` unconditionally.
- * - Total cells: 2^24 (16,777,216). `LiteralValue` is ≥32 bytes, so this
- *   already bounds the transient allocation near ~0.5 GiB — three orders
- *   of magnitude above the engine's default spill cap
- *   (`SpillConfig::max_spill_cells` = 10,000) which would reject the
- *   result downstream anyway. Anything larger risks OOM before that
- *   downstream guard can run.
- */
-const GENERATED_ARRAY_MAX_ROWS: i64 = 1_048_576;
-const GENERATED_ARRAY_MAX_COLS: i64 = 16_384;
-const GENERATED_ARRAY_MAX_CELLS: i64 = 1 << 24;
+// Generated-array allocation guard: shared with other materializing builtins;
+// the cap rationale lives next to the definition in `builtins::utils`.
+use super::super::utils::{
+    GENERATED_ARRAY_MAX_COLS, GENERATED_ARRAY_MAX_ROWS, generated_array_too_large,
+};
 
-/// Returns `Some(#NUM!)` when a `rows x cols` generated array exceeds the
-/// allocation guard; uses checked arithmetic so overflowing products fail
-/// closed. Callers have already rejected `rows <= 0 || cols <= 0`.
-fn generated_array_too_large(rows: i64, cols: i64) -> Option<ExcelError> {
-    if rows > GENERATED_ARRAY_MAX_ROWS || cols > GENERATED_ARRAY_MAX_COLS {
-        return Some(ExcelError::new(ExcelErrorKind::Num));
-    }
-    match rows.checked_mul(cols) {
-        Some(total) if total <= GENERATED_ARRAY_MAX_CELLS => None,
-        _ => Some(ExcelError::new(ExcelErrorKind::Num)),
+/// The `(rows, cols)` an XLOOKUP array argument declares.
+///
+/// Excel's length rule compares what the formula declares, not what the data
+/// occupies: `XLOOKUP(v,A1:A3,B1:B4)` is `#VALUE!` even when `B4` is blank,
+/// and `XLOOKUP(v,A:A,B1:B10)` is `#VALUE!` because `A:A` declares every row.
+/// A view is trimmed to the used region along an open (whole-column or
+/// whole-row) axis, so for a reference written in the formula the declared
+/// extent is read from the reference itself. Anything else (a computed array,
+/// a reference-returning function, a defined name) is measured by its view.
+fn declared_shape(handle: &ArgumentHandle<'_, '_>, view: (usize, usize)) -> (usize, usize) {
+    use formualizer_parse::parser::ReferenceType;
+
+    let span = |start: Option<u32>, end: Option<u32>, limit: i64| -> usize {
+        let start = i64::from(start.unwrap_or(1));
+        let end = end.map_or(limit, i64::from);
+        (end - start + 1).max(0) as usize
+    };
+    match handle.bare_reference() {
+        Some(ReferenceType::Cell { .. }) => (1, 1),
+        Some(ReferenceType::Range {
+            start_row,
+            start_col,
+            end_row,
+            end_col,
+            ..
+        }) => (
+            span(start_row, end_row, GENERATED_ARRAY_MAX_ROWS),
+            span(start_col, end_col, GENERATED_ARRAY_MAX_COLS),
+        ),
+        _ => view,
     }
 }
 
@@ -69,6 +72,28 @@ fn generated_array_too_large(rows: i64, cols: i64) -> Option<ExcelError> {
 
 pub fn super_wildcard_match(pattern: &str, text: &str) -> bool {
     super::lookup_utils::wildcard_pattern_match(pattern, text)
+}
+
+fn find_semantic_empty(
+    view: &crate::engine::range_view::RangeView<'_>,
+    len: usize,
+    vertical: bool,
+    reverse: bool,
+) -> Option<usize> {
+    let is_empty = |i| {
+        let value = if vertical {
+            view.get_cell(i, 0)
+        } else {
+            view.get_cell(0, i)
+        };
+        matches!(value, LiteralValue::Empty)
+    };
+
+    if reverse {
+        (0..len).rev().find(|&i| is_empty(i))
+    } else {
+        (0..len).find(|&i| is_empty(i))
+    }
 }
 
 /* ───────────────────────── XLOOKUP() ───────────────────────── */
@@ -82,6 +107,7 @@ pub struct XLookupFn;
 ///
 /// # Remarks
 /// - Defaults: `match_mode=0` (exact), `search_mode=1` (first-to-last).
+/// - In exact and wildcard modes, a blank lookup value selects only a blank candidate; numeric zero and empty text remain distinct.
 /// - `if_not_found` is optional; if omitted and no match exists, returns `#N/A`.
 /// - `match_mode`: `0` exact, `-1` exact-or-next-smaller, `1` exact-or-next-larger, `2` wildcard.
 /// - `search_mode`: `1` forward, `-1` reverse. Other modes are accepted with current fallback behavior.
@@ -251,6 +277,27 @@ impl Function for XLookupFn {
         let (lookup_rows, lookup_cols) = lookup_view.dims();
         let (ret_rows, ret_cols) = ret_view.dims();
 
+        // A lookup array and a return array of different declared lengths along
+        // the lookup axis are `#VALUE!` before any search, and `if_not_found`
+        // does not apply. A declared single column searches down, a declared
+        // single row across; a 2-D lookup array is rejected below.
+        let (declared_lookup_rows, declared_lookup_cols) =
+            declared_shape(&args[1], (lookup_rows, lookup_cols));
+        let (declared_ret_rows, declared_ret_cols) = declared_shape(&args[2], (ret_rows, ret_cols));
+        let length_mismatch = if declared_lookup_cols == 1 {
+            declared_lookup_rows != declared_ret_rows
+        } else if declared_lookup_rows == 1 {
+            declared_lookup_cols != declared_ret_cols
+        } else {
+            false
+        };
+        if length_mismatch {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new(ExcelErrorKind::Value)
+                    .with_message("XLOOKUP lookup_array and return_array differ in length"),
+            )));
+        }
+
         // XLOOKUP requires a 1-D lookup array (single row or single column).
         // If the lookup range is completely empty (used-region trimmed to 0),
         // fall back to the return range's used-region length and treat missing lookup
@@ -313,9 +360,10 @@ impl Function for XLookupFn {
 
         let mut found: Option<usize> = None;
         let needle = lookup_value;
-        let prepared_matcher = PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
         if match_mode == 0 || wildcard {
-            if match_mode == 0 && search_mode == 1 && lookup_rows > 0 && lookup_cols > 0 {
+            if matches!(needle, LiteralValue::Empty) {
+                found = find_semantic_empty(&lookup_view, lookup_len, vertical, search_mode == -1);
+            } else if match_mode == 0 && search_mode == 1 && lookup_rows > 0 && lookup_cols > 0 {
                 let axis = if vertical {
                     LookupAxis::ColumnInView(0)
                 } else {
@@ -339,6 +387,8 @@ impl Function for XLookupFn {
                     _ctx.date_system(),
                 )?;
             } else if search_mode == -1 {
+                let prepared_matcher =
+                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
                 for i in (0..lookup_len).rev() {
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
@@ -353,6 +403,8 @@ impl Function for XLookupFn {
             } else {
                 // Fallback linear scan (also used when the lookup view is empty and
                 // we are treating missing cells as Empty).
+                let prepared_matcher =
+                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
                 for i in 0..lookup_len {
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
@@ -458,7 +510,9 @@ impl Function for XLookupFn {
             ));
         }
 
-        if args.len() >= 4 {
+        // An omitted-in-place slot (`XLOOKUP(v,l,r,,mode)`) is not a supplied
+        // if_not_found; Excel returns #N/A, not the omitted slot's 0.
+        if args.len() >= 4 && !args[3].is_omitted() {
             return args[3].value();
         }
         Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
@@ -477,6 +531,7 @@ pub struct XMatchFn;
 ///
 /// # Remarks
 /// - Defaults: `match_mode=0` (exact), `search_mode=1` (first-to-last).
+/// - In exact and wildcard modes, a blank lookup value selects only a blank candidate; numeric zero and empty text remain distinct.
 /// - `match_mode`: `0` exact, `-1` exact-or-next-smaller, `1` exact-or-next-larger, `2` wildcard.
 /// - `search_mode`: `1` forward, `-1` reverse, `2` ascending binary intent, `-2` descending binary intent.
 /// - `lookup_array` must be a single row or single column, otherwise returns `#VALUE!`.
@@ -661,13 +716,19 @@ impl Function for XMatchFn {
 
         let wildcard = match_mode == 2;
         let needle = lookup_value;
-        let prepared_matcher = PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
 
         let mut found: Option<usize> = None;
 
         if match_mode == 0 || wildcard {
             // Exact match or wildcard match
-            if search_mode == 1 || search_mode == 2 {
+            if matches!(needle, LiteralValue::Empty) {
+                found = find_semantic_empty(
+                    &lookup_view,
+                    lookup_len,
+                    vertical,
+                    search_mode == -1 || search_mode == -2,
+                );
+            } else if search_mode == 1 || search_mode == 2 {
                 // Forward search (first to last) or binary ascending (treated as forward for exact)
                 if lookup_rows > 0 && lookup_cols > 0 {
                     found = super::lookup_utils::find_exact_index_in_view(
@@ -679,6 +740,8 @@ impl Function for XMatchFn {
                 }
             } else if search_mode == -1 || search_mode == -2 {
                 // Reverse search (last to first) or binary descending (treated as reverse for exact)
+                let prepared_matcher =
+                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
                 for i in (0..lookup_len).rev() {
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
@@ -692,6 +755,8 @@ impl Function for XMatchFn {
                 }
             } else {
                 // Fallback linear scan
+                let prepared_matcher =
+                    PreparedLookupMatcher::new(&needle, wildcard, _ctx.date_system());
                 for i in 0..lookup_len {
                     let cand = if vertical {
                         lookup_view.get_cell(i, 0)
@@ -2985,13 +3050,15 @@ impl Function for SequenceFn {
         };
         let rows_f = num(&args[0])?;
         let rows = rows_f as i64;
-        let cols = if args.len() >= 2 {
-            num(&args[1])? as i64
-        } else {
-            1
+        let optional_num = |index: usize, default: f64| -> Result<f64, ExcelError> {
+            match args.get(index) {
+                Some(arg) if !arg.is_omitted() => num(arg),
+                _ => Ok(default),
+            }
         };
-        let start = if args.len() >= 3 { num(&args[2])? } else { 1.0 };
-        let step = if args.len() >= 4 { num(&args[3])? } else { 1.0 };
+        let cols = optional_num(1, 1.0)? as i64;
+        let start = optional_num(2, 1.0)?;
+        let step = optional_num(3, 1.0)?;
         if rows <= 0 || cols <= 0 {
             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
                 ExcelError::new(ExcelErrorKind::Value),
@@ -3594,6 +3661,169 @@ mod tests {
             .unwrap()
             .into_literal();
         assert_eq!(v_nf, LiteralValue::Text("NF".into()));
+    }
+
+    #[test]
+    fn xlookup_declared_length_mismatch_is_value_on_the_ast_path() {
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(XLookupFn))
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(1))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Int(2))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Int(10))
+            .with_cell_a1("Sheet1", "B2", LiteralValue::Int(20));
+        let ctx = wb.interpreter();
+        let f = ctx.context.get_function("", "XLOOKUP").unwrap();
+        let key = lit(LiteralValue::Int(2));
+        let not_found = lit(LiteralValue::Text("nf".into()));
+        // B3 is blank: the declared length still differs. (Whole-column
+        // references need an engine; see engine::tests::xlookup_declared_length.)
+        let cases = [(range("A1:A2", 1, 1, 2, 1), range("B1:B3", 1, 2, 3, 2))];
+        for (lookup, ret) in &cases {
+            let args = vec![
+                ArgumentHandle::new(&key, &ctx),
+                ArgumentHandle::new(lookup, &ctx),
+                ArgumentHandle::new(ret, &ctx),
+                ArgumentHandle::new(&not_found, &ctx),
+            ];
+            match f
+                .dispatch(&args, &ctx.function_context(None))
+                .unwrap()
+                .into_literal()
+            {
+                LiteralValue::Error(e) => assert_eq!(e.kind, ExcelErrorKind::Value),
+                other => panic!("expected #VALUE!, got {other:?}"),
+            }
+        }
+        // Equal declared lengths still search.
+        let lookup = range("A1:A2", 1, 1, 2, 1);
+        let ret = range("B1:B2", 1, 2, 2, 2);
+        let args = vec![
+            ArgumentHandle::new(&key, &ctx),
+            ArgumentHandle::new(&lookup, &ctx),
+            ArgumentHandle::new(&ret, &ctx),
+        ];
+        assert_eq!(
+            f.dispatch(&args, &ctx.function_context(None))
+                .unwrap()
+                .into_literal(),
+            LiteralValue::Number(20.0)
+        );
+    }
+
+    #[test]
+    fn modern_reverse_array_numeric_zero_only_matches_numeric_zero_candidates() {
+        let wb = TestWorkbook::new()
+            .with_function(Arc::new(XLookupFn))
+            .with_function(Arc::new(XMatchFn));
+        let ctx = wb.interpreter();
+        let xlookup = ctx.context.get_function("", "XLOOKUP").unwrap();
+        let xmatch = ctx.context.get_function("", "XMATCH").unwrap();
+        let zero_mode = lit(LiteralValue::Int(0));
+        let reverse = lit(LiteralValue::Int(-1));
+        let not_found = lit(LiteralValue::Text("NF".into()));
+        let needles = [LiteralValue::Number(0.0), LiteralValue::Number(-0.0)];
+
+        for vertical in [false, true] {
+            let candidates = vec![
+                LiteralValue::Boolean(false),
+                LiteralValue::Text("0".into()),
+                LiteralValue::Number(-0.0),
+                LiteralValue::Number(0.0),
+                LiteralValue::Boolean(false),
+                LiteralValue::Text("0".into()),
+            ];
+            let payloads = vec![
+                LiteralValue::Int(10),
+                LiteralValue::Int(20),
+                LiteralValue::Int(30),
+                LiteralValue::Int(40),
+                LiteralValue::Int(50),
+                LiteralValue::Int(60),
+            ];
+            let no_zero = vec![
+                LiteralValue::Boolean(false),
+                LiteralValue::Text("0".into()),
+                LiteralValue::Text(String::new()),
+                LiteralValue::Empty,
+                LiteralValue::Text("0".into()),
+                LiteralValue::Boolean(false),
+            ];
+            let rows = |values: Vec<LiteralValue>| {
+                if vertical {
+                    values.into_iter().map(|value| vec![value]).collect()
+                } else {
+                    vec![values]
+                }
+            };
+            let lookup_array = lit(LiteralValue::Array(rows(candidates)));
+            let return_array = lit(LiteralValue::Array(rows(payloads.clone())));
+            let no_zero_array = lit(LiteralValue::Array(rows(no_zero)));
+            let no_zero_returns = lit(LiteralValue::Array(rows(payloads)));
+
+            for needle_value in needles.clone() {
+                let needle = lit(needle_value);
+                let xmatch_args = vec![
+                    ArgumentHandle::new(&needle, &ctx),
+                    ArgumentHandle::new(&lookup_array, &ctx),
+                    ArgumentHandle::new(&zero_mode, &ctx),
+                    ArgumentHandle::new(&reverse, &ctx),
+                ];
+                assert_eq!(
+                    xmatch
+                        .dispatch(&xmatch_args, &ctx.function_context(None))
+                        .unwrap()
+                        .into_literal(),
+                    LiteralValue::Int(4)
+                );
+
+                let xlookup_args = vec![
+                    ArgumentHandle::new(&needle, &ctx),
+                    ArgumentHandle::new(&lookup_array, &ctx),
+                    ArgumentHandle::new(&return_array, &ctx),
+                    ArgumentHandle::new(&not_found, &ctx),
+                    ArgumentHandle::new(&zero_mode, &ctx),
+                    ArgumentHandle::new(&reverse, &ctx),
+                ];
+                assert_eq!(
+                    xlookup
+                        .dispatch(&xlookup_args, &ctx.function_context(None))
+                        .unwrap()
+                        .into_literal(),
+                    LiteralValue::Number(40.0)
+                );
+
+                let missing_match_args = vec![
+                    ArgumentHandle::new(&needle, &ctx),
+                    ArgumentHandle::new(&no_zero_array, &ctx),
+                    ArgumentHandle::new(&zero_mode, &ctx),
+                    ArgumentHandle::new(&reverse, &ctx),
+                ];
+                let missing_match = xmatch
+                    .dispatch(&missing_match_args, &ctx.function_context(None))
+                    .unwrap()
+                    .into_literal();
+                assert!(
+                    matches!(missing_match, LiteralValue::Error(ref error) if error.kind == ExcelErrorKind::Na),
+                    "XMATCH should reject non-numeric zero candidates, got {missing_match:?}"
+                );
+
+                let missing_lookup_args = vec![
+                    ArgumentHandle::new(&needle, &ctx),
+                    ArgumentHandle::new(&no_zero_array, &ctx),
+                    ArgumentHandle::new(&no_zero_returns, &ctx),
+                    ArgumentHandle::new(&not_found, &ctx),
+                    ArgumentHandle::new(&zero_mode, &ctx),
+                    ArgumentHandle::new(&reverse, &ctx),
+                ];
+                assert_eq!(
+                    xlookup
+                        .dispatch(&missing_lookup_args, &ctx.function_context(None))
+                        .unwrap()
+                        .into_literal(),
+                    LiteralValue::Text("NF".into())
+                );
+            }
+        }
     }
 
     #[test]
@@ -4209,6 +4439,56 @@ mod tests {
                 assert_eq!(a[0][0], LiteralValue::Number(5.0));
             }
             other => panic!("expected array got {other:?}"),
+        }
+    }
+
+    fn eval_sequence_formula(formula: &str, wb: TestWorkbook) -> LiteralValue {
+        let wb = wb.with_function(Arc::new(SequenceFn));
+        let ctx = wb.interpreter();
+        match ctx.evaluate_ast(&formualizer_parse::parser::parse(formula).unwrap()) {
+            Ok(value) => value.into_literal(),
+            Err(error) => LiteralValue::Error(error),
+        }
+    }
+
+    #[test]
+    fn sequence_omitted_optional_arguments_use_documented_defaults() {
+        // https://support.microsoft.com/en-us/office/sequence-function-57467a98-57e0-4817-9f14-2eb78519ca90
+        // documents columns, start and step as optional with a default of 1.
+        let cases = [
+            ("=SEQUENCE(3,,2)", vec![vec![2.0], vec![3.0], vec![4.0]]),
+            ("=SEQUENCE(3,1,,2)", vec![vec![1.0], vec![3.0], vec![5.0]]),
+            ("=SEQUENCE(3,1,2,)", vec![vec![2.0], vec![3.0], vec![4.0]]),
+            ("=SEQUENCE(3,,,2)", vec![vec![1.0], vec![3.0], vec![5.0]]),
+        ];
+
+        for (formula, expected) in cases {
+            let expected = expected
+                .into_iter()
+                .map(|row| row.into_iter().map(LiteralValue::Number).collect())
+                .collect();
+            assert_eq!(
+                eval_sequence_formula(formula, TestWorkbook::new()),
+                LiteralValue::Array(expected),
+                "{formula}"
+            );
+        }
+    }
+
+    #[test]
+    fn sequence_explicit_values_do_not_use_omission_defaults() {
+        assert_eq!(
+            eval_sequence_formula("=SEQUENCE(3,1,0,0)", TestWorkbook::new()),
+            LiteralValue::Array(vec![
+                vec![LiteralValue::Number(0.0)],
+                vec![LiteralValue::Number(0.0)],
+                vec![LiteralValue::Number(0.0)],
+            ])
+        );
+
+        match eval_sequence_formula("=SEQUENCE(3,1,1,1/0)", TestWorkbook::new()) {
+            LiteralValue::Error(error) => assert_eq!(error.kind, ExcelErrorKind::Div),
+            other => panic!("expected #DIV/0!, got {other:?}"),
         }
     }
 

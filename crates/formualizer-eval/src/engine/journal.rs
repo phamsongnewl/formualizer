@@ -162,15 +162,33 @@ impl GraphUndoBatch {
     }
 
     pub fn undo(&self, graph: &mut DependencyGraph) -> Result<(), EditorError> {
+        graph.authority_set_replay(crate::engine::authority::history::Replay::Undo);
+        let replayed = self.undo_events(graph);
+        graph.authority_set_replay(crate::engine::authority::history::Replay::Forward);
+        replayed
+    }
+
+    fn undo_events(&self, graph: &mut DependencyGraph) -> Result<(), EditorError> {
         let mut editor = VertexEditor::new(graph);
         let mut compound_stack: Vec<usize> = Vec::new();
-        for ev in self.events.iter().rev() {
+        for (i, ev) in self.events.iter().enumerate().rev() {
             match ev {
-                ChangeEvent::CompoundEnd { depth } => compound_stack.push(*depth),
+                ChangeEvent::CompoundEnd { depth } => {
+                    compound_stack.push(*depth);
+                    if let Some(description) =
+                        crate::engine::graph::editor::change_log::compound_start_description(
+                            i,
+                            |j| &self.events[j],
+                        )
+                    {
+                        editor.inverse_compound_end(description);
+                    }
+                }
                 ChangeEvent::CompoundStart { depth, .. } => {
                     if compound_stack.last() == Some(depth) {
                         compound_stack.pop();
                     }
+                    editor.apply_inverse(ev.clone())?;
                 }
                 _ => {
                     editor.apply_inverse(ev.clone())?;
@@ -181,10 +199,13 @@ impl GraphUndoBatch {
     }
 
     pub fn redo(&self, graph: &mut DependencyGraph) -> Result<(), EditorError> {
-        for ev in &self.events {
-            apply_forward_change_event(graph, ev)?;
-        }
-        Ok(())
+        graph.authority_set_replay(crate::engine::authority::history::Replay::Redo);
+        let replayed = self
+            .events
+            .iter()
+            .try_for_each(|ev| apply_forward_change_event(graph, ev));
+        graph.authority_set_replay(crate::engine::authority::history::Replay::Forward);
+        replayed
     }
 }
 
@@ -289,9 +310,10 @@ fn apply_forward_change_event(
             let mut editor = VertexEditor::new(graph);
             let _ = editor.remove_edge(*from, *to);
         }
-        ChangeEvent::CompoundStart { .. }
-        | ChangeEvent::CompoundEnd { .. }
-        | ChangeEvent::StagedFormulaCellChanged { .. } => {}
+        ChangeEvent::CompoundStart { description, .. } => {
+            graph.replay_structural_marker(description, true);
+        }
+        ChangeEvent::CompoundEnd { .. } | ChangeEvent::StagedFormulaCellChanged { .. } => {}
     }
     Ok(())
 }

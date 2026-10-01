@@ -17,8 +17,7 @@ where
     ///
     /// # Errors
     ///
-    /// Returns an error if function-semantic observation, formula-span demotion, or graph
-    /// admission fails.
+    /// Returns an error if graph admission fails.
     pub fn bulk_insert_values_untracked<I>(
         &mut self,
         sheet: &str,
@@ -32,29 +31,17 @@ where
             return Ok(());
         }
 
-        self.observe_function_semantic_epoch()?;
-        let sheet_id = self.graph.sheet_id_mut(sheet);
-        let mut coordinates = Vec::with_capacity(cells.len());
-        for (row, col, _) in &cells {
-            self.demote_span_containing_cell_for_write(
-                sheet_id,
-                row.saturating_sub(1),
-                col.saturating_sub(1),
-            )
-            .map_err(Self::editor_error_to_excel)?;
-            coordinates.push((*row, *col));
-        }
-
         let previous_mode = self.graph.sheet_index_mode();
+        let previous_assume_new = self.first_load_assume_new();
+        if !previous_assume_new {
+            self.set_first_load_assume_new(true);
+        }
         self.graph.set_sheet_index_mode(SheetIndexMode::FastBatch);
         let result = self.graph.bulk_insert_values(sheet, cells);
-        self.graph.set_sheet_index_mode(previous_mode);
-        result?;
-
-        for (row, col) in coordinates {
-            self.record_formula_plane_changed_cell(sheet, row, col);
+        if !previous_assume_new {
+            self.set_first_load_assume_new(false);
         }
-
-        Ok(())
+        self.graph.set_sheet_index_mode(previous_mode);
+        result
     }
 }

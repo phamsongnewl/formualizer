@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use formualizer_common::LiteralValue;
+use formualizer_eval::engine::EvalConfig;
 use formualizer_workbook::Workbook;
 
 pub mod common;
@@ -97,6 +98,8 @@ mod s083_affine_row_literals_single_outlier;
 mod s084_affine_row_literals_periodic_outliers;
 mod s085_affine_row_literals_gap;
 mod s086_non_integer_literal_dictionary;
+mod s087_stable_scc_unrelated_edit;
+mod s088_error_guard_arrays;
 
 pub use s001_no_formulas_static_grid::S001NoFormulasStaticGrid;
 pub use s002_single_column_trivial_family::S002SingleColumnTrivialFamily;
@@ -184,6 +187,8 @@ pub use s083_affine_row_literals_single_outlier::S083AffineRowLiteralsSingleOutl
 pub use s084_affine_row_literals_periodic_outliers::S084AffineRowLiteralsPeriodicOutliers;
 pub use s085_affine_row_literals_gap::S085AffineRowLiteralsGap;
 pub use s086_non_integer_literal_dictionary::S086NonIntegerLiteralDictionary;
+pub use s087_stable_scc_unrelated_edit::S087StableSccUnrelatedEdit;
+pub use s088_error_guard_arrays::ErrorGuardArrays;
 
 pub trait Scenario: Send + Sync {
     /// Stable, immutable identifier. Format: "sNNN-name".
@@ -201,6 +206,15 @@ pub trait Scenario: Send + Sync {
     /// Optional edit-cycle plan.
     fn edit_plan(&self) -> Option<EditPlan> {
         None
+    }
+
+    /// Engine configuration for this scenario. Runners build the workbook
+    /// with `EvalConfig::default()` plus the FormulaPlane mode and
+    /// parallelism they are sweeping, then pass that through here so a
+    /// scenario can require e.g. iterative calculation
+    /// (`CycleConfig::iterate_excel_defaults()`). Default: unchanged.
+    fn eval_config(&self, base: EvalConfig) -> EvalConfig {
+        base
     }
 
     /// Expected result invariants checked by the runner after phases.
@@ -250,6 +264,20 @@ pub enum ExpectedDivergenceAction {
 pub struct ExpectedFailure {
     pub mode: ExpectedFailureMode,
     pub reason: &'static str,
+    /// The failure the lifecycle runner must observe (see `adapt_scenario`);
+    /// any other failure fails the run.
+    pub runner_failure: RunnerFailure,
+}
+
+/// A lifecycle-runner failure fingerprint. `step` indexes the adapted script:
+/// 0 load, 1 prepare, 2 first evaluation, then an edit and an evaluation per
+/// cycle (edit `3 + 2 * cycle`). `message` is the complete failure message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunnerFailure {
+    /// Applying the step (fixture load, edit, evaluation) returned an error.
+    Action { step: usize, message: &'static str },
+    /// An invariant checked after the step did not hold.
+    Expectation { step: usize, message: &'static str },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -480,6 +508,251 @@ impl ScenarioRegistry {
             Box::new(S084AffineRowLiteralsPeriodicOutliers::new()),
             Box::new(S085AffineRowLiteralsGap::new()),
             Box::new(S086NonIntegerLiteralDictionary::new()),
+            Box::new(S087StableSccUnrelatedEdit::new()),
+            Box::new(ErrorGuardArrays::new(0)),
+            Box::new(ErrorGuardArrays::new(100)),
+            Box::new(ErrorGuardArrays::new(2)),
         ]
+    }
+}
+
+#[cfg(feature = "formualizer_runner")]
+fn runner_scale(size: formualizer_testkit::scenario::ScenarioSize) -> ScenarioScale {
+    match size.class {
+        formualizer_testkit::scenario::SizeClass::Small => ScenarioScale::Small,
+        formualizer_testkit::scenario::SizeClass::Medium => ScenarioScale::Medium,
+        formualizer_testkit::scenario::SizeClass::Large
+        | formualizer_testkit::scenario::SizeClass::Nightly => ScenarioScale::Large,
+    }
+}
+
+/// Lossless view of the established benchmark corpus for the lifecycle runner.
+/// Fixture construction deliberately remains owned by each original Scenario.
+#[cfg(feature = "formualizer_runner")]
+pub fn adapt_scenario(
+    scenario: std::sync::Arc<dyn Scenario>,
+) -> formualizer_testkit::scenario::ScenarioSpec {
+    use formualizer_eval::engine::FormulaPlaneMode;
+    use formualizer_testkit::scenario::{
+        EnginePath, Expect, ExpectedFailureSpec, FailureFingerprint, Family, LifecycleOp, Purpose,
+        ScenarioSize, ScenarioSource, Script, SizeClass, Step, StructureExpect, Tags,
+    };
+    use std::sync::Arc;
+
+    let fixture_scenario = scenario.clone();
+    let source = ScenarioSource::XlsxFixture(Arc::new(move |path, size| {
+        let fixture_dir = path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_path_buf();
+        fixture_scenario
+            .build_fixture(&ScenarioBuildCtx {
+                scale: runner_scale(size),
+                fixture_dir,
+                label: fixture_scenario.id().to_owned(),
+            })
+            .map(|fixture| fixture.path)
+            .map_err(|error| error.to_string())
+    }));
+    let mut steps = vec![Step::Load, Step::Prepare, Step::EvaluateAll];
+    let mut phases = vec![
+        (0, ScenarioPhase::AfterLoad),
+        (2, ScenarioPhase::AfterFirstEval),
+    ];
+    if let Some(plan) = scenario.edit_plan() {
+        for cycle in 0..plan.cycles {
+            let apply = plan.apply;
+            steps.push(Step::Custom(Arc::new(move |workbook| {
+                apply(workbook, cycle)
+                    .map(|_| ())
+                    .map_err(|error| error.to_string())
+            })));
+            let edit_index = steps.len() - 1;
+            // The corpus labels are diagnostics only; applying twice is not acceptable.
+            phases.push((
+                edit_index,
+                ScenarioPhase::AfterEdit {
+                    cycle,
+                    kind: "legacy_edit",
+                },
+            ));
+            steps.push(Step::EvaluateAll);
+            phases.push((
+                steps.len() - 1,
+                ScenarioPhase::AfterRecalc {
+                    cycle,
+                    kind: "legacy_edit",
+                },
+            ));
+        }
+    }
+    let mut expects = Vec::new();
+    for (index, phase) in phases {
+        for invariant in scenario.invariants(phase) {
+            let expect = match invariant {
+                ScenarioInvariant::CellEquals {
+                    sheet,
+                    row,
+                    col,
+                    expected,
+                } => Expect::Value {
+                    sheet,
+                    row,
+                    col,
+                    value: expected,
+                },
+                ScenarioInvariant::NoErrorCells { sheet } => Expect::NoErrors(sheet),
+                ScenarioInvariant::EngineStats {
+                    mode,
+                    formula_plane_active_span_count,
+                    graph_formula_vertex_count,
+                    graph_edge_count,
+                    formula_ast_root_count,
+                } => {
+                    if mode.is_some_and(|wanted| {
+                        matches!(
+                            (wanted, FormulaPlaneMode::AuthoritativeExperimental),
+                            (ScenarioInvariantMode::Off, FormulaPlaneMode::Off)
+                                | (
+                                    ScenarioInvariantMode::Auth,
+                                    FormulaPlaneMode::AuthoritativeExperimental
+                                )
+                        )
+                    }) || mode.is_none()
+                    {
+                        Expect::Structure(StructureExpect {
+                            active_spans: formula_plane_active_span_count
+                                .map(|value| value as usize),
+                            graph_vertices: graph_formula_vertex_count.map(|value| value as usize),
+                            graph_edges: graph_edge_count.map(|value| value as usize),
+                            arena_nodes: formula_ast_root_count.map(|value| value as usize),
+                            ..StructureExpect::default()
+                        })
+                    } else {
+                        continue;
+                    }
+                }
+            };
+            expects.push((index, expect));
+        }
+    }
+    let tags = scenario.tags();
+    let engine = if tags.contains(&ScenarioTag::SpanPromotable) {
+        EnginePath::FormulaPlane
+    } else {
+        EnginePath::Legacy
+    };
+    let family = if tags.contains(&ScenarioTag::LongChain) {
+        Family::Coupled
+    } else if tags.contains(&ScenarioTag::LookupHeavy) {
+        Family::Fixed
+    } else {
+        Family::Independent
+    };
+    let expected_failures = scenario
+        .expected_to_fail_under()
+        .iter()
+        .map(|failure| ExpectedFailureSpec {
+            mode: match failure.mode {
+                ExpectedFailureMode::AuthOnly => FormulaPlaneMode::AuthoritativeExperimental,
+                ExpectedFailureMode::OffOnly => FormulaPlaneMode::Off,
+            },
+            provenance: None,
+            failure: match failure.runner_failure {
+                RunnerFailure::Action { step, message } => {
+                    FailureFingerprint::action(step, message)
+                }
+                RunnerFailure::Expectation { step, message } => {
+                    FailureFingerprint::expectation(step, message)
+                }
+            },
+            reason: failure.reason.to_owned(),
+        })
+        .collect();
+    formualizer_testkit::scenario::ScenarioSpec {
+        id: scenario.id().to_owned(),
+        description: scenario.description().to_owned(),
+        shape: formualizer_testkit::shape::Shape::new(),
+        source: Some(source),
+        script: Script::new(steps),
+        expects,
+        tags: Tags {
+            family: vec![family],
+            lifecycle: vec![LifecycleOp::Load, LifecycleOp::Evaluate, LifecycleOp::Edit],
+            engine: vec![engine],
+            purpose: vec![Purpose::Behavioral, Purpose::Trace],
+            size: vec![SizeClass::Small, SizeClass::Medium, SizeClass::Large],
+            ..Tags::default()
+        },
+        modes: vec![
+            FormulaPlaneMode::Off,
+            FormulaPlaneMode::AuthoritativeExperimental,
+        ],
+        sizes: vec![
+            ScenarioSize::new(SizeClass::Small, 16),
+            ScenarioSize::new(SizeClass::Medium, 100),
+            ScenarioSize::new(SizeClass::Large, 1_000),
+        ],
+        expected_failures,
+    }
+}
+
+/// The unified registry currently joins the legacy corpus with native testkit
+/// witnesses. Native witnesses are supplied by testkit so bench consumers use
+/// one registry entry point.
+#[cfg(feature = "formualizer_runner")]
+pub fn unified_registry(rows: u32) -> Vec<formualizer_testkit::scenario::ScenarioSpec> {
+    let mut specs: Vec<_> = ScenarioRegistry::all()
+        .into_iter()
+        .map(std::sync::Arc::from)
+        .map(adapt_scenario)
+        .collect();
+    specs.extend(formualizer_testkit::scenario::witness_registry(rows));
+    specs
+}
+
+#[cfg(all(test, feature = "formualizer_runner"))]
+mod runner_tests {
+    use super::*;
+    #[test]
+    fn unified_registry_has_unique_ids() {
+        let specs = unified_registry(256);
+        assert_eq!(specs.len(), 104, "90 adapted plus 14 native witnesses");
+        let mut ids: Vec<_> = specs.iter().map(|spec| &spec.id).collect();
+        ids.sort();
+        ids.dedup();
+        assert_eq!(ids.len(), specs.len());
+    }
+
+    #[test]
+    fn five_legacy_scenarios_run_through_lifecycle() {
+        use formualizer_eval::engine::FormulaPlaneMode;
+        use formualizer_testkit::{
+            WorkbookRoute,
+            run::{self, Materializer},
+        };
+        let mut config = formualizer_workbook::WorkbookConfig::ephemeral();
+        config.eval.enable_parallel = false;
+        for id in [
+            "s002-single-column-trivial-family",
+            "s005-long-chain-family",
+            "s007-fixed-anchor-family",
+            "s032-family-with-row-insert-cycles",
+            "s039-undo-redo-of-bulk-edit",
+        ] {
+            let scenario = ScenarioRegistry::all()
+                .into_iter()
+                .find(|scenario| scenario.id() == id)
+                .unwrap();
+            let spec = adapt_scenario(std::sync::Arc::from(scenario));
+            let report = run::run(
+                &spec,
+                FormulaPlaneMode::AuthoritativeExperimental,
+                spec.sizes[0],
+                Materializer::workbook_api(WorkbookRoute::SetValuesSetFormulas, config.clone()),
+                None,
+            );
+            assert!(report.is_ok(), "{id}: {:?}", report.failure);
+        }
     }
 }

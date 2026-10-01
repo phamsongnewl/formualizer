@@ -324,12 +324,6 @@ fn legacy_delete_rows_matches_formula_plane_authority_on_issue_306_fixture() {
     };
     let mut legacy = build(FormulaPlaneMode::Off);
     let mut authoritative = build(FormulaPlaneMode::AuthoritativeExperimental);
-    assert_eq!(
-        authoritative
-            .baseline_stats()
-            .formula_plane_active_span_count,
-        1
-    );
 
     for engine in [&mut legacy, &mut authoritative] {
         engine.delete_rows(SHEET, 60, 1).unwrap();
@@ -371,7 +365,7 @@ fn undo_of_logged_delete_restores_whole_column_reader_value() {
 }
 
 fn out_formula_vertex(engine: &Engine<TestWorkbook>, row: u32) -> crate::engine::vertex::VertexId {
-    *engine
+    engine
         .graph
         .get_vertex_id_for_address(&engine.graph.make_cell_ref("Out", row, 1))
         .expect("formula vertex")
@@ -397,9 +391,16 @@ fn compressed_delete_queries_select_exact_shape_and_boundary_matrix() {
         TestWorkbook::new(),
         EvalConfig::default().with_parallel(false),
     );
-    engine
-        .set_cell_value("Data", 1, 1, LiteralValue::Number(1.0))
-        .unwrap();
+    for row in 1..=350 {
+        engine
+            .set_cell_value("Data", row, 1, LiteralValue::Number(1.0))
+            .unwrap();
+    }
+    for col in 1..=52 {
+        engine
+            .set_cell_value("Data", 1, col, LiteralValue::Number(1.0))
+            .unwrap();
+    }
     engine
         .set_cell_value("Other", 1, 1, LiteralValue::Number(1.0))
         .unwrap();
@@ -425,6 +426,14 @@ fn compressed_delete_queries_select_exact_shape_and_boundary_matrix() {
     }
 
     let data = engine.sheet_id("Data").unwrap();
+    // The value cells' occupancy (exactly what their vertices used to give
+    // the graph's scan; value cells have no vertex since decision 27, and
+    // the engine combines the graph's scan with Arrow's).
+    let occupancy = crate::engine::graph::StructuralOccupancy::of_cells_for_test(
+        (0..350)
+            .map(|row| (row, 0))
+            .chain((0..52).map(|col| (0, col))),
+    );
     // Row windows touch each finite range's exact upper and lower boundaries,
     // and include whole-column, multi-column-open, half-open, and bounded shapes.
     for (start, end, expected_rows) in [
@@ -438,7 +447,11 @@ fn compressed_delete_queries_select_exact_shape_and_boundary_matrix() {
             &engine,
             engine
                 .graph
-                .compressed_range_dependents_intersecting_deleted_rows(data, start, end),
+                .compressed_range_dependents_for_structural_edit(
+                    data,
+                    crate::engine::graph::StructuralEdit::DeleteRows { start, end },
+                    &occupancy,
+                ),
             &expected_rows,
         );
     }
@@ -456,7 +469,11 @@ fn compressed_delete_queries_select_exact_shape_and_boundary_matrix() {
             &engine,
             engine
                 .graph
-                .compressed_range_dependents_intersecting_deleted_columns(data, start, end),
+                .compressed_range_dependents_for_structural_edit(
+                    data,
+                    crate::engine::graph::StructuralEdit::DeleteColumns { start, end },
+                    &occupancy,
+                ),
             &expected_rows,
         );
     }
@@ -586,10 +603,7 @@ fn unrelated_sheet_deletes_do_not_recompute_open_range_readers_on_either_axis() 
     assert_eq!(col_calls.load(Ordering::SeqCst), 1);
 }
 
-// Pre-existing on main; follow-up #313 tracks position-sensitive open-range
-// readers that insertion leaves current over stale values.
 #[test]
-#[ignore = "pending insert open-range invalidation follow-up #313"]
 fn insert_rows_dirties_match_over_whole_column() {
     let mut engine = Engine::new(
         TestWorkbook::new(),
@@ -618,9 +632,7 @@ fn insert_rows_dirties_match_over_whole_column() {
     assert_eq!(inspected.value, Some(LiteralValue::Number(51.0)));
 }
 
-// Pre-existing on main; follow-up #313 tracks this insertion invalidation gap.
 #[test]
-#[ignore = "pending insert open-range invalidation follow-up #313"]
 fn insert_rows_dirties_index_over_whole_column() {
     let mut engine = Engine::new(
         TestWorkbook::new(),
@@ -649,9 +661,7 @@ fn insert_rows_dirties_index_over_whole_column() {
     assert_eq!(inspected.value, Some(LiteralValue::Number(60.0)));
 }
 
-// Pre-existing on main; follow-up #313 tracks the symmetric column case.
 #[test]
-#[ignore = "pending insert open-range invalidation follow-up #313"]
 fn insert_columns_dirties_index_over_whole_row() {
     let mut engine = Engine::new(
         TestWorkbook::new(),

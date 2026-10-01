@@ -1,9 +1,9 @@
-<h1 align="center">Formualizer for WASM</h1>
+<h1 align="center">Formualizer</h1>
 
 <p align="center">
   <img alt="Arrow Powered" src="https://img.shields.io/badge/Arrow-Powered-0A66C2?logo=apache&logoColor=white" />
   <a href="https://www.npmjs.com/package/formualizer"><img alt="npm" src="https://img.shields.io/npm/v/formualizer.svg" /></a>
-  <a href="../../LICENSE-MIT"><img alt="License: MIT/Apache-2.0" src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg" /></a>
+  <a href="https://github.com/PSU3D0/formualizer/blob/main/LICENSE-MIT"><img alt="License: MIT/Apache-2.0" src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg" /></a>
   <a href="https://www.formualizer.dev/docs/quickstarts/js-wasm-quickstart"><img alt="Documentation" src="https://img.shields.io/badge/docs-formualizer.dev-blue" /></a>
 </p>
 
@@ -11,11 +11,14 @@
   <img alt="Formualizer banner" src="https://raw.githubusercontent.com/psu3d0/formualizer/main/assets/formualizer-banner.png" />
 </p>
 
-<br />
+**The fastest open-source spreadsheet engine. In your JavaScript app.**
 
-**Parse, evaluate, and mutate Excel workbooks in the browser or Node.js.**
+Load Excel workbooks, change inputs, recalculate and read results—in the browser, Node.js or a compatible JavaScript edge runtime. Formualizer ships a Rust calculation engine as WebAssembly with a typed JavaScript API. No Excel installation, office-suite process or remote calculation service. Built for AI agents and applications that need spreadsheet logic without a spreadsheet UI.
 
-A Rust-powered spreadsheet engine compiled to WebAssembly with 320+ Excel-compatible functions, Arrow-powered storage, and a clean TypeScript API.
+- **No compromise on speed.** Copied formulas compute as families over Arrow columns; lookups reuse indexes; only affected cells recalculate. The [engine benchmarks](https://github.com/psu3d0/formualizer#how-fast) report native measurements, not browser or edge timings.
+- **Excel-compatible.** 400+ functions, dynamic arrays, `LET`, `LAMBDA`, names and cross-sheet references. Load XLSX bytes and calculate formulas, not just read cached values.
+- **Built for agents.** Inspect dependencies, group edits with undo/redo, and expose deterministic typed inputs and outputs through SheetPort. For ready-made CLI and MCP tools, see [agent-spreadsheet](https://github.com/PSU3D0/agent-spreadsheet).
+- **One engine across languages.** Also available for [Rust and Python](https://github.com/psu3d0/formualizer#bindings). This npm package targets JavaScript hosts; non-JavaScript WASM hosts use the [portable Rust profile](#runtime-profile).
 
 ## Installation
 
@@ -30,12 +33,14 @@ Full documentation at **[formualizer.dev](https://www.formualizer.dev/docs)**:
 - [JS/WASM Quickstart](https://www.formualizer.dev/docs/quickstarts/js-wasm-quickstart)
 - [JS/WASM API Reference](https://www.formualizer.dev/docs/reference/js-wasm-api-map)
 - [Formula Parser](https://www.formualizer.dev/formula-parser) — interactive in-browser tool
-- [Function Reference](https://www.formualizer.dev/docs/reference/functions) — 320+ built-in functions
+- [Function Reference](https://www.formualizer.dev/docs/reference/functions) — 400+ built-in functions
 - [SheetPort Guide](https://www.formualizer.dev/docs/sheetport) — spreadsheets as typed APIs
 
 ## Quick start
 
-### Evaluate a workbook
+Rows and columns are **1-based**: row 3, column 2 is B3.
+
+### Create and calculate a model
 
 ```typescript
 import init, { Workbook } from 'formualizer';
@@ -49,8 +54,42 @@ wb.setValue('Loans', 2, 1, 0.045);   // annual rate
 wb.setValue('Loans', 3, 1, 360);     // months
 
 wb.setFormula('Loans', 1, 2, '=PMT(A2/12, A3, -A1)');
-console.log(await wb.evaluateCell('Loans', 1, 2)); // ~1266.71
+console.log(wb.evaluateCell('Loans', 1, 2)); // ~1266.71
 ```
+
+
+### Load an XLSX, change an input and recalculate
+
+```typescript
+import init, { Workbook } from 'formualizer';
+await init();
+
+// Browser example; use a workbook with Assumptions and Summary sheets.
+const response = await fetch('/financial_model.xlsx');
+if (!response.ok) throw new Error(`Workbook fetch failed: ${response.status}`);
+const wb = Workbook.fromXlsxBytes(new Uint8Array(await response.arrayBuffer()));
+wb.setValue('Assumptions', 3, 2, 0.07);  // B3
+wb.evaluateAll();
+console.log(wb.sheet('Summary').getValue(5, 2)); // B5
+```
+
+For Node.js, read the bytes with `readFile` from `node:fs/promises` instead of `fetch`. Initialization and WASM asset loading depend on your runtime and bundler; see the [JS quickstart](https://www.formualizer.dev/docs/quickstarts/js-wasm-quickstart). Calculation methods are synchronous: use a Web Worker for large browser workloads to keep the UI responsive.
+
+### Cache-only XLSX recalculation
+
+```typescript
+import { recalculateXlsxBytes } from 'formualizer';
+
+const input = new Uint8Array(await (await fetch('/model.xlsx')).arrayBuffer());
+const result = await recalculateXlsxBytes(input);
+console.log(result.summary.status, result.cache_cells_changed);
+// `result.bytes` is a Uint8Array ready for download/upload.
+```
+
+This delegates to the shared Rust cache-only XLSX recalculator: formula text and
+unrelated package members are retained, while formula cached values are updated.
+Safe core resource limits apply; `errorLocationLimit` only limits stored error
+locations.
 
 ### Parse formulas
 
@@ -71,19 +110,19 @@ console.log(ast);  // AST with node types, references, operators
 ```typescript
 const wb = new Workbook();
 wb.addSheet('S');
-await wb.setChangelogEnabled(true);
+wb.setChangelogEnabled(true);
 
 wb.setValue('S', 1, 1, 10);
 wb.setValue('S', 1, 1, 20);
-await wb.undo();  // back to 10
-await wb.redo();  // back to 20
+wb.undo();  // back to 10
+wb.redo();  // back to 20
 
 // Group multiple edits into one undo step
-await wb.beginAction('bulk update');
+wb.beginAction('bulk update');
 wb.setValue('S', 1, 1, 100);
 wb.setValue('S', 2, 1, 200);
-await wb.endAction();
-await wb.undo();  // reverts both
+wb.endAction();
+wb.undo();  // reverts both
 ```
 
 ### Register custom functions
@@ -116,9 +155,9 @@ Key semantics:
 - Return scalars, `null`/`undefined`, 1D/2D arrays (array results spill into the grid).
 - JS exceptions are sanitized and mapped to `#VALUE!` errors.
 
-Runnable example: `node bindings/wasm/examples/custom-function-registration.mjs` (after `npm run build`)
+Runnable [custom-function example](https://github.com/psu3d0/formualizer/blob/main/bindings/wasm/examples/custom-function-registration.mjs) (after building from a source checkout).
 
-Note: the phase-4 Rust plugin seam (`register_wasm_function`) is intentionally still stubbed/pending runtime integration and is not yet surfaced in the JS API.
+Note: the Rust-side WASM UDF plugin path (`formualizer-workbook` features `wasm_plugins` / `wasm_runtime_wasmtime`) is not surfaced in the JS API; JS callbacks registered with `registerFunction` are the custom-function mechanism here.
 
 ---
 
@@ -130,6 +169,8 @@ Note: the phase-4 Rust plugin seam (`register_wasm_function`) is intentionally s
 import init from 'formualizer';
 await init(); // must be called once before using any API
 ```
+
+`init`, `tokenize`, `parse` and `recalculateXlsxBytes` return promises. `Workbook`, `Sheet` and `SheetPortSession` methods are synchronous once the module is initialized.
 
 ### Formula parsing
 
@@ -151,7 +192,7 @@ parse(formula: string, dialect?: FormulaDialect): Promise<ASTNodeData>
 
 | Method | Description |
 |---|---|
-| `new Workbook()` | Create an empty workbook |
+| `new Workbook(options?)` | Create an empty workbook; options cover span evaluation, cycle detection/policy, iteration limits and per-request work/time budgets |
 | `addSheet(name)` | Add a new sheet |
 | `sheetNames()` | List all sheet names |
 | `sheet(name)` | Get or create a Sheet facade |
@@ -170,6 +211,11 @@ parse(formula: string, dialect?: FormulaDialect): Promise<ASTNodeData>
 | `listFunctions()` | List registered custom function metadata |
 | `static fromJson(json)` | Load workbook from JSON string |
 | `static fromXlsxBytes(bytes)` | Load workbook from XLSX bytes via the Calamine read path |
+| `static fromXlsxBytesWithOptions(bytes, options)` / `static fromJsonWithOptions(json, options)` | Same loaders with `WorkbookLoadOptions` |
+| `inspectCell(cell, options?)` / `precedents(...)` / `dependents(...)` / `trace(...)` / `rangePage(...)` | Inspection and dependency tracing |
+| `getEvalPlan(targets)` | Inspect the evaluation schedule before computing |
+| `lastCycleTelemetry()` | Per-recalc iterative-calculation counters |
+| `cancel()` / `resetCancel()` | Cooperative cancellation of a running evaluation |
 
 ### Sheet
 
@@ -223,7 +269,7 @@ That means:
 - `crypto.getRandomValues` is used for entropy.
 - Ambient wall-clock time is available for `NOW()`, `TODAY()`, etc.
 
-This is the correct profile for browser and Node.js hosts. If you are embedding Formualizer inside a raw **wasmtime** guest or any non-JS wasm host, use the `portable-wasm` Rust feature on the `formualizer` crate instead (see the [main README](../../README.md#webassembly-runtime-profiles)).
+This is the correct profile for browser and Node.js hosts. If you are embedding Formualizer inside a raw **wasmtime** guest or any non-JS wasm host, use the `portable-wasm` Rust feature on the `formualizer` crate instead (see the [main README](https://github.com/psu3d0/formualizer#webassembly-profiles)).
 
 ---
 
@@ -248,14 +294,6 @@ cargo test -p formualizer-wasm
 wasm-pack test --node
 ```
 
-## Why Formualizer?
-
-- **Complete engine**: Parse, evaluate, mutate, and persist — not just read cached values.
-- **320+ functions**: Math, text, lookup (XLOOKUP), date/time, financial, statistics, and more.
-- **Fast**: Arrow-powered storage with incremental dependency tracking and parallel evaluation.
-- **Portable**: Same Rust engine runs natively, in Python, and in the browser via WASM.
-- **Deterministic**: Inject clock, timezone, and RNG for reproducible results.
-
 ## License
 
-Dual-licensed under [MIT](../../LICENSE-MIT) or [Apache-2.0](../../LICENSE-APACHE), at your option.
+Dual-licensed under [MIT](https://github.com/PSU3D0/formualizer/blob/main/LICENSE-MIT) or [Apache-2.0](https://github.com/PSU3D0/formualizer/blob/main/LICENSE-APACHE), at your option. Both license texts ship inside the package.

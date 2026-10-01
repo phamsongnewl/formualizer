@@ -213,18 +213,67 @@ fn unregister_js_callback(callback_id: u64) {
     JS_CALLBACK_REGISTRY.with(|registry| registry.borrow_mut().remove(callback_id));
 }
 
-fn cell_coords_are_valid(row: u32, col: u32) -> bool {
-    row != 0 && col != 0
-}
+/// Excel's grid limits, mirroring `formualizer_common::coord`.
+const MAX_ROW: u32 = 1_048_576;
+const MAX_COL: u32 = 16_384;
 
 fn validate_cell_coords(row: u32, col: u32) -> Result<(), JsValue> {
-    if cell_coords_are_valid(row, col) {
-        Ok(())
-    } else {
-        Err(js_error(format!(
+    if row == 0 || col == 0 {
+        return Err(js_error(format!(
             "row/col are 1-based (row={row}, col={col})"
-        )))
+        )));
     }
+    // Reject before engine `Coord` packing asserts — surface out-of-grid as a JS error.
+    if row > MAX_ROW || col > MAX_COL {
+        return Err(js_error(format!(
+            "row/col exceed the maximum supported cell {MAX_ROW}x{MAX_COL} (row={row}, col={col})"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a batch write anchor plus extent after the payload is marshalled,
+/// so a block that would run off the grid is rejected up front.
+fn validate_block(start_row: u32, start_col: u32, rows: usize, cols: usize) -> Result<(), JsValue> {
+    validate_cell_coords(start_row, start_col)?;
+    if rows == 0 || cols == 0 {
+        return Ok(());
+    }
+    let last_row = (start_row as u64) + rows.saturating_sub(1) as u64;
+    let last_col = (start_col as u64) + cols.saturating_sub(1) as u64;
+    if last_row > MAX_ROW as u64 {
+        return Err(js_error(format!(
+            "block ending at row {last_row} exceeds maximum {MAX_ROW}"
+        )));
+    }
+    if last_col > MAX_COL as u64 {
+        return Err(js_error(format!(
+            "block ending at col {last_col} exceeds maximum {MAX_COL}"
+        )));
+    }
+    Ok(())
+}
+
+/// Inclusive 1-based rectangle: ordered and within the Excel grid.
+fn validate_range_coords(
+    start_row: u32,
+    start_col: u32,
+    end_row: u32,
+    end_col: u32,
+) -> Result<(), JsValue> {
+    validate_cell_coords(start_row, start_col)?;
+    validate_cell_coords(end_row, end_col)?;
+    if start_row > end_row || start_col > end_col {
+        return Err(js_error(format!(
+            "range must have start <= end (got start=({start_row},{start_col}), end=({end_row},{end_col}))"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_table_range(range: (u32, u32, u32, u32)) -> Result<(), JsValue> {
+    let (start_row, start_col, end_row, end_col) = range;
+    validate_range_coords(start_row, start_col, end_row, end_col)
 }
 
 fn parse_target_coord(raw: Option<f64>, label: &str, index: u32) -> Result<u32, JsValue> {
@@ -448,7 +497,21 @@ fn binding_value_to_js(value: BindingValue) -> JsValue {
 }
 
 pub(crate) fn literal_to_js(value: &formualizer::LiteralValue) -> JsValue {
-    binding_value_to_js(binding_value(value))
+    match value {
+        formualizer::LiteralValue::Date(date) => {
+            let milliseconds = date
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis();
+            js_sys::Date::new(&JsValue::from_f64(milliseconds as f64)).into()
+        }
+        formualizer::LiteralValue::DateTime(datetime) => {
+            let milliseconds = datetime.and_utc().timestamp_millis();
+            js_sys::Date::new(&JsValue::from_f64(milliseconds as f64)).into()
+        }
+        _ => binding_value_to_js(binding_value(value)),
+    }
 }
 
 fn set(obj: &js_sys::Object, key: &str, value: JsValue) -> Result<(), JsValue> {
@@ -764,18 +827,17 @@ impl Workbook {
     }
 
     #[wasm_bindgen(js_name = "sheetNames")]
-    pub fn sheet_names(&self) -> js_sys::Array {
+    pub fn sheet_names(&self) -> Result<js_sys::Array, JsValue> {
         let arr = js_sys::Array::new();
         let names = self
             .inner
             .read()
-            .ok()
-            .map(|w| w.sheet_names())
-            .unwrap_or_default();
+            .map_err(|_| js_error("failed to lock workbook for read"))?
+            .sheet_names();
         for s in names.into_iter() {
             arr.push(&JsValue::from_str(&s));
         }
-        arr
+        Ok(arr)
     }
 
     /// Register a workbook-local custom function backed by a JavaScript callback.
@@ -919,6 +981,7 @@ impl Workbook {
         )?;
         let definition: JsTableDefinition = serde_wasm_bindgen::from_value(definition)
             .map_err(|err| js_error(format!("invalid table definition: {err}")))?;
+        validate_table_range(definition.range)?;
         self.inner
             .write()
             .map_err(|_| js_error("failed to lock workbook for write"))?
@@ -1085,6 +1148,22 @@ impl Workbook {
         })
     }
 
+    /// Choose temporal output as native JS dates (default) or numeric serials.
+    #[wasm_bindgen(js_name = "setTemporalEgress")]
+    pub fn set_temporal_egress(&self, policy: String) -> Result<(), JsValue> {
+        let policy = match policy.to_ascii_lowercase().as_str() {
+            "native" => formualizer::eval::engine::TemporalEgress::Native,
+            "serial" => formualizer::eval::engine::TemporalEgress::Serial,
+            _ => return Err(js_error("temporal egress must be 'native' or 'serial'")),
+        };
+        self.inner
+            .write()
+            .map_err(|_| js_error("failed to lock workbook for write"))?
+            .engine_mut()
+            .set_temporal_egress(policy);
+        Ok(())
+    }
+
     #[wasm_bindgen(js_name = "setValue")]
     pub fn set_value(
         &self,
@@ -1206,11 +1285,7 @@ impl Workbook {
                 .ok_or_else(|| js_error(format!("invalid sheet name at index {i}")))?;
             let row = parse_target_coord(arr.get(1).as_f64(), "row", i)?;
             let col = parse_target_coord(arr.get(2).as_f64(), "col", i)?;
-            if !cell_coords_are_valid(row, col) {
-                return Err(js_error(format!(
-                    "row/col are 1-based at index {i} (row={row}, col={col})"
-                )));
-            }
+            validate_cell_coords(row, col)?;
             target_vec.push((sheet, row, col));
         }
 
@@ -1355,6 +1430,12 @@ impl Workbook {
             "nanConverged",
             JsValue::from_f64(t.nan_converged as f64),
         )?;
+        set(&obj, "reusedSccs", JsValue::from_f64(t.reused_sccs as f64))?;
+        set(
+            &obj,
+            "reusedSccMembers",
+            JsValue::from_f64(t.reused_scc_members as f64),
+        )?;
         // u128 -> u64 saturation mirrors the Python binding; the u64 -> f64
         // conversion is then lossless for any realistic duration.
         set(
@@ -1425,11 +1506,13 @@ impl Sheet {
     }
 
     #[wasm_bindgen(js_name = "getFormula")]
-    pub fn get_formula(&self, row: u32, col: u32) -> Option<String> {
-        if !cell_coords_are_valid(row, col) {
-            return None;
-        }
-        self.wb.read().ok()?.get_formula(&self.name, row, col)
+    pub fn get_formula(&self, row: u32, col: u32) -> Result<Option<String>, JsValue> {
+        validate_cell_coords(row, col)?;
+        Ok(self
+            .wb
+            .read()
+            .map_err(|_| js_error("failed to lock workbook for read"))?
+            .get_formula(&self.name, row, col))
     }
 
     #[wasm_bindgen(js_name = "setValues")]
@@ -1439,9 +1522,7 @@ impl Sheet {
         start_col: u32,
         data: js_sys::Array,
     ) -> Result<(), JsValue> {
-        validate_cell_coords(start_row, start_col)?;
-
-        // data: Array<Array<any>>
+        // data: Array<Array<any>> — marshal first so block extent is known.
         let mut rows: Vec<Vec<formualizer::LiteralValue>> =
             Vec::with_capacity(data.length() as usize);
         for r in 0..data.length() {
@@ -1453,6 +1534,9 @@ impl Sheet {
             }
             rows.push(row_vec);
         }
+        let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+        validate_block(start_row, start_col, rows.len(), width)?;
+
         let mut wb = self
             .wb
             .write()
@@ -1477,9 +1561,7 @@ impl Sheet {
         start_col: u32,
         data: js_sys::Array,
     ) -> Result<(), JsValue> {
-        validate_cell_coords(start_row, start_col)?;
-
-        // data: Array<Array<string>>
+        // data: Array<Array<string>> — marshal first so block extent is known.
         let mut rows: Vec<Vec<String>> = Vec::with_capacity(data.length() as usize);
         for r in 0..data.length() {
             let row_val = data.get(r);
@@ -1491,6 +1573,9 @@ impl Sheet {
             }
             rows.push(row_vec);
         }
+        let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+        validate_block(start_row, start_col, rows.len(), width)?;
+
         let mut wb = self
             .wb
             .write()
@@ -1530,6 +1615,7 @@ impl Sheet {
         end_row: u32,
         end_col: u32,
     ) -> Result<js_sys::Array, JsValue> {
+        validate_range_coords(start_row, start_col, end_row, end_col)?;
         let addr = formualizer::workbook::RangeAddress::new(
             &self.name, start_row, start_col, end_row, end_col,
         )

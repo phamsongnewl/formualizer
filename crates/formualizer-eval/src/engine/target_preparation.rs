@@ -4,8 +4,6 @@ use std::time::{Duration, Instant};
 use formualizer_common::RangeAddress;
 
 use super::{EvaluationBudgets, VertexId};
-use crate::formula_plane::region_index::Region;
-use crate::formula_plane::runtime::FormulaSpanRef;
 use crate::reference::CellRef;
 
 pub type RequestId = u64;
@@ -44,10 +42,6 @@ pub enum EvaluationTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum TargetProducer {
     Legacy(VertexId),
-    Span {
-        span_ref: FormulaSpanRef,
-        demanded: Region,
-    },
     Symbol(VertexId),
     ValueOnly(CellRef),
 }
@@ -126,10 +120,12 @@ impl Default for TargetEvalOptions<'_> {
 #[non_exhaustive]
 pub struct PreparationRevision {
     pub graph: u64,
-    /// Raw FormulaPlane epoch. Kept separate from each authority-index counter so
-    /// unrelated component revisions cannot collide through arithmetic folding.
+    /// Always `0`: the FormulaPlane span authority these counters tracked was
+    /// removed (the dependency authority is the only runtime path).
     pub authority: u64,
+    /// Always `0`; see [`Self::authority`].
     pub authority_indexes: u64,
+    /// Always `0`; see [`Self::authority`].
     pub authority_indexed_plane: u64,
     pub staged: u64,
     pub symbols: u64,
@@ -153,8 +149,9 @@ pub struct PreparedTargetGraphReport {
     pub normalized_regions: usize,
     pub normalized_target_list: Vec<EvaluationTarget>,
     pub selected_staged_cells: usize,
-    /// Total family proposals owned by the whole deferred packages selected by
-    /// this request. Selection and consumption are package-atomic.
+    /// Total family proposals owned by deferred packages selected by this request.
+    /// Family-bearing packages remain package-atomic; indexed ordinary-only
+    /// packages can be selected and consumed by coordinate.
     pub selected_source_families: usize,
     pub retained_staged_cells: usize,
     pub selected_cells: Vec<RangeAddress>,
@@ -212,6 +209,8 @@ struct StagedPackagePresence {
     generation: u64,
     family_count: usize,
     geometry: Vec<StagedPackageRect>,
+    // Exact formula-bearing geometry, unlike discovery's declared partition bounds.
+    occupancy_geometry: Vec<StagedPackageRect>,
     fallback_points: BTreeSet<(u32, u32)>,
     geometry_complete: bool,
 }
@@ -327,6 +326,28 @@ impl StagedFormulaIndex {
                     }
                 }
             }
+            let mut occupancy_geometry = geometry.clone();
+            for family in &package.partitioned_families {
+                occupancy_geometry.extend(family.fragments.iter().map(|fragment| {
+                    let rect = fragment.rect();
+                    StagedPackageRect {
+                        start_row: rect.start.row + 1,
+                        start_col: rect.start.col + 1,
+                        end_row: rect.end.row + 1,
+                        end_col: rect.end.col + 1,
+                    }
+                }));
+                // Both shared members and ordinary exceptions are formulas; holes
+                // have no legacy member and must never acquire occupancy.
+                occupancy_geometry.extend(family.legacy_members.as_slice().iter().map(|member| {
+                    StagedPackageRect {
+                        start_row: member.coord.row + 1,
+                        start_col: member.coord.col + 1,
+                        end_row: member.coord.row + 1,
+                        end_col: member.coord.col + 1,
+                    }
+                }));
+            }
             geometry.extend(
                 package
                     .partitioned_families
@@ -342,6 +363,7 @@ impl StagedFormulaIndex {
                 .source_coordinates
                 .iter()
                 .map(|coord| (coord.row.saturating_add(1), coord.col.saturating_add(1)))
+                .filter(|point| !package.source_accounted || !package.suppressed.contains(point))
                 .collect();
             let geometry_complete = package.source_geometry_complete
                 || package.report.source_formula_records_spooled == 0;
@@ -351,6 +373,7 @@ impl StagedFormulaIndex {
                     generation,
                     family_count: package.families.len() + package.partitioned_families.len(),
                     geometry,
+                    occupancy_geometry,
                     fallback_points,
                     geometry_complete,
                 },
@@ -361,6 +384,99 @@ impl StagedFormulaIndex {
         };
         if changed {
             self.bump();
+        }
+    }
+
+    /// Test occupancy without acquiring a source lease, parsing text, or opening
+    /// the replay spool. Coordinates are Excel (one-based). Current ordinary
+    /// entries take precedence over source suppression tombstones.
+    pub(crate) fn occupies_spill(
+        &self,
+        sheet: &str,
+        anchor: (u32, u32),
+        end: (u32, u32),
+        suppressed: impl Fn((u32, u32)) -> bool,
+    ) -> bool {
+        if self.sheets.get(sheet).is_some_and(|entries| {
+            entries
+                .range((anchor.0, 0)..=(end.0, u32::MAX))
+                .any(|(&point, _)| point != anchor && point.1 >= anchor.1 && point.1 <= end.1)
+        }) {
+            return true;
+        }
+        self.package_occupies_spill(sheet, anchor, end, suppressed)
+    }
+
+    pub(crate) fn package_occupies_spill(
+        &self,
+        sheet: &str,
+        anchor: (u32, u32),
+        end: (u32, u32),
+        suppressed: impl Fn((u32, u32)) -> bool,
+    ) -> bool {
+        let Some(package) = self.packages.get(sheet) else {
+            return false;
+        };
+        if package
+            .fallback_points
+            .range((anchor.0, 0)..=(end.0, u32::MAX))
+            .any(|&point| {
+                point != anchor && point.1 >= anchor.1 && point.1 <= end.1 && !suppressed(point)
+            })
+        {
+            return true;
+        }
+        package.occupancy_geometry.iter().any(|rect| {
+            if !rect.intersects(anchor.0, anchor.1, end.0, end.1) {
+                return false;
+            }
+            // Only suppressed coordinates (plus the anchor) can be skipped:
+            // a large unsuppressed domain returns on its first candidate.
+            for row in rect.start_row.max(anchor.0)..=rect.end_row.min(end.0) {
+                for col in rect.start_col.max(anchor.1)..=rect.end_col.min(end.1) {
+                    let point = (row, col);
+                    if point != anchor && !suppressed(point) {
+                        return true;
+                    }
+                }
+            }
+            false
+        })
+    }
+
+    pub(crate) fn package_points_in_region(
+        &self,
+        sheet: &str,
+        start_row: u32,
+        start_col: u32,
+        end_row: u32,
+        end_col: u32,
+    ) -> Vec<(u32, u32)> {
+        self.packages
+            .get(sheet)
+            .into_iter()
+            .flat_map(|package| {
+                package
+                    .fallback_points
+                    .range((start_row, 0)..=(end_row, u32::MAX))
+            })
+            .filter(|&&(_, col)| col >= start_col && col <= end_col)
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn consume_package_points(&mut self, sheet: &str, points: &BTreeSet<(u32, u32)>) {
+        if let Some(package) = self.packages.get_mut(sheet) {
+            for point in points {
+                package.fallback_points.remove(point);
+            }
+        }
+        self.touch_package(sheet);
+    }
+
+    pub(crate) fn update_package_family_count(&mut self, sheet: &str, count: usize) {
+        if let Some(package) = self.packages.get_mut(sheet) {
+            package.family_count = count;
         }
     }
 

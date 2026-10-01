@@ -1077,10 +1077,11 @@ impl WorkbookConfig {
         self
     }
 
-    /// Opt in/out of experimental FormulaPlane span evaluation.
+    /// Record the FormulaPlane span-evaluation preference.
     ///
-    /// The default is disabled to preserve stable workbook semantics and load
-    /// costs. Enabling this selects `FormulaPlaneMode::AuthoritativeExperimental`.
+    /// Accepted and ignored by the engine: FormulaPlane spans were removed and
+    /// the dependency authority is the only runtime path. Enabling this still
+    /// stores `FormulaPlaneMode::AuthoritativeExperimental` in this config.
     pub fn with_span_evaluation(mut self, enabled: bool) -> Self {
         self.eval.formula_plane_mode = if enabled {
             formualizer_eval::engine::FormulaPlaneMode::AuthoritativeExperimental
@@ -1155,6 +1156,7 @@ impl Workbook {
         use crate::backends::UmyaAdapter;
 
         let mut adapter = UmyaAdapter::new_empty();
+        adapter.set_date_system(self.engine.config.date_system);
         let sheet_names = self.sheet_names();
 
         if let Some((first_sheet, remaining_sheets)) = sheet_names.split_first() {
@@ -2020,23 +2022,12 @@ impl Workbook {
             .sheet_mut(sheet)
             .expect("ArrowSheet must exist");
 
-        // On an empty-width sheet, add columns before the rows so later sparse
-        // overlay writes can grow their tail chunks amortized instead of eagerly
-        // creating dense Arrow chunks for every setter call.
-        if asheet.columns.is_empty() {
-            if min_cols > 0 {
-                asheet.insert_columns(0, min_cols);
-            }
-            if min_rows > asheet.nrows as usize {
-                asheet.ensure_row_capacity(min_rows);
-            }
-            return;
-        }
-
-        // Existing columns need their current chunks extended before adding columns.
+        // Ensure rows first so nrows is set before inserting columns
         if min_rows > asheet.nrows as usize {
             asheet.ensure_row_capacity(min_rows);
         }
+
+        // Then ensure columns - they will get properly sized chunks since nrows is set
         let cur_cols = asheet.columns.len();
         if min_cols > cur_cols {
             asheet.insert_columns(cur_cols, min_cols - cur_cols);
@@ -2044,6 +2035,7 @@ impl Workbook {
     }
 
     fn mirror_value_to_overlay(&mut self, sheet: &str, row: u32, col: u32, value: &LiteralValue) {
+        use formualizer_eval::arrow_store::OverlayValue;
         if !(self.engine.config.arrow_storage_enabled && self.engine.config.delta_overlay_enabled) {
             return;
         }
@@ -2057,51 +2049,42 @@ impl Workbook {
             .sheet_mut(sheet)
             .expect("ArrowSheet must exist");
         if let Some((ch_idx, in_off)) = asheet.chunk_of_row(row0) {
-            let ov = Self::overlay_value_for_literal(value, date_system);
+            let ov = match value {
+                LiteralValue::Empty => OverlayValue::Empty,
+                LiteralValue::Int(i) => OverlayValue::Number(*i as f64),
+                LiteralValue::Number(n) => OverlayValue::Number(*n),
+                LiteralValue::Boolean(b) => OverlayValue::Boolean(*b),
+                LiteralValue::Text(s) => OverlayValue::Text(std::sync::Arc::from(s.clone())),
+                LiteralValue::Error(e) => {
+                    OverlayValue::Error(formualizer_eval::arrow_store::map_error_code(e.kind))
+                }
+                LiteralValue::Date(d) => {
+                    let dt = d.and_hms_opt(0, 0, 0).unwrap();
+                    let serial = formualizer_common::datetime_to_serial_for(date_system, &dt);
+                    OverlayValue::DateTime(serial)
+                }
+                LiteralValue::DateTime(dt) => {
+                    let serial = formualizer_common::datetime_to_serial_for(date_system, dt);
+                    OverlayValue::DateTime(serial)
+                }
+                LiteralValue::Time(t) => {
+                    let serial = formualizer_common::time_to_fraction(t);
+                    OverlayValue::DateTime(serial)
+                }
+                LiteralValue::Duration(d) => {
+                    let serial = d.num_seconds() as f64 / 86_400.0;
+                    OverlayValue::Duration(serial)
+                }
+                LiteralValue::Pending => OverlayValue::Pending,
+                LiteralValue::Array(_) => {
+                    OverlayValue::Error(formualizer_eval::arrow_store::map_error_code(
+                        formualizer_common::ExcelErrorKind::Value,
+                    ))
+                }
+            };
             // Use ensure_column_chunk_mut to lazily create chunk if needed
             if let Some(ch) = asheet.ensure_column_chunk_mut(col0, ch_idx) {
                 ch.overlay.set(in_off, ov);
-            }
-        }
-    }
-
-    fn overlay_value_for_literal(
-        value: &LiteralValue,
-        date_system: formualizer_common::DateSystem,
-    ) -> formualizer_eval::arrow_store::OverlayValue {
-        use formualizer_eval::arrow_store::OverlayValue;
-
-        match value {
-            LiteralValue::Empty => OverlayValue::Empty,
-            LiteralValue::Int(i) => OverlayValue::Number(*i as f64),
-            LiteralValue::Number(n) => OverlayValue::Number(*n),
-            LiteralValue::Boolean(b) => OverlayValue::Boolean(*b),
-            LiteralValue::Text(s) => OverlayValue::Text(std::sync::Arc::from(s.clone())),
-            LiteralValue::Error(e) => {
-                OverlayValue::Error(formualizer_eval::arrow_store::map_error_code(e.kind))
-            }
-            LiteralValue::Date(d) => {
-                let dt = d.and_hms_opt(0, 0, 0).unwrap();
-                let serial = formualizer_common::datetime_to_serial_for(date_system, &dt);
-                OverlayValue::DateTime(serial)
-            }
-            LiteralValue::DateTime(dt) => {
-                let serial = formualizer_common::datetime_to_serial_for(date_system, dt);
-                OverlayValue::DateTime(serial)
-            }
-            LiteralValue::Time(t) => {
-                let serial = formualizer_common::time_to_fraction(t);
-                OverlayValue::DateTime(serial)
-            }
-            LiteralValue::Duration(d) => {
-                let serial = d.num_seconds() as f64 / 86_400.0;
-                OverlayValue::Duration(serial)
-            }
-            LiteralValue::Pending => OverlayValue::Pending,
-            LiteralValue::Array(_) => {
-                OverlayValue::Error(formualizer_eval::arrow_store::map_error_code(
-                    formualizer_common::ExcelErrorKind::Value,
-                ))
             }
         }
     }
@@ -2258,14 +2241,15 @@ impl Workbook {
 
                     self.engine
                         .edit_with_logger(&mut self.log, |editor| {
-                            editor.set_cell_formula_with_old_state(
+                            editor.try_set_cell_formula_with_old_state(
                                 cell,
                                 ast,
                                 old_value,
                                 old_formula,
-                            );
+                            )
                         })
-                        .map_err(|e| IoError::from_backend("editor", e))?;
+                        .map_err(|e| IoError::from_backend("editor", e))?
+                        .map_err(IoError::Engine)?;
 
                     self.engine.clear_staged_formula_text(sheet, row, col);
                     if let Some(before) = staged_before {
@@ -2308,9 +2292,10 @@ impl Workbook {
                 );
                 self.engine
                     .edit_with_logger(&mut self.log, |editor| {
-                        editor.set_cell_formula(cell, ast);
+                        editor.try_set_cell_formula(cell, ast)
                     })
-                    .map_err(|e| IoError::from_backend("editor", e))?;
+                    .map_err(|e| IoError::from_backend("editor", e))?
+                    .map_err(IoError::Engine)?;
                 self.engine.clear_staged_formula_text(sheet, row, col);
                 if let Some(before) = staged_before {
                     self.record_staged_formula_cell_change(sheet, row, col, before, None);
@@ -2374,36 +2359,13 @@ impl Workbook {
 
     // Ranges
     pub fn read_range(&self, addr: &RangeAddress) -> Vec<Vec<LiteralValue>> {
-        let mut out = Vec::with_capacity(addr.height() as usize);
-        if let Some(asheet) = self.engine.sheet_store().sheet(&addr.sheet) {
-            let sr0 = addr.start_row.saturating_sub(1) as usize;
-            let sc0 = addr.start_col.saturating_sub(1) as usize;
-            let er0 = addr.end_row.saturating_sub(1) as usize;
-            let ec0 = addr.end_col.saturating_sub(1) as usize;
-            let view = asheet.range_view(sr0, sc0, er0, ec0);
-            let (h, w) = view.dims();
-            for rr in 0..h {
-                let mut row = Vec::with_capacity(w);
-                for cc in 0..w {
-                    row.push(view.get_cell(rr, cc));
-                }
-                out.push(row);
-            }
-        } else {
-            // Fallback: materialize via graph stored values
-            for r in addr.start_row..=addr.end_row {
-                let mut row = Vec::with_capacity(addr.width() as usize);
-                for c in addr.start_col..=addr.end_col {
-                    row.push(
-                        self.engine
-                            .get_cell_value(&addr.sheet, r, c)
-                            .unwrap_or(LiteralValue::Empty),
-                    );
-                }
-                out.push(row);
-            }
-        }
-        out
+        self.engine.get_range_values(
+            &addr.sheet,
+            addr.start_row,
+            addr.start_col,
+            addr.end_row,
+            addr.end_col,
+        )
     }
     pub fn write_range(
         &mut self,
@@ -2600,14 +2562,6 @@ impl Workbook {
         start_col: u32,
         rows: &[Vec<LiteralValue>],
     ) -> Result<(), IoError> {
-        #[cfg(feature = "benchmark_internal")]
-        let profile_batch = std::env::var_os("FORMUALIZER_WORKBOOK_PROFILE_BATCH").is_some()
-            && rows.iter().map(Vec::len).sum::<usize>() >= 1_000;
-        #[cfg(feature = "benchmark_internal")]
-        let mut profile_started = profile_batch.then(std::time::Instant::now);
-        #[cfg(feature = "benchmark_internal")]
-        let mut profile_phases = [std::time::Duration::ZERO; 4];
-
         // Pre-allocate the Arrow sheet to the full batch extent ONCE, so the
         // per-cell `mirror_value_to_overlay` → `ensure_row_capacity` → `grow_len_to`
         // (which rebuilds the whole column's type-tag/lanes on every call) is
@@ -2624,8 +2578,6 @@ impl Workbook {
             let end_col = start_col.saturating_add((width - 1) as u32);
             self.ensure_arrow_sheet_capacity(sheet, end_row as usize, end_col as usize);
         }
-        #[cfg(feature = "benchmark_internal")]
-        Self::record_set_values_profile_phase(&mut profile_started, &mut profile_phases, 0);
 
         if self.enable_changelog {
             let sheet_id = self
@@ -2636,23 +2588,19 @@ impl Workbook {
             // Capture old state from Arrow truth BEFORE applying the batch.
             // `staged_before` is the cell's staged formula text prior to the edit,
             // used to record a per-cell staged-formula delta for undo/redo (see #126).
-            let item_capacity = rows
-                .iter()
-                .fold(0usize, |total, row| total.saturating_add(row.len()));
             #[allow(clippy::type_complexity)]
             let mut items: Vec<(
                 u32,
                 u32,
-                usize,
-                usize,
+                LiteralValue,
                 formualizer_eval::reference::CellRef,
                 Option<LiteralValue>,
                 Option<formualizer_parse::ASTNode>,
                 Option<String>,
-            )> = Vec::with_capacity(item_capacity);
+            )> = Vec::new();
             for (ri, rvals) in rows.iter().enumerate() {
                 let r = start_row + ri as u32;
-                for (ci, _v) in rvals.iter().enumerate() {
+                for (ci, v) in rvals.iter().enumerate() {
                     let c = start_col + ci as u32;
                     let cell = formualizer_eval::reference::CellRef::new(
                         sheet_id,
@@ -2661,33 +2609,27 @@ impl Workbook {
                     let old_value = self.engine.get_cell_value(sheet, r, c);
                     let old_formula = self.engine.get_cell(sheet, r, c).and_then(|(ast, _)| ast);
                     let staged_before = self.staged_formula_cell(sheet, r, c);
-                    items.push((r, c, ri, ci, cell, old_value, old_formula, staged_before));
+                    items.push((r, c, v.clone(), cell, old_value, old_formula, staged_before));
                 }
             }
-            #[cfg(feature = "benchmark_internal")]
-            Self::record_set_values_profile_phase(&mut profile_started, &mut profile_phases, 1);
 
             self.engine
                 .edit_with_logger(&mut self.log, |editor| {
-                    for (_r, _c, ri, ci, cell, old_value, old_formula, _staged_before) in
-                        items.iter()
-                    {
-                        let value = &rows[*ri][*ci];
+                    for (_r, _c, v, cell, old_value, old_formula, _staged_before) in items.iter() {
                         // Old state captured from Arrow truth rides directly on the
                         // event (graph-captured state wins; this only fills `None`).
                         editor.set_cell_value_with_old_state(
                             *cell,
-                            value.clone(),
+                            v.clone(),
                             old_value.clone(),
                             old_formula.clone(),
                         );
                     }
                 })
                 .map_err(|e| IoError::from_backend("editor", e))?;
-            #[cfg(feature = "benchmark_internal")]
-            Self::record_set_values_profile_phase(&mut profile_started, &mut profile_phases, 2);
 
-            for (r, c, _ri, _ci, _cell, _old_value, _old_formula, staged_before) in items {
+            for (r, c, v, _cell, _old_value, _old_formula, staged_before) in items {
+                self.mirror_value_to_overlay(sheet, r, c, &v);
                 self.engine.clear_staged_formula_text(sheet, r, c);
                 // Setting a literal value clears any staged formula for this cell.
                 if staged_before.is_some() {
@@ -2695,16 +2637,6 @@ impl Workbook {
                 }
             }
             self.engine.mark_data_edited();
-            #[cfg(feature = "benchmark_internal")]
-            {
-                Self::record_set_values_profile_phase(&mut profile_started, &mut profile_phases, 3);
-                if profile_batch {
-                    eprintln!(
-                        "set_values_inner cells={item_capacity}: capacity={:?}, old_state={:?}, edit={:?}, overlay_clear={:?}",
-                        profile_phases[0], profile_phases[1], profile_phases[2], profile_phases[3],
-                    );
-                }
-            }
             Ok(())
         } else {
             for (ri, rvals) in rows.iter().enumerate() {
@@ -2721,20 +2653,9 @@ impl Workbook {
         }
     }
 
-    #[cfg(feature = "benchmark_internal")]
-    fn record_set_values_profile_phase(
-        started: &mut Option<std::time::Instant>,
-        phases: &mut [std::time::Duration; 4],
-        index: usize,
-    ) {
-        if let Some(previous) = started.take() {
-            let now = std::time::Instant::now();
-            phases[index] = now.duration_since(previous);
-            *started = Some(now);
-        }
-    }
-
-    // Batch set formulas in a rectangle starting at (start_row,start_col)
+    /// Set formulas in a rectangle starting at `(start_row, start_col)`.
+    /// In graph mode, an error may leave the successful prefix committed; this is
+    /// not an atomic batch. Deferred mode stages text for validation at preparation.
     pub fn set_formulas(
         &mut self,
         sheet: &str,
@@ -2824,7 +2745,9 @@ impl Workbook {
                             };
                             let ast = formualizer_parse::parser::parse(&with_eq)
                                 .map_err(|e| IoError::from_backend("parser", e))?;
-                            editor.set_cell_formula(cell, ast);
+                            editor
+                                .try_set_cell_formula(cell, ast)
+                                .map_err(IoError::Engine)?;
                         }
                     }
                     Ok(())

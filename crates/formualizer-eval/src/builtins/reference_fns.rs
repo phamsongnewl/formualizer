@@ -1,20 +1,48 @@
 use crate::args::{ArgSchema, CoercionPolicy, ShapeKind};
-use crate::function::{FnCaps, Function};
+use crate::function::{FnCaps, Function, FunctionResolution};
 use crate::traits::{ArgumentHandle, FunctionContext};
-use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue};
+use formualizer_common::{ArgKind, ExcelError, ExcelErrorKind, LiteralValue, PackedSheetCell};
 use formualizer_parse::parser::ReferenceType;
 
-fn number_strict_scalar() -> ArgSchema {
+fn position_scalar() -> ArgSchema {
     ArgSchema {
         kinds: smallvec::smallvec![ArgKind::Number],
         required: true,
         by_ref: false,
         shape: ShapeKind::Scalar,
-        coercion: CoercionPolicy::NumberStrict,
+        coercion: CoercionPolicy::NumberLenientText,
         max: None,
         repeating: None,
         default: None,
     }
+}
+
+/// Excel's sheet limits (1,048,576 rows, 16,384 columns), taken from the packed
+/// cell layout. OFFSET cannot address a cell past them.
+const SHEET_MAX_ROWS: i64 = PackedSheetCell::MAX_ROW0 as i64 + 1;
+const SHEET_MAX_COLS: i64 = PackedSheetCell::MAX_COL0 as i64 + 1;
+
+/// Coerce an INDEX/OFFSET position or size argument as Excel does.
+///
+/// Numbers truncate toward zero, a blank is 0, `TRUE`/`FALSE` are 1/0 and
+/// numeric text (`"2"`, `" 2 "`, `"1e0"`, `"50%"`) is parsed. Any other text,
+/// including a non-finite spelling such as `"inf"`, is `#VALUE!`; an error
+/// value passes through unchanged. Out-of-range magnitudes saturate, so the
+/// callers' bounds checks turn them into `#REF!`.
+fn position_argument(value: &LiteralValue) -> Result<i64, ExcelError> {
+    let number = crate::coercion::to_number_lenient(value)?;
+    if !number.is_finite() {
+        return Err(ExcelError::new(ExcelErrorKind::Value));
+    }
+    Ok(number.trunc() as i64)
+}
+
+/// A non-negative position as a `usize`, if it is at most `len`.
+///
+/// Converts with `usize::try_from` rather than `as`, so a position of 2^32 or
+/// more cannot truncate back into range on 32-bit targets (wasm32).
+fn position_within(position: i64, len: usize) -> Option<usize> {
+    usize::try_from(position).ok().filter(|&p| p <= len)
 }
 
 fn arg_byref_array() -> Vec<ArgSchema> {
@@ -30,14 +58,14 @@ fn arg_byref_array() -> Vec<ArgSchema> {
             repeating: None,
             default: None,
         },
-        number_strict_scalar(),
+        position_scalar(),
         // Column is optional for 1D arrays
         ArgSchema {
             kinds: smallvec::smallvec![ArgKind::Number],
             required: false,
             by_ref: false,
             shape: ShapeKind::Scalar,
-            coercion: CoercionPolicy::NumberStrict,
+            coercion: CoercionPolicy::NumberLenientText,
             max: None,
             repeating: None,
             default: None,
@@ -57,15 +85,15 @@ fn arg_byref_reference() -> Vec<ArgSchema> {
             repeating: None,
             default: None,
         },
-        number_strict_scalar(),
-        number_strict_scalar(),
+        position_scalar(),
+        position_scalar(),
         ArgSchema {
             // height optional
             kinds: smallvec::smallvec![ArgKind::Number],
             required: false,
             by_ref: false,
             shape: ShapeKind::Scalar,
-            coercion: CoercionPolicy::NumberStrict,
+            coercion: CoercionPolicy::NumberLenientText,
             max: None,
             repeating: None,
             default: None,
@@ -76,7 +104,7 @@ fn arg_byref_reference() -> Vec<ArgSchema> {
             required: false,
             by_ref: false,
             shape: ShapeKind::Scalar,
-            coercion: CoercionPolicy::NumberStrict,
+            coercion: CoercionPolicy::NumberLenientText,
             max: None,
             repeating: None,
             default: None,
@@ -84,17 +112,46 @@ fn arg_byref_reference() -> Vec<ArgSchema> {
     ]
 }
 
-/// Resolve a reference's concrete 1-based inclusive bounds as
-/// `(sheet, start_row, start_col, end_row, end_col)`.
+/// Concrete 1-based inclusive bounds `(sheet, start_row, start_col, end_row, end_col)`.
+type ReferenceBounds = (Option<String>, u32, u32, u32, u32);
+
+/// Convert a resolved `RangeView` (absolute, 0-based) into 1-based bounds on
+/// `sheet`. An empty view yields `#REF!`.
+fn view_bounds(
+    view: &crate::engine::range_view::RangeView<'_>,
+    sheet: Option<String>,
+) -> Result<ReferenceBounds, ExcelError> {
+    if view.is_empty() {
+        return Err(ExcelError::new(ExcelErrorKind::Ref));
+    }
+    Ok((
+        sheet,
+        view.start_row() as u32 + 1,
+        view.start_col() as u32 + 1,
+        view.end_row() as u32 + 1,
+        view.end_col() as u32 + 1,
+    ))
+}
+
+/// Resolve a reference's concrete 1-based inclusive bounds.
 ///
 /// Fully bounded ranges use their declared bounds directly. Unbounded
 /// whole-column/whole-row (or open-ended) ranges are clamped to the used
 /// region via `ctx.resolve_range_view`, mirroring how MATCH/VLOOKUP resolve
-/// the same references. An empty resolved view yields `#REF!`.
+/// the same references. A defined name resolves through the same call and
+/// takes the sheet and bounds of the region it names. An empty resolved view
+/// yields `#REF!`.
+///
+/// `Ok(None)` means the reference is a defined name that does not name a
+/// sheet region: a constant (`=5`), an array constant, a formula, or a name
+/// supplied by an external resolver. `resolve_range_view` materialises those
+/// into an owned view on a temporary backing sheet, whose coordinates are not
+/// cell addresses, so there are no bounds to return. Callers decide what that
+/// means (INDEX indexes the name's value; OFFSET answers `#VALUE!`).
 fn resolve_reference_bounds<'b>(
     ctx: &dyn FunctionContext<'b>,
     base: &ReferenceType,
-) -> Result<(Option<String>, u32, u32, u32, u32), ExcelError> {
+) -> Result<Option<ReferenceBounds>, ExcelError> {
     match base {
         ReferenceType::Range {
             sheet,
@@ -107,30 +164,243 @@ fn resolve_reference_bounds<'b>(
             if let (Some(sr), Some(sc), Some(er), Some(ec)) =
                 (start_row, start_col, end_row, end_col)
             {
-                return Ok((sheet.clone(), *sr, *sc, *er, *ec));
+                return Ok(Some((sheet.clone(), *sr, *sc, *er, *ec)));
             }
             let rv = ctx.resolve_range_view(base, ctx.current_sheet())?;
-            if rv.is_empty() {
-                return Err(ExcelError::new(ExcelErrorKind::Ref));
-            }
-            // RangeView exposes absolute 0-based coordinates; ReferenceType is 1-based.
-            Ok((
-                sheet.clone(),
-                rv.start_row() as u32 + 1,
-                rv.start_col() as u32 + 1,
-                rv.end_row() as u32 + 1,
-                rv.end_col() as u32 + 1,
-            ))
+            view_bounds(&rv, sheet.clone()).map(Some)
         }
         ReferenceType::Cell {
             sheet, row, col, ..
-        } => Ok((sheet.clone(), *row, *col, *row, *col)),
+        } => Ok(Some((sheet.clone(), *row, *col, *row, *col))),
+        ReferenceType::NamedRange(_) => {
+            let rv = ctx.resolve_range_view(base, ctx.current_sheet())?;
+            if !rv.is_sheet_backed() {
+                return Ok(None);
+            }
+            let sheet = Some(rv.sheet_name().to_string());
+            view_bounds(&rv, sheet).map(Some)
+        }
         _ => Err(ExcelError::new(ExcelErrorKind::Ref)),
     }
 }
 
 #[derive(Debug)]
 pub struct IndexFn;
+
+impl IndexFn {
+    fn index_argument<'a, 'b>(arg: &ArgumentHandle<'a, 'b>) -> Result<Option<i64>, ExcelError> {
+        if arg.is_omitted() {
+            return Ok(Some(0));
+        }
+        match arg.value()? {
+            crate::traits::CalcValue::Range(_)
+            | crate::traits::CalcValue::Scalar(LiteralValue::Array(_)) => Ok(None),
+            value => position_argument(&value.into_literal()).map(Some),
+        }
+    }
+
+    fn bounded_dimensions(base: &ReferenceType) -> Option<(u32, u32)> {
+        match base {
+            ReferenceType::Cell { .. } => Some((1, 1)),
+            ReferenceType::Range {
+                start_row: Some(start_row),
+                start_col: Some(start_col),
+                end_row: Some(end_row),
+                end_col: Some(end_col),
+                ..
+            } => Some((
+                end_row.checked_sub(*start_row)?.checked_add(1)?,
+                end_col.checked_sub(*start_col)?.checked_add(1)?,
+            )),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn precise_single_cell_selection<'a, 'b>(
+        args: &[ArgumentHandle<'a, 'b>],
+        rows: u32,
+        cols: u32,
+    ) -> bool {
+        if !(2..=3).contains(&args.len()) {
+            return false;
+        }
+        let Ok(Some(position)) = Self::index_argument(&args[1]) else {
+            return false;
+        };
+        if args.len() == 3 {
+            let Ok(Some(column)) = Self::index_argument(&args[2]) else {
+                return false;
+            };
+            if args[1].is_omitted() {
+                column > 0 && rows == 1 && u32::try_from(column).is_ok_and(|col| col <= cols)
+            } else if args[2].is_omitted() {
+                position > 0 && cols == 1 && u32::try_from(position).is_ok_and(|row| row <= rows)
+            } else {
+                position > 0
+                    && column > 0
+                    && u32::try_from(position).is_ok_and(|row| row <= rows)
+                    && u32::try_from(column).is_ok_and(|col| col <= cols)
+            }
+        } else if rows == 1 {
+            position > 0 && u32::try_from(position).is_ok_and(|col| col <= cols)
+        } else if cols == 1 {
+            position > 0 && u32::try_from(position).is_ok_and(|row| row <= rows)
+        } else {
+            false
+        }
+    }
+
+    fn reference_from_base<'a, 'b>(
+        args: &[ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+        base: ReferenceType,
+    ) -> Option<Result<ReferenceType, ExcelError>> {
+        let position = match Self::index_argument(&args[1]) {
+            Ok(Some(position)) => position,
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
+        let explicit_col = if args.len() >= 3 {
+            match Self::index_argument(&args[2]) {
+                Ok(Some(column)) => Some(column),
+                Ok(None) => return None,
+                Err(error) => return Some(Err(error)),
+            }
+        } else {
+            None
+        };
+
+        let (sheet, sr, sc, er, ec) = match resolve_reference_bounds(ctx, &base) {
+            Ok(Some(bounds)) => bounds,
+            // A name bound to a value rather than a sheet region: let `eval`
+            // index its value (`INDEX(K,1)` with `K` defined as `=5` is `5`).
+            Ok(None) => return None,
+            Err(error) => return Some(Err(error)),
+        };
+        let (row, col) = match explicit_col {
+            Some(col) => (position, col),
+            None if sr == er => (1, position),
+            None => (position, 1),
+        };
+        if row < 0 || col < 0 {
+            return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
+        }
+        // Compare in i64 before narrowing, so a saturated or very large index
+        // cannot wrap back into the range.
+        if row > i64::from(er - sr) + 1 || col > i64::from(ec - sc) + 1 {
+            return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
+        }
+        let range_ref = |sheet, sr, sc, er, ec| ReferenceType::Range {
+            sheet,
+            start_row: Some(sr),
+            start_col: Some(sc),
+            end_row: Some(er),
+            end_col: Some(ec),
+            start_row_abs: false,
+            start_col_abs: false,
+            end_row_abs: false,
+            end_col_abs: false,
+        };
+        if col == 0 {
+            if row == 0 {
+                return Some(Ok(range_ref(sheet, sr, sc, er, ec)));
+            }
+            let r = sr + (row as u32) - 1;
+            if r > er {
+                return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
+            }
+            return Some(Ok(if sc == ec {
+                ReferenceType::cell(sheet, r, sc)
+            } else {
+                range_ref(sheet, r, sc, r, ec)
+            }));
+        }
+        if row == 0 {
+            let c = sc + (col as u32) - 1;
+            if c > ec {
+                return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
+            }
+            return Some(Ok(if sr == er {
+                ReferenceType::cell(sheet, sr, c)
+            } else {
+                range_ref(sheet, sr, c, er, c)
+            }));
+        }
+        let r = sr + (row as u32) - 1;
+        let c = sc + (col as u32) - 1;
+        if r > er || c > ec {
+            return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
+        }
+        Some(Ok(ReferenceType::cell(sheet, r, c)))
+    }
+
+    fn materialize_reference<'b>(
+        ctx: &dyn FunctionContext<'b>,
+        reference: &ReferenceType,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let view = ctx.resolve_range_view(reference, ctx.current_sheet())?;
+        let (rows, cols) = view.dims();
+        if rows == 1 && cols == 1 {
+            Ok(crate::traits::CalcValue::Scalar(
+                view.as_1x1().unwrap_or(LiteralValue::Empty),
+            ))
+        } else {
+            Ok(crate::traits::CalcValue::Range(view))
+        }
+    }
+
+    /// Attempt the precise single-cell fast path.
+    ///
+    /// Returns `None` when any gate declines, in which case the caller falls
+    /// back to `validated_dispatch`. Factored out of `dispatch` (and
+    /// parameterized over the dispatching function) so tests can assert which
+    /// path a given argument shape takes and observe the format policy being
+    /// applied to the precise result.
+    pub(crate) fn precise_dispatch<'a, 'b, 'c>(
+        function: &dyn Function,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Option<crate::traits::CalcValue<'b>> {
+        let argument = args.first()?;
+        if !argument.may_return_reference() {
+            return None;
+        }
+        let Ok(FunctionResolution::Reference(base)) = argument.resolve_reference_or_value() else {
+            return None;
+        };
+        let (rows, cols) = Self::bounded_dimensions(&base)?;
+        if !Self::precise_single_cell_selection(args, rows, cols) {
+            return None;
+        }
+        let Some(Ok(reference @ ReferenceType::Cell { .. })) =
+            Self::reference_from_base(args, ctx, base)
+        else {
+            return None;
+        };
+        let value = Self::materialize_reference(ctx, &reference).ok()?;
+        Some(function.apply_format_propagation(value))
+    }
+
+    fn validated_dispatch<'a, 'b>(
+        &self,
+        args: &[ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        use crate::args::{ValidationOptions, validate_and_prepare};
+        if let Err(error) = validate_and_prepare(
+            args,
+            self.arg_schema(),
+            ValidationOptions {
+                warn_only: false,
+                min_args: self.min_args(),
+            },
+        ) {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+        }
+        self.eval(args, ctx)
+            .map(|result| self.apply_format_propagation(result))
+    }
+}
 
 /// Returns the value or reference at a 1-based row and column within an array or range.
 ///
@@ -145,8 +415,10 @@ pub struct IndexFn;
 /// - For rectangular 2D inputs, omitted `column_num` defaults to the first column.
 /// - A `row_num` or `column_num` of `0` selects the entire column or row respectively
 ///   (both `0` selects the whole range), matching Excel.
-/// - Negative or out-of-bounds indexes return `#REF!`.
-/// - Non-numeric index arguments return `#VALUE!`.
+/// - Negative or out-of-bounds indexes return `#REF!`. Excel returns `#VALUE!` for a negative
+///   index; this implementation does not match that yet.
+/// - Index arguments coerce like Excel: a blank is `0`, `TRUE` is `1` and numeric text is
+///   parsed; other text returns `#VALUE!`.
 ///
 /// # Examples
 /// ```yaml,sandbox
@@ -181,7 +453,7 @@ pub struct IndexFn;
 ///   - q: "How does INDEX behave when column_num is omitted?"
 ///     a: "For single-row or single-column inputs, row_num selects the position along that vector; for 2D inputs, omitted column_num defaults to the first column."
 ///   - q: "Which errors indicate bad indexes?"
-///     a: "Non-numeric index arguments return #VALUE!. A 0 row_num/column_num selects an entire column/row (Excel behavior); negative or out-of-bounds indexes return #REF!."
+///     a: "Text that is not a number returns #VALUE! (a blank index is 0, TRUE is 1, numeric text is parsed). A 0 row_num/column_num selects an entire column/row (Excel behavior); negative or out-of-bounds indexes return #REF!."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: INDEX
@@ -190,7 +462,7 @@ pub struct IndexFn;
 /// Max args: 3
 /// Variadic: false
 /// Signature: INDEX(arg1: any@range, arg2: number@scalar, arg3?: number@scalar)
-/// Arg schema: arg1{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}
+/// Arg schema: arg1{kinds=any,required=true,shape=range,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
 /// Caps: PURE, RETURNS_REFERENCE
 /// [formualizer-docgen:schema:end]
 impl Function for IndexFn {
@@ -209,125 +481,32 @@ impl Function for IndexFn {
         &SCHEMA
     }
 
+    fn dispatch<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        if let Some(value) = Self::precise_dispatch(self, args, ctx) {
+            return Ok(value);
+        }
+        self.validated_dispatch(args, ctx)
+    }
+
     fn eval_reference<'a, 'b, 'c>(
         &self,
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Option<Result<ReferenceType, ExcelError>> {
-        // args: array(by_ref), row, col (col optional for 1D)
         if args.len() < 2 {
             return Some(Err(ExcelError::new(ExcelErrorKind::Value)));
         }
-        // Return None for array literals so eval() handles them
-        let base = match args[0].as_reference_or_eval() {
-            Ok(r) => r,
-            Err(_) => return None,
-        };
-        // Defensive: value() currently materializes omitted indexes as Number(0), so these
-        // row/column checks are redundant while documenting whole-row/column intent.
-        let position = if args[1].is_omitted() {
-            0
-        } else {
-            match args[1].value() {
-                Ok(cv) => match cv.into_literal() {
-                    LiteralValue::Number(n) => n as i64,
-                    LiteralValue::Int(i) => i,
-                    _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-                },
-                Err(e) => return Some(Err(e)),
+        let base = match args[0].resolve_reference_or_value() {
+            Ok(FunctionResolution::Reference(reference)) => reference,
+            Ok(FunctionResolution::ReferenceError(_) | FunctionResolution::Value(_)) | Err(_) => {
+                return None;
             }
         };
-        let explicit_col = if args.len() >= 3 {
-            Some(if args[2].is_omitted() {
-                0
-            } else {
-                match args[2].value() {
-                    Ok(cv) => match cv.into_literal() {
-                        LiteralValue::Number(n) => n as i64,
-                        LiteralValue::Int(i) => i,
-                        _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-                    },
-                    Err(e) => return Some(Err(e)),
-                }
-            })
-        } else {
-            None
-        };
-
-        // Only Range/Cell supported for now; unbounded ranges (e.g. B:B, 2:2)
-        // are clamped to the used region instead of erroring.
-        let (sheet, sr, sc, er, ec) = match resolve_reference_bounds(ctx, &base) {
-            Ok(bounds) => bounds,
-            Err(e) => return Some(Err(e)),
-        };
-
-        let (row, col) = match explicit_col {
-            Some(col) => (position, col),
-            None if sr == er => {
-                // Excel treats INDEX(single_row_range, n) as horizontal indexing.
-                (1, position)
-            }
-            None => {
-                // Excel treats INDEX(single_col_range, n) as vertical indexing and defaults
-                // 2-D ranges to the first column when column_num is omitted.
-                (position, 1)
-            }
-        };
-
-        // 1-based indexing per Excel. A 0 means "the entire row" (column_num == 0)
-        // or "the entire column" (row_num == 0); 0 for both yields the whole range.
-        // Negative indices are #REF!.
-        if row < 0 || col < 0 {
-            return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
-        }
-        let range_ref = |sheet, sr, sc, er, ec| ReferenceType::Range {
-            sheet,
-            start_row: Some(sr),
-            start_col: Some(sc),
-            end_row: Some(er),
-            end_col: Some(ec),
-            start_row_abs: false,
-            start_col_abs: false,
-            end_row_abs: false,
-            end_col_abs: false,
-        };
-        if col == 0 {
-            if row == 0 {
-                // INDEX(range, 0, 0) -> the entire range.
-                return Some(Ok(range_ref(sheet, sr, sc, er, ec)));
-            }
-            // INDEX(range, r, 0) -> the entire row r (degenerates to a cell for a
-            // single-column range).
-            let r = sr + (row as u32) - 1;
-            if r > er {
-                return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
-            }
-            return Some(Ok(if sc == ec {
-                ReferenceType::cell(sheet, r, sc)
-            } else {
-                range_ref(sheet, r, sc, r, ec)
-            }));
-        }
-        if row == 0 {
-            // INDEX(range, 0, c) -> the entire column c (degenerates to a cell for a
-            // single-row range).
-            let c = sc + (col as u32) - 1;
-            if c > ec {
-                return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
-            }
-            return Some(Ok(if sr == er {
-                ReferenceType::cell(sheet, sr, c)
-            } else {
-                range_ref(sheet, sr, c, er, c)
-            }));
-        }
-        let r = sr + (row as u32) - 1;
-        let c = sc + (col as u32) - 1;
-        if r > er || c > ec {
-            return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
-        }
-
-        Some(Ok(ReferenceType::cell(sheet, r, c)))
+        Self::reference_from_base(args, ctx, base)
     }
 
     fn eval<'a, 'b, 'c>(
@@ -338,23 +517,9 @@ impl Function for IndexFn {
         // First try to handle as a reference
         if let Some(result) = self.eval_reference(args, ctx) {
             match result {
-                Ok(r) => {
-                    // Materialize to value
-                    let current_sheet = ctx.current_sheet();
-                    match ctx.resolve_range_view(&r, current_sheet) {
-                        Ok(rv) => {
-                            let (rows, cols) = rv.dims();
-                            if rows == 1 && cols == 1 {
-                                Ok(crate::traits::CalcValue::Scalar(
-                                    rv.as_1x1().unwrap_or(LiteralValue::Empty),
-                                ))
-                            } else {
-                                Ok(crate::traits::CalcValue::Range(rv))
-                            }
-                        }
-                        Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
-                    }
-                }
+                Ok(reference) => Self::materialize_reference(ctx, &reference).or_else(|error| {
+                    Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)))
+                }),
                 Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
             }
         } else {
@@ -374,13 +539,10 @@ impl Function for IndexFn {
             let index = if args[1].is_omitted() {
                 0
             } else {
-                match args[1].value()?.into_literal() {
-                    LiteralValue::Number(n) => n as i64,
-                    LiteralValue::Int(i) => i,
-                    _ => {
-                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                            ExcelError::new(ExcelErrorKind::Value),
-                        )));
+                match position_argument(&args[1].value()?.into_literal()) {
+                    Ok(index) => index,
+                    Err(error) => {
+                        return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
                     }
                 }
             };
@@ -390,12 +552,11 @@ impl Function for IndexFn {
                 Some(if args[2].is_omitted() {
                     0
                 } else {
-                    match args[2].value()?.into_literal() {
-                        LiteralValue::Number(n) => n as i64,
-                        LiteralValue::Int(i) => i,
-                        _ => {
+                    match position_argument(&args[2].value()?.into_literal()) {
+                        Ok(column) => column,
+                        Err(error) => {
                             return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                                ExcelError::new(ExcelErrorKind::Value),
+                                error,
                             )));
                         }
                     }
@@ -445,10 +606,10 @@ impl Function for IndexFn {
                     return Ok(as_range(table));
                 }
                 // INDEX(array, r, 0) -> the entire row r (scalar for a single-column array).
-                if row as usize > nrows {
+                let Some(r) = position_within(row, nrows) else {
                     return Ok(ref_err());
-                }
-                let r = &table[row as usize - 1];
+                };
+                let r = &table[r - 1];
                 if ncols == 1 {
                     return Ok(crate::traits::CalcValue::Scalar(
                         r.first().cloned().unwrap_or(LiteralValue::Empty),
@@ -458,10 +619,10 @@ impl Function for IndexFn {
             }
             if row == 0 {
                 // INDEX(array, 0, c) -> the entire column c (scalar for a single-row array).
-                if col as usize > ncols {
+                let Some(c) = position_within(col, ncols) else {
                     return Ok(ref_err());
-                }
-                let cidx = col as usize - 1;
+                };
+                let cidx = c - 1;
                 if single_row {
                     return Ok(crate::traits::CalcValue::Scalar(
                         table[0].get(cidx).cloned().unwrap_or(LiteralValue::Empty),
@@ -475,12 +636,13 @@ impl Function for IndexFn {
             }
 
             // 1-based positive indexing.
-            if row as usize > nrows || col as usize > ncols {
+            let (Some(r), Some(c)) = (position_within(row, nrows), position_within(col, ncols))
+            else {
                 return Ok(ref_err());
-            }
+            };
             let val = table
-                .get(row as usize - 1)
-                .and_then(|r| r.get(col as usize - 1))
+                .get(r - 1)
+                .and_then(|row| row.get(c - 1))
                 .cloned()
                 .unwrap_or_else(|| LiteralValue::Error(ExcelError::new(ExcelErrorKind::Ref)));
             Ok(crate::traits::CalcValue::Scalar(val))
@@ -499,8 +661,10 @@ pub struct OffsetFn;
 /// # Remarks
 /// - `rows` and `cols` shift from the top-left of `reference`.
 /// - If omitted, `height` and `width` default to the original reference size.
-/// - Non-positive target coordinates or dimensions return `#REF!`.
-/// - Non-numeric offset/size inputs return `#VALUE!`.
+/// - Non-positive target coordinates or dimensions return `#REF!`, and so does a result that
+///   extends past the last row or column of the sheet.
+/// - Offset/size inputs coerce like Excel: a blank is `0`, `TRUE` is `1` and numeric text is
+///   parsed; other text returns `#VALUE!`.
 /// - In value context, a 1x1 result returns a scalar; larger results spill as an array.
 ///
 /// # Examples
@@ -535,7 +699,7 @@ pub struct OffsetFn;
 ///   - q: "What defaults are used when height and width are omitted?"
 ///     a: "OFFSET keeps the source reference size, then applies the row/column shift to that same-sized block."
 ///   - q: "When does OFFSET return #REF!?"
-///     a: "It returns #REF! if the shifted start goes to row/column <= 0 or if requested height/width are non-positive."
+///     a: "It returns #REF! if the shifted start goes to row/column <= 0, if requested height/width are non-positive, or if the result extends past the edge of the sheet."
 /// ```
 /// [formualizer-docgen:schema:start]
 /// Name: OFFSET
@@ -544,7 +708,7 @@ pub struct OffsetFn;
 /// Max args: 5
 /// Variadic: false
 /// Signature: OFFSET(arg1: range@range, arg2: number@scalar, arg3: number@scalar, arg4?: number@scalar, arg5?: number@scalar)
-/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberStrict,max=None,repeating=None,default=false}
+/// Arg schema: arg1{kinds=range,required=true,shape=range,by_ref=true,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg3{kinds=number,required=true,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg4{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}; arg5{kinds=number,required=false,shape=scalar,by_ref=false,coercion=NumberLenientText,max=None,repeating=None,default=false}
 /// Caps: PURE, VOLATILE, RETURNS_REFERENCE, DYNAMIC_DEPENDENCY
 /// [formualizer-docgen:schema:end]
 impl Function for OffsetFn {
@@ -576,51 +740,46 @@ impl Function for OffsetFn {
             Ok(r) => r,
             Err(e) => return Some(Err(e)),
         };
-        let dr = match args[1].value() {
-            Ok(cv) => match cv.into_literal() {
-                LiteralValue::Number(n) => n as i64,
-                LiteralValue::Int(i) => i,
-                _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-            },
+        let numeric_argument = |argument: &ArgumentHandle<'a, 'b>| {
+            position_argument(&argument.value()?.into_literal())
+        };
+        let dr = match numeric_argument(&args[1]) {
+            Ok(value) => value,
             Err(e) => return Some(Err(e)),
         };
-        let dc = match args[2].value() {
-            Ok(cv) => match cv.into_literal() {
-                LiteralValue::Number(n) => n as i64,
-                LiteralValue::Int(i) => i,
-                _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-            },
+        let dc = match numeric_argument(&args[2]) {
+            Ok(value) => value,
             Err(e) => return Some(Err(e)),
         };
 
         // Unbounded ranges (e.g. B:B, 2:2) are clamped to the used region
         // instead of erroring.
         let (sheet, sr, sc, er, ec) = match resolve_reference_bounds(ctx, &base) {
-            Ok(bounds) => bounds,
+            Ok(Some(bounds)) => bounds,
+            // A name bound to a value rather than a sheet region has no cells
+            // to offset from; Excel answers `#VALUE!`.
+            Ok(None) => {
+                return Some(Err(ExcelError::new(ExcelErrorKind::Value)
+                    .with_message("OFFSET reference is a name bound to a value")));
+            }
             Err(e) => return Some(Err(e)),
         };
 
-        let nsr = (sr as i64) + dr;
-        let nsc = (sc as i64) + dc;
+        // Saturating: a huge offset lands past the sheet edge and is `#REF!`
+        // below, instead of overflowing.
+        let nsr = (sr as i64).saturating_add(dr);
+        let nsc = (sc as i64).saturating_add(dc);
         let height = if args.len() >= 4 && !args[3].is_omitted() {
-            match args[3].value() {
-                Ok(cv) => match cv.into_literal() {
-                    LiteralValue::Number(n) => n as i64,
-                    LiteralValue::Int(i) => i,
-                    _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-                },
+            match numeric_argument(&args[3]) {
+                Ok(value) => value,
                 Err(e) => return Some(Err(e)),
             }
         } else {
             (er as i64) - (sr as i64) + 1
         };
         let width = if args.len() >= 5 && !args[4].is_omitted() {
-            match args[4].value() {
-                Ok(cv) => match cv.into_literal() {
-                    LiteralValue::Number(n) => n as i64,
-                    LiteralValue::Int(i) => i,
-                    _ => return Some(Err(ExcelError::new(ExcelErrorKind::Value))),
-                },
+            match numeric_argument(&args[4]) {
+                Ok(value) => value,
                 Err(e) => return Some(Err(e)),
             }
         } else {
@@ -630,8 +789,14 @@ impl Function for OffsetFn {
         if nsr <= 0 || nsc <= 0 || height <= 0 || width <= 0 {
             return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
         }
-        let ner = nsr + height - 1;
-        let nec = nsc + width - 1;
+        let ner = nsr.saturating_add(height - 1);
+        let nec = nsc.saturating_add(width - 1);
+        // Excel answers `#REF!` for a result that extends past the last row or
+        // column; building such a reference would also exceed the packed
+        // coordinate range.
+        if ner > SHEET_MAX_ROWS || nec > SHEET_MAX_COLS {
+            return Some(Err(ExcelError::new(ExcelErrorKind::Ref)));
+        }
 
         if height == 1 && width == 1 {
             Some(Ok(ReferenceType::cell(sheet, nsr as u32, nsc as u32)))
@@ -651,25 +816,30 @@ impl Function for OffsetFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        if let Some(Ok(r)) = self.eval_reference(args, ctx) {
-            let current_sheet = ctx.current_sheet();
-            match ctx.resolve_range_view(&r, current_sheet) {
-                Ok(rv) => {
-                    let (rows, cols) = rv.dims();
-                    if rows == 1 && cols == 1 {
-                        Ok(crate::traits::CalcValue::Scalar(
-                            rv.as_1x1().unwrap_or(LiteralValue::Empty),
-                        ))
-                    } else {
-                        Ok(crate::traits::CalcValue::Range(rv))
-                    }
-                }
-                Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+        let r = match self.eval_reference(args, ctx) {
+            Some(Ok(r)) => r,
+            // Report the error the reference path found (an undefined name is
+            // `#NAME?`, a name bound to a value `#VALUE!`), as the reference
+            // callers of `eval_reference` already see it.
+            Some(Err(e)) => return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
+            None => {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                    ExcelError::new(ExcelErrorKind::Ref),
+                )));
             }
-        } else {
-            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
-                ExcelError::new(ExcelErrorKind::Ref),
-            )))
+        };
+        match ctx.resolve_range_view(&r, ctx.current_sheet()) {
+            Ok(rv) => {
+                let (rows, cols) = rv.dims();
+                if rows == 1 && cols == 1 {
+                    Ok(crate::traits::CalcValue::Scalar(
+                        rv.as_1x1().unwrap_or(LiteralValue::Empty),
+                    ))
+                } else {
+                    Ok(crate::traits::CalcValue::Range(rv))
+                }
+            }
+            Err(e) => Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(e))),
         }
     }
 }
@@ -896,10 +1066,123 @@ impl Function for IndirectFn {
     }
 }
 
+#[derive(Debug)]
+pub struct HyperlinkFn;
+
+/// Returns the friendly name of a hyperlink, or its link location when no name is given.
+///
+/// The returned value is `friendly_name` when the second argument is present,
+/// otherwise `link_location`.
+///
+/// Known divergence: the friendly name is always returned as text, whereas
+/// Excel passes numbers and booleans through with their original type, so
+/// `=ISNUMBER(HYPERLINK("x",1))` is FALSE here and TRUE in Excel.
+///
+/// ```yaml,sandbox
+/// title: "Hyperlink with a friendly name"
+/// formula: '=HYPERLINK("https://example.com","Example")'
+/// expected: "Example"
+/// ```
+///
+/// ```yaml,sandbox
+/// title: "Hyperlink without a friendly name"
+/// formula: '=HYPERLINK("https://example.com")'
+/// expected: "https://example.com"
+/// ```
+///
+/// ```yaml,docs
+/// related:
+///   - INDIRECT
+/// faq:
+///   - q: "What does HYPERLINK return?"
+///     a: "The friendly name when provided, otherwise the link location, always as text."
+/// ```
+/// [formualizer-docgen:schema:start]
+/// Name: HYPERLINK
+/// Type: HyperlinkFn
+/// Min args: 1
+/// Max args: 2
+/// Variadic: false
+/// Signature: HYPERLINK(arg1: any@scalar, arg2?: any@scalar)
+/// Arg schema: arg1{kinds=any,required=true,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}; arg2{kinds=any,required=false,shape=scalar,by_ref=false,coercion=None,max=None,repeating=None,default=false}
+/// Caps: PURE
+/// [formualizer-docgen:schema:end]
+impl Function for HyperlinkFn {
+    fn caps(&self) -> FnCaps {
+        FnCaps::PURE
+    }
+    fn name(&self) -> &'static str {
+        "HYPERLINK"
+    }
+    fn min_args(&self) -> usize {
+        1
+    }
+    fn arg_schema(&self) -> &'static [ArgSchema] {
+        use std::sync::LazyLock;
+        static SCHEMA: LazyLock<Vec<ArgSchema>> = LazyLock::new(|| {
+            let mut optional = ArgSchema::any();
+            optional.required = false;
+            vec![ArgSchema::any(), optional]
+        });
+        &SCHEMA
+    }
+
+    fn eval<'a, 'b, 'c>(
+        &self,
+        args: &'c [ArgumentHandle<'a, 'b>],
+        _ctx: &dyn FunctionContext<'b>,
+    ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+        let link = hyperlink_text(&args[0])?;
+        if args.len() < 2 {
+            return Ok(link);
+        }
+        hyperlink_text(&args[1])
+    }
+}
+
+/// Coerces a HYPERLINK argument to its display text.
+///
+/// Errors propagate as the argument's own error. Multi-cell references and
+/// array constants cannot name a hyperlink target, so they surface `#VALUE!`
+/// instead of leaking a debug-formatted array literal into the cell text.
+/// A 1x1 array collapses to its single element.
+fn hyperlink_text<'a, 'b>(
+    arg: &ArgumentHandle<'a, 'b>,
+) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+    let lit = match arg.value()? {
+        crate::traits::CalcValue::Scalar(lit) => lit,
+        crate::traits::CalcValue::AnnotatedScalar(lit, _) => lit,
+        crate::traits::CalcValue::Range(view) => {
+            let (rows, cols) = view.dims();
+            if rows == 1 && cols == 1 {
+                view.get_cell(0, 0)
+            } else {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                    ExcelError::new_value(),
+                )));
+            }
+        }
+        crate::traits::CalcValue::Callable(_) => {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
+            )));
+        }
+    };
+    Ok(crate::traits::CalcValue::Scalar(match lit {
+        LiteralValue::Error(e) => LiteralValue::Error(e),
+        LiteralValue::Array(arr) if arr.len() == 1 && arr[0].len() == 1 => {
+            LiteralValue::Text(crate::coercion::to_text_invariant(&arr[0][0]))
+        }
+        LiteralValue::Array(_) => LiteralValue::Error(ExcelError::new_value()),
+        other => LiteralValue::Text(crate::coercion::to_text_invariant(&other)),
+    }))
+}
+
 pub fn register_builtins() {
     crate::function_registry::register_builtin(std::sync::Arc::new(IndexFn));
     crate::function_registry::register_builtin(std::sync::Arc::new(OffsetFn));
     crate::function_registry::register_builtin(std::sync::Arc::new(IndirectFn));
+    crate::function_registry::register_builtin(std::sync::Arc::new(HyperlinkFn));
 }
 
 #[cfg(test)]
@@ -1295,5 +1578,123 @@ mod tests {
             .unwrap()
             .into_literal();
         assert_eq!(v, LiteralValue::Number(5.0));
+    }
+
+    fn assert_error_kind(value: LiteralValue, expected: ExcelErrorKind) {
+        match value {
+            LiteralValue::Error(error) => assert_eq!(error.kind, expected),
+            other => panic!("expected {expected:?}, got {other:?}"),
+        }
+    }
+
+    fn position_workbook() -> TestWorkbook {
+        TestWorkbook::new()
+            .with_cell_a1("Sheet1", "A1", LiteralValue::Int(7))
+            .with_cell_a1("Sheet1", "A2", LiteralValue::Int(8))
+            .with_cell_a1("Sheet1", "A3", LiteralValue::Int(9))
+            .with_cell_a1("Sheet1", "B1", LiteralValue::Empty)
+            .with_cell_a1("Sheet1", "C1", LiteralValue::Text("1".into()))
+            .with_cell_a1(
+                "Sheet1",
+                "D1",
+                LiteralValue::Error(ExcelError::new(ExcelErrorKind::Div)),
+            )
+            .with_function(std::sync::Arc::new(IndexFn))
+            .with_function(std::sync::Arc::new(OffsetFn))
+            .with_function(std::sync::Arc::new(crate::builtins::math::aggregate::SumFn))
+    }
+
+    #[test]
+    fn offset_blank_boolean_and_numeric_text_arguments_coerce() {
+        let wb = position_workbook();
+        for (formula, expected) in [
+            ("=OFFSET(A1,0,B1)", 7.0),
+            ("=OFFSET(A1,B1,0)", 7.0),
+            ("=OFFSET(A1,TRUE,0)", 8.0),
+            ("=OFFSET(A1,\"1\",0)", 8.0),
+            ("=OFFSET(A1,C1,0)", 8.0),
+            ("=OFFSET(A1,\" 1 \",0)", 8.0),
+            ("=OFFSET(A1,\"50%\",0)", 7.0),
+            ("=SUM(OFFSET(A1,0,0,\"2\",1))", 15.0),
+            ("=OFFSET(A3,-1.5,0)", 8.0),
+        ] {
+            assert_eq!(
+                evaluate_formula(formula, &wb).unwrap(),
+                LiteralValue::Number(expected),
+                "{formula}"
+            );
+        }
+    }
+
+    #[test]
+    fn offset_non_numeric_text_is_value_and_errors_pass_through() {
+        let wb = position_workbook();
+        for formula in [
+            "=OFFSET(A1,0,\"x\")",
+            "=OFFSET(A1,\"TRUE\",0)",
+            "=OFFSET(A1,\"inf\",0)",
+            "=OFFSET(A1,0,0,\"x\",1)",
+        ] {
+            assert_error_kind(
+                evaluate_formula(formula, &wb).unwrap(),
+                ExcelErrorKind::Value,
+            );
+        }
+        assert_error_kind(
+            evaluate_formula("=OFFSET(A1,0,D1)", &wb).unwrap(),
+            ExcelErrorKind::Div,
+        );
+    }
+
+    #[test]
+    fn offset_blank_size_and_results_past_the_sheet_edge_are_ref() {
+        let wb = position_workbook();
+        for formula in [
+            "=OFFSET(A1,0,0,B1,1)",
+            "=OFFSET(A1,0,0,1,B1)",
+            "=OFFSET(A1,-1,0)",
+            "=OFFSET(A1,2000000,0)",
+            "=OFFSET(A1,0,20000)",
+            "=OFFSET(A1,1E+300,0)",
+            "=OFFSET(A1,1048575,0,2,1)",
+        ] {
+            assert_error_kind(evaluate_formula(formula, &wb).unwrap(), ExcelErrorKind::Ref);
+        }
+    }
+
+    #[test]
+    fn index_blank_boolean_and_numeric_text_positions_coerce() {
+        let wb = position_workbook();
+        for (formula, expected) in [
+            ("=SUM(INDEX(A1:A3,B1))", 24.0),
+            ("=INDEX(A1:A3,\"2\")", 8.0),
+            ("=INDEX(A1:A3,TRUE)", 7.0),
+            ("=INDEX(A1:A3,C1)", 7.0),
+            ("=INDEX({7;8;9},\"2\")", 8.0),
+            ("=SUM(INDEX({7;8;9},B1))", 24.0),
+        ] {
+            assert_eq!(
+                evaluate_formula(formula, &wb).unwrap(),
+                LiteralValue::Number(expected),
+                "{formula}"
+            );
+        }
+        assert_error_kind(
+            evaluate_formula("=INDEX(A1:A3,\"x\")", &wb).unwrap(),
+            ExcelErrorKind::Value,
+        );
+    }
+
+    #[test]
+    fn index_huge_position_is_ref_without_wrapping() {
+        let wb = position_workbook();
+        // 2^32 + 1 would narrow to 1 as a u32.
+        for formula in [
+            "=INDEX(A1:A3,4294967297)",
+            "=INDEX(A1:A3,1E+300)",
+            "=INDEX({7;8;9},4294967297)",
+        ] {
+            assert_error_kind(evaluate_formula(formula, &wb).unwrap(), ExcelErrorKind::Ref);
+        }
     }
 }

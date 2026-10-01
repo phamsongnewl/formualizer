@@ -9,7 +9,7 @@ use formualizer::common::error::{ExcelError, ExcelErrorKind};
 use crate::engine::{
     PyEvaluationConfig, apply_binding_eval_defaults, eval_plan_to_py, merge_python_eval_config,
 };
-use crate::enums::PyWorkbookMode;
+use crate::enums::{PyWorkbookMode, PyXlsxPathSource};
 use crate::errors::workbook_error_to_pyerr;
 use crate::value::{literal_to_py, py_to_literal};
 use std::collections::HashMap;
@@ -277,28 +277,43 @@ impl PyWorkbook {
     /// Args:
     ///     path: Path to the `.xlsx` file.
     ///     backend: Backend name (currently defaults to `calamine`).
+    ///     path_source: `XlsxPathSource.SHARED_FILE` (the safe default) or
+    ///         `XlsxPathSource.DIRECT_MMAP`. Direct mmap requires a native
+    ///         Calamine `.xlsx` path whose underlying file is not destructively
+    ///         modified or truncated while the workbook loads.
     ///     mode/config: Optional workbook configuration.
     ///
     /// Example:
     /// ```python
     ///     import formualizer as fz
     ///
-    ///     wb = fz.Workbook.load_path("model.xlsx")
+    ///     wb = fz.Workbook.load_path(
+    ///         "model.xlsx", path_source=fz.XlsxPathSource.DIRECT_MMAP
+    ///     )
     ///     print(wb.sheet_names)
     /// ```
     #[classmethod]
-    #[pyo3(signature = (path, strategy=None, backend=None, *, mode=None, config=None, span_evaluation=None))]
+    #[pyo3(signature = (path, strategy=None, backend=None, *, path_source=None, mode=None, config=None, span_evaluation=None))]
     pub fn load_path(
         _cls: &Bound<'_, pyo3::types::PyType>,
         path: &str,
         strategy: Option<&str>,
         backend: Option<&str>,
+        path_source: Option<PyXlsxPathSource>,
         mode: Option<PyWorkbookMode>,
         config: Option<PyWorkbookConfig>,
         span_evaluation: Option<bool>,
     ) -> PyResult<Self> {
         let _ = strategy; // currently unused, default eager
-        Self::from_path(_cls, path, backend, mode, config, span_evaluation)
+        Self::from_path(
+            _cls,
+            path,
+            backend,
+            path_source,
+            mode,
+            config,
+            span_evaluation,
+        )
     }
 
     /// Get or create a sheet by name.
@@ -335,35 +350,62 @@ impl PyWorkbook {
     }
 
     #[classmethod]
-    #[pyo3(signature = (path, backend=None, *, mode=None, config=None, span_evaluation=None))]
+    #[pyo3(signature = (path, backend=None, *, path_source=None, mode=None, config=None, span_evaluation=None))]
     pub fn from_path(
         _cls: &Bound<'_, pyo3::types::PyType>,
         path: &str,
         backend: Option<&str>,
+        path_source: Option<PyXlsxPathSource>,
         mode: Option<PyWorkbookMode>,
         config: Option<PyWorkbookConfig>,
         span_evaluation: Option<bool>,
     ) -> PyResult<Self> {
         let backend = backend.unwrap_or("calamine");
+        let path_source = path_source.unwrap_or_default();
+        if path_source == PyXlsxPathSource::DirectMmap && backend != "calamine" {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "path_source=XlsxPathSource.DIRECT_MMAP requires backend='calamine', not backend='{backend}'"
+            )));
+        }
+        if path_source == PyXlsxPathSource::DirectMmap
+            && !std::path::Path::new(path)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("xlsx"))
+        {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "path_source=XlsxPathSource.DIRECT_MMAP supports only Calamine `.xlsx` filesystem paths; use SHARED_FILE or an in-memory byte API for other formats",
+            ));
+        }
         let cfg = resolve_workbook_config(mode, config, span_evaluation)?;
         match backend {
             "calamine" => {
                 #[cfg(target_os = "emscripten")]
                 {
                     let _ = (path, cfg);
+                    let message = if path_source == PyXlsxPathSource::DirectMmap {
+                        "XlsxPathSource.DIRECT_MMAP is unavailable in the Pyodide build; use SHARED_FILE or an in-memory XLSX byte API"
+                    } else {
+                        "backend='calamine' is unavailable in the Pyodide build; use backend='umya' with in-memory XLSX bytes"
+                    };
                     Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
-                        "backend='calamine' is unavailable in the Pyodide build; use backend='umya' with in-memory XLSX bytes",
+                        message,
                     ))
                 }
                 #[cfg(not(target_os = "emscripten"))]
                 {
                     use formualizer::workbook::backends::CalamineAdapter;
-                    use formualizer::workbook::traits::SpreadsheetReader;
-                    let adapter = <CalamineAdapter as SpreadsheetReader>::open_path(
+                    let adapter = CalamineAdapter::open_path_with_source(
                         std::path::Path::new(path),
+                        path_source.into(),
                     )
                     .map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("open failed: {e}"))
+                        let source = match path_source {
+                            PyXlsxPathSource::SharedFile => "SHARED_FILE",
+                            PyXlsxPathSource::DirectMmap => "DIRECT_MMAP",
+                        };
+                        PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
+                            "open failed with XlsxPathSource.{source}: {e}"
+                        ))
                     })?;
                     let wb = formualizer::workbook::Workbook::from_reader(
                         adapter,
@@ -851,6 +893,34 @@ impl PyWorkbook {
         literal_to_py(py, &v)
     }
 
+    /// Pin the evaluation clock to a caller-supplied instant, so the
+    /// volatile date/time builtins (TODAY, NOW) evaluate deterministically
+    /// on the next recalculation. Takes effect on a live workbook; no
+    /// reload is required.
+    ///
+    /// `deterministic_timezone` accepts `"utc"`, `"local"`, or a fixed
+    /// offset in seconds — the same spelling as
+    /// `SheetPortSession.evaluate_once(deterministic_timezone=...)`.
+    /// Omitted means UTC.
+    #[pyo3(signature = (deterministic_timestamp_utc, deterministic_timezone=None))]
+    pub fn set_deterministic_clock(
+        &self,
+        deterministic_timestamp_utc: chrono::DateTime<chrono::Utc>,
+        deterministic_timezone: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let timezone = match deterministic_timezone {
+            Some(obj) => crate::sheetport::parse_timezone_spec(obj)?,
+            None => formualizer::eval::timezone::TimeZoneSpec::Utc,
+        };
+        let mut wb = self.write_inner()?;
+        wb.set_deterministic_mode(formualizer::eval::engine::DeterministicMode::Enabled {
+            timestamp_utc: deterministic_timestamp_utc,
+            timezone,
+        })
+        .map_err(workbook_error_to_pyerr)?;
+        Ok(())
+    }
+
     pub fn evaluate_all(&self, py: Python<'_>) -> PyResult<()> {
         // Ensure flag is reset before starting
         self.cancel_flag
@@ -971,6 +1041,22 @@ impl PyWorkbook {
     pub fn reset_cancel(&self) {
         self.cancel_flag
             .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Choose temporal output as native Python datetime values (default) or floats.
+    pub fn set_temporal_egress(&self, policy: &str) -> PyResult<()> {
+        let policy = match policy.to_ascii_lowercase().as_str() {
+            "native" => formualizer::eval::engine::TemporalEgress::Native,
+            "serial" => formualizer::eval::engine::TemporalEgress::Serial,
+            _ => {
+                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                    "temporal egress must be 'native' or 'serial'",
+                ));
+            }
+        };
+        self.write_inner()?.engine_mut().set_temporal_egress(policy);
+        self.sheets.write().unwrap().clear();
+        Ok(())
     }
 
     pub fn get_value(
@@ -1261,6 +1347,13 @@ pub struct PyCycleTelemetry {
     /// Identical-bit NaN comparisons treated as converged (spec §6 NaN rule).
     #[pyo3(get)]
     pub nan_converged: usize,
+    /// Retained exactly-converged SCCs that had no dirty member at the start of this request and were
+    /// therefore served without a re-run (#368).
+    #[pyo3(get)]
+    pub reused_sccs: usize,
+    /// Members of the SCCs counted in `reused_sccs`.
+    #[pyo3(get)]
+    pub reused_scc_members: usize,
     /// Wall-clock milliseconds spent inside Runtime SCC tasks.
     #[pyo3(get)]
     pub elapsed_ms: u64,
@@ -1280,6 +1373,8 @@ impl PyCycleTelemetry {
             capped_sccs: t.capped_sccs,
             max_abs_delta_at_stop: t.max_abs_delta_at_stop,
             nan_converged: t.nan_converged,
+            reused_sccs: t.reused_sccs,
+            reused_scc_members: t.reused_scc_members,
             elapsed_ms: u64::try_from(t.elapsed_ms).unwrap_or(u64::MAX),
         }
     }
@@ -1293,7 +1388,8 @@ impl PyCycleTelemetry {
             "CycleTelemetry(static_sccs={}, phantom_sccs={}, live_cycles_witnessed={}, \
              circ_cells_stamped={}, settle_passes_total={}, max_passes_single_scc={}, \
              iterated_sccs={}, converged_sccs={}, capped_sccs={}, \
-             max_abs_delta_at_stop={}, nan_converged={}, elapsed_ms={})",
+             max_abs_delta_at_stop={}, nan_converged={}, reused_sccs={}, \
+             reused_scc_members={}, elapsed_ms={})",
             self.static_sccs,
             self.phantom_sccs,
             self.live_cycles_witnessed,
@@ -1305,6 +1401,8 @@ impl PyCycleTelemetry {
             self.capped_sccs,
             self.max_abs_delta_at_stop,
             self.nan_converged,
+            self.reused_sccs,
+            self.reused_scc_members,
             self.elapsed_ms,
         )
     }

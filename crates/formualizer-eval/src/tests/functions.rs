@@ -561,3 +561,455 @@ fn interpreter_incompatible_broadcast_is_value_error() {
         v => panic!("expected value error, got {v:?}"),
     }
 }
+
+fn reference_returning_engine(g1: i64) -> crate::engine::Engine<TestWorkbook> {
+    use crate::engine::{CycleConfig, CycleDetection, CyclePolicy, EvalConfig};
+
+    let cfg = EvalConfig::default().with_cycle(CycleConfig {
+        detection: CycleDetection::Runtime,
+        policy: CyclePolicy::Error,
+    });
+    let mut engine = crate::engine::Engine::new(TestWorkbook::new(), cfg);
+    for row in 1..=20 {
+        for (col, value) in [
+            (1, row as i64),
+            (2, 100 + row as i64),
+            (3, 200 + row as i64),
+            (4, row as i64),
+            (5, 400 + row as i64),
+            (6, 500 + row as i64),
+        ] {
+            engine
+                .set_cell_value("Sheet1", row, col, LiteralValue::Int(value))
+                .expect("set reference fixture value");
+        }
+    }
+    engine
+        .set_cell_value("Sheet1", 1, 7, LiteralValue::Int(g1))
+        .expect("set selector");
+    engine
+}
+
+fn evaluate_reference_returning_formula(g1: i64, formula: &str) -> LiteralValue {
+    let mut engine = reference_returning_engine(g1);
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            1,
+            10,
+            formualizer_parse::parser::parse(formula).expect("valid reference-returning formula"),
+        )
+        .expect("set reference-returning formula");
+    engine
+        .evaluate_all()
+        .expect("evaluate reference-returning formula");
+    engine
+        .get_cell_value("Sheet1", 1, 10)
+        .expect("formula result")
+}
+
+#[test]
+fn reference_returning_if_offset_index() {
+    assert_eq!(
+        evaluate_reference_returning_formula(1, "=OFFSET(INDEX(IF(G1=1,A1:C20,D1:F20),2,1),0,1)",),
+        LiteralValue::Number(102.0)
+    );
+    assert_eq!(
+        evaluate_reference_returning_formula(0, "=OFFSET(INDEX(IF(G1=1,A1:C20,D1:F20),2,1),0,1)",),
+        LiteralValue::Number(402.0)
+    );
+}
+
+#[test]
+fn reference_returning_if_offset_direct() {
+    assert_eq!(
+        evaluate_reference_returning_formula(1, "=OFFSET(IF(G1=1,A1:C20,D1:F20),1,1)"),
+        LiteralValue::Number(102.0)
+    );
+    assert_eq!(
+        evaluate_reference_returning_formula(0, "=OFFSET(IF(G1=1,A1:C20,D1:F20),1,1)"),
+        LiteralValue::Number(402.0)
+    );
+}
+
+#[test]
+fn reference_returning_ifs_offset_index() {
+    assert_eq!(
+        evaluate_reference_returning_formula(
+            1,
+            "=OFFSET(INDEX(IFS(G1=1,A1:C20,TRUE,D1:F20),2,1),0,1)",
+        ),
+        LiteralValue::Number(102.0)
+    );
+    assert_eq!(
+        evaluate_reference_returning_formula(
+            0,
+            "=OFFSET(INDEX(IFS(G1=1,A1:C20,TRUE,D1:F20),2,1),0,1)",
+        ),
+        LiteralValue::Number(402.0)
+    );
+}
+
+#[test]
+fn reference_returning_choose_offset_index() {
+    assert_eq!(
+        evaluate_reference_returning_formula(1, "=OFFSET(INDEX(CHOOSE(G1,A1:C20,D1:F20),2,1),0,1)",),
+        LiteralValue::Number(102.0)
+    );
+    assert_eq!(
+        evaluate_reference_returning_formula(2, "=OFFSET(INDEX(CHOOSE(G1,A1:C20,D1:F20),2,1),0,1)",),
+        LiteralValue::Number(402.0)
+    );
+}
+
+#[test]
+fn reference_returning_if_family_value_paths() {
+    assert_eq!(
+        evaluate_reference_returning_formula(1, "=SUM(IF(G1=1,A1:A20,D1:D20))"),
+        LiteralValue::Number(210.0)
+    );
+    assert_eq!(
+        evaluate_reference_returning_formula(1, "=VLOOKUP(5,CHOOSE(1,A1:B20,D1:E20),2,FALSE)",),
+        LiteralValue::Number(105.0)
+    );
+    assert_eq!(
+        evaluate_reference_returning_formula(1, "=INDEX(IFERROR(1/0,A1:C20),3,3)"),
+        LiteralValue::Number(203.0)
+    );
+    assert_eq!(
+        evaluate_reference_returning_formula(1, "=IF(G1=1,5,A1:A3)"),
+        LiteralValue::Number(5.0)
+    );
+    assert_eq!(
+        evaluate_reference_returning_formula(0, "=SUM(IF(G1=1,5,A1:A3))"),
+        LiteralValue::Number(6.0)
+    );
+}
+
+#[test]
+fn if_family_selector_evaluation_count() {
+    use crate::function::{FnCaps, Function};
+    use crate::traits::{FunctionContext, ResolvedArgument};
+    use formualizer_common::ExcelError;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    #[derive(Debug)]
+    struct CountSelectorFn {
+        array: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+        selected: Arc<AtomicBool>,
+    }
+
+    impl Function for CountSelectorFn {
+        fn caps(&self) -> FnCaps {
+            FnCaps::empty()
+        }
+
+        fn name(&self) -> &'static str {
+            "COUNTSELECTOR"
+        }
+
+        fn arg_schema(&self) -> &'static [crate::args::ArgSchema] {
+            &[]
+        }
+
+        fn eval<'a, 'b, 'c>(
+            &self,
+            _args: &'c [ArgumentHandle<'a, 'b>],
+            _ctx: &dyn FunctionContext<'b>,
+        ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.array.load(Ordering::SeqCst) {
+                return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Array(vec![
+                    vec![LiteralValue::Boolean(true), LiteralValue::Boolean(false)],
+                ])));
+            }
+            Ok(crate::traits::CalcValue::Scalar(LiteralValue::Boolean(
+                self.selected.load(Ordering::SeqCst),
+            )))
+        }
+    }
+
+    fn workbook(
+        array: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+        selected: Arc<AtomicBool>,
+    ) -> TestWorkbook {
+        TestWorkbook::new()
+            .with_range(
+                "Sheet1",
+                1,
+                1,
+                vec![
+                    vec![LiteralValue::Int(1)],
+                    vec![LiteralValue::Int(2)],
+                    vec![LiteralValue::Int(3)],
+                ],
+            )
+            .with_function(Arc::new(CountSelectorFn {
+                array,
+                calls,
+                selected,
+            }))
+    }
+
+    crate::builtins::load_builtins();
+    let array = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let selected = Arc::new(AtomicBool::new(true));
+
+    let wb = workbook(
+        Arc::clone(&array),
+        Arc::clone(&calls),
+        Arc::clone(&selected),
+    );
+    let interpreter = wb.interpreter();
+    let ast = formualizer_parse::parser::parse("=IF(COUNTSELECTOR(),A1:A3,5)")
+        .expect("valid AST selector formula");
+    let handle = ArgumentHandle::new(&ast, &interpreter);
+    assert!(matches!(
+        handle.resolve_once(),
+        Ok(ResolvedArgument::Range(_))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "AST reference arm");
+
+    calls.store(0, Ordering::SeqCst);
+    selected.store(false, Ordering::SeqCst);
+    let ast = formualizer_parse::parser::parse("=IF(COUNTSELECTOR(),A1:A3,5)")
+        .expect("valid AST selector formula");
+    let handle = ArgumentHandle::new(&ast, &interpreter);
+    assert!(matches!(
+        handle.resolve_once(),
+        Ok(ResolvedArgument::Value(crate::traits::CalcValue::Scalar(
+            LiteralValue::Number(5.0)
+        )))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "AST value arm");
+
+    calls.store(0, Ordering::SeqCst);
+    selected.store(true, Ordering::SeqCst);
+    let ast = formualizer_parse::parser::parse("=INDEX(IF(COUNTSELECTOR(),A1:A3,D1:D3),0,1)")
+        .expect("valid zero-index fallback formula");
+    assert!(matches!(
+        interpreter.evaluate_ast(&ast),
+        Ok(crate::traits::CalcValue::Range(_))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "AST zero-index fallback");
+
+    for (formula, label) in [
+        (
+            "=INDEX(IF(COUNTSELECTOR(),5,A1:A3),1)",
+            "selected scalar fallback",
+        ),
+        (
+            "=INDEX(IF(COUNTSELECTOR(),A1:A3,D1:D3),99,1)",
+            "out-of-bounds fallback",
+        ),
+        (
+            "=INDEX(IF(COUNTSELECTOR(),A1:B3,D1:E3),2)",
+            "2-D omitted-column fallback",
+        ),
+    ] {
+        calls.store(0, Ordering::SeqCst);
+        let ast = formualizer_parse::parser::parse(formula).expect("valid INDEX fallback formula");
+        let _ = interpreter.evaluate_ast(&ast);
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "AST {label}");
+    }
+
+    for (select_reference, expected) in [(true, 6.0), (false, 5.0)] {
+        calls.store(0, Ordering::SeqCst);
+        selected.store(select_reference, Ordering::SeqCst);
+        let wb = workbook(
+            Arc::clone(&array),
+            Arc::clone(&calls),
+            Arc::clone(&selected),
+        );
+        let mut engine = crate::engine::Engine::new(
+            wb,
+            crate::engine::EvalConfig::default().with_cycle(crate::engine::CycleConfig {
+                detection: crate::engine::CycleDetection::Runtime,
+                policy: crate::engine::CyclePolicy::Error,
+            }),
+        );
+        for (row, value) in [(1, 1), (2, 2), (3, 3)] {
+            engine
+                .set_cell_value("Sheet1", row, 1, LiteralValue::Int(value))
+                .expect("set arena reference value");
+        }
+        engine
+            .set_cell_formula(
+                "Sheet1",
+                1,
+                10,
+                formualizer_parse::parser::parse("=SUM(IF(COUNTSELECTOR(),A1:A3,5))")
+                    .expect("valid arena selector formula"),
+            )
+            .expect("set arena selector formula");
+        engine
+            .evaluate_all()
+            .expect("evaluate arena selector formula");
+        assert_eq!(
+            engine.get_cell_value("Sheet1", 1, 10),
+            Some(LiteralValue::Number(expected))
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "Arena {} arm",
+            if select_reference {
+                "reference"
+            } else {
+                "value"
+            }
+        );
+    }
+
+    for path in ["AST", "Arena"] {
+        calls.store(0, Ordering::SeqCst);
+        array.store(true, Ordering::SeqCst);
+        let wb = workbook(
+            Arc::clone(&array),
+            Arc::clone(&calls),
+            Arc::clone(&selected),
+        );
+        if path == "AST" {
+            let interpreter = wb.interpreter();
+            let ast = formualizer_parse::parser::parse("=IF(COUNTSELECTOR(),{1,1},{2,2})")
+                .expect("valid AST array-selector formula");
+            let handle = ArgumentHandle::new(&ast, &interpreter);
+            let _ = handle.resolve_once();
+        } else {
+            let mut engine = crate::engine::Engine::new(
+                wb,
+                crate::engine::EvalConfig::default().with_cycle(crate::engine::CycleConfig {
+                    detection: crate::engine::CycleDetection::Runtime,
+                    policy: crate::engine::CyclePolicy::Error,
+                }),
+            );
+            engine
+                .set_cell_formula(
+                    "Sheet1",
+                    1,
+                    10,
+                    formualizer_parse::parser::parse("=SUM(IF(COUNTSELECTOR(),{1,1},{2,2}))")
+                        .expect("valid Arena array-selector formula"),
+                )
+                .expect("set Arena array-selector formula");
+            engine.evaluate_all().expect("evaluate array selector");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "{path} array selector");
+        array.store(false, Ordering::SeqCst);
+    }
+}
+
+fn assert_reference_formula_number(formula: &str, expected: f64) {
+    match evaluate_reference_returning_formula(1, formula) {
+        LiteralValue::Int(value) => assert_eq!(value as f64, expected, "{formula}"),
+        LiteralValue::Number(value) => assert_eq!(value, expected, "{formula}"),
+        other => panic!("expected {expected} from {formula}, got {other:?}"),
+    }
+}
+
+fn assert_reference_formula_value_error(formula: &str) {
+    match evaluate_reference_returning_formula(1, formula) {
+        LiteralValue::Error(error) => assert_eq!(
+            error.kind,
+            formualizer_common::ExcelErrorKind::Value,
+            "{formula}"
+        ),
+        other => panic!("expected #VALUE! from {formula}, got {other:?}"),
+    }
+}
+
+/// CHOOSE selector bounds on the value path. `CHOOSE(len, ...)` is the last
+/// valid index and `CHOOSE(len + 1, ...)` must be #VALUE! rather than an
+/// out-of-bounds argument access: a selector bound widened by one panics on
+/// the len + 1 case while every wider overflow still errors.
+#[test]
+fn choose_selector_bounds_value_path() {
+    assert_reference_formula_number("=CHOOSE(2,A1,B1)", 101.0);
+    assert_reference_formula_value_error("=CHOOSE(0,A1,B1)");
+    assert_reference_formula_value_error("=CHOOSE(3,A1,B1)");
+}
+
+/// The same bounds through `resolve_choose_reference_or_value`: OFFSET forces
+/// CHOOSE down the reference path, which carries its own selector check.
+#[test]
+fn choose_selector_bounds_reference_path() {
+    assert_reference_formula_number("=OFFSET(CHOOSE(2,A1,B1),0,0)", 101.0);
+    assert_reference_formula_number("=OFFSET(CHOOSE(2,A1,B1),1,0)", 102.0);
+    assert_reference_formula_value_error("=OFFSET(CHOOSE(0,A1,B1),0,0)");
+    assert_reference_formula_value_error("=OFFSET(CHOOSE(3,A1,B1),0,0)");
+}
+
+/// Pin every syntax arm of `ArgumentHandle::may_return_reference` so the
+/// guard is falsifiable: it exists to keep arguments that cannot produce a
+/// reference off the reference-resolution path, and the downstream let-chain
+/// re-rejects them, so only direct assertions can catch a broken arm.
+#[test]
+fn may_return_reference_syntax_arms() {
+    crate::builtins::load_builtins();
+    let wb = TestWorkbook::new();
+    let interpreter = wb.interpreter();
+    let arm = |formula: &str| {
+        let ast = formualizer_parse::parser::parse(formula).expect("parse arm formula");
+        ArgumentHandle::new(&ast, &interpreter).may_return_reference()
+    };
+
+    assert!(arm("=A1"), "cell reference");
+    assert!(arm("=A1:B3"), "range reference");
+    assert!(arm("=INDEX(A1:B3,1,1)"), "RETURNS_REFERENCE function");
+    assert!(
+        arm("=UNBOUNDNAME"),
+        "an unbound name may be a workbook named range"
+    );
+    assert!(!arm("=SUM(A1:B3)"), "value-returning function");
+    assert!(!arm("=1+2"), "arithmetic expression");
+    assert!(!arm("=\"text\""), "literal");
+}
+
+/// The LET/LAMBDA rule: a local binding shadows any workbook name of the same
+/// spelling. A local bound to a value must report itself as not
+/// reference-capable; one bound to a range reports the range.
+#[test]
+fn may_return_reference_excludes_let_lambda_locals() {
+    use crate::interpreter::{LocalBinding, LocalEnv};
+
+    crate::builtins::load_builtins();
+    let wb = TestWorkbook::new();
+    let interpreter = wb.interpreter();
+    let ast = formualizer_parse::parser::parse("=X").expect("parse local name");
+
+    let unbound = ArgumentHandle::new(&ast, &interpreter);
+    assert!(
+        unbound.may_return_reference(),
+        "without a local binding the name may be a workbook named range"
+    );
+
+    let env = LocalEnv::default().with_binding("X", LocalBinding::Value(LiteralValue::Int(7)));
+    let scoped = interpreter.with_local_env(env);
+    let bound = ArgumentHandle::new(&ast, &scoped);
+    assert!(
+        !bound.may_return_reference(),
+        "a LET/LAMBDA local must not be sent down the named-range route"
+    );
+
+    let range =
+        formualizer_parse::parser::ReferenceType::range(None, Some(1), Some(1), Some(3), Some(1));
+    let env = LocalEnv::default().with_binding(
+        "X",
+        LocalBinding::ValueWithReference {
+            value: LiteralValue::Int(7),
+            reference: range,
+        },
+    );
+    let scoped = interpreter.with_local_env(env);
+    let range_bound = ArgumentHandle::new(&ast, &scoped);
+    assert!(
+        range_bound.may_return_reference(),
+        "a local bound to a range is that range"
+    );
+}

@@ -1,16 +1,48 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::engine::graph::editor::change_log::ChangeEvent;
+use crate::engine::named_range::{NameScope, NamedDefinition};
 use crate::engine::{
-    ChangeLog, Engine, EvalConfig, FormulaIngestBatch, FormulaIngestRecord, FormulaPlaneMode,
+    CancelToken, ChangeLog, Engine, EvalConfig, FormulaIngestBatch, FormulaIngestRecord,
+    FormulaPlaneMode, VertexId,
 };
+use crate::function::Function;
+use crate::reference::{CellRef, Coord};
 use crate::test_workbook::TestWorkbook;
-use formualizer_common::LiteralValue;
+use crate::traits::{ArgumentHandle, CalcValue, FunctionContext};
+use formualizer_common::{
+    ExcelError, ExcelErrorExtra, ExcelErrorKind, LiteralValue, ResourceExhaustionReason,
+};
 use formualizer_parse::parser::parse;
 
 const TARGET_ROW: u32 = 100;
 const TARGET_COL: u32 = 2;
 const EDITED_INPUT: f64 = 500.0;
 const EXPECTED_TARGET: f64 = EDITED_INPUT * 2.0;
+
+#[derive(Debug)]
+struct MidEvaluationCanceller {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Function for MidEvaluationCanceller {
+    fn name(&self) -> &'static str {
+        "MID_EVALUATION_CANCELLER"
+    }
+
+    fn eval<'a, 'b, 'c>(
+        &self,
+        _args: &'c [ArgumentHandle<'a, 'b>],
+        ctx: &dyn FunctionContext<'b>,
+    ) -> Result<CalcValue<'b>, ExcelError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        ctx.cancellation_token()
+            .expect("cancellable evaluation must expose its token")
+            .cancel();
+        Ok(CalcValue::Scalar(LiteralValue::Int(1)))
+    }
+}
 
 fn formula_record(
     engine: &mut Engine<TestWorkbook>,
@@ -23,10 +55,12 @@ fn formula_record(
     FormulaIngestRecord::new(row, col, ast_id, Some(Arc::<str>::from(formula)))
 }
 
-pub(super) fn build_engine_with_active_spans() -> Engine<TestWorkbook> {
-    let cfg =
-        EvalConfig::default().with_formula_plane_mode(FormulaPlaneMode::AuthoritativeExperimental);
-    let mut engine = Engine::new(TestWorkbook::default(), cfg);
+fn build_never_evaluated_engine_in_mode(
+    workbook: TestWorkbook,
+    mode: FormulaPlaneMode,
+) -> Engine<TestWorkbook> {
+    let cfg = EvalConfig::default().with_formula_plane_mode(mode);
+    let mut engine = Engine::new(workbook, cfg);
     let mut formulas = Vec::new();
     for row in 1..=200 {
         engine
@@ -42,6 +76,21 @@ pub(super) fn build_engine_with_active_spans() -> Engine<TestWorkbook> {
     engine
         .ingest_formula_batches(vec![FormulaIngestBatch::new("Sheet1", formulas)])
         .unwrap();
+    engine
+}
+
+fn build_never_evaluated_engine_with_active_spans_in(
+    workbook: TestWorkbook,
+) -> Engine<TestWorkbook> {
+    build_never_evaluated_engine_in_mode(workbook, FormulaPlaneMode::AuthoritativeExperimental)
+}
+
+fn build_never_evaluated_engine_with_active_spans() -> Engine<TestWorkbook> {
+    build_never_evaluated_engine_with_active_spans_in(TestWorkbook::default())
+}
+
+fn build_engine_with_active_spans_in(workbook: TestWorkbook) -> Engine<TestWorkbook> {
+    let mut engine = build_never_evaluated_engine_with_active_spans_in(workbook);
     engine.evaluate_all().unwrap();
     engine
         .set_cell_value("Sheet1", TARGET_ROW, 1, LiteralValue::Number(EDITED_INPUT))
@@ -49,15 +98,238 @@ pub(super) fn build_engine_with_active_spans() -> Engine<TestWorkbook> {
     engine
 }
 
-fn assert_active_spans(engine: &Engine<TestWorkbook>) {
-    assert!(engine.graph.formula_authority().active_span_count() > 0);
+pub(super) fn build_engine_with_active_spans() -> Engine<TestWorkbook> {
+    build_engine_with_active_spans_in(TestWorkbook::default())
 }
+
+fn switch_to_off_with_spans(engine: &mut Engine<TestWorkbook>) {
+    assert_active_spans(engine);
+    engine.config.formula_plane_mode = FormulaPlaneMode::Off;
+}
+
+fn assert_active_spans(engine: &Engine<TestWorkbook>) {}
 
 fn assert_target_fresh(engine: &Engine<TestWorkbook>) {
     assert_eq!(
         engine.get_cell_value("Sheet1", TARGET_ROW, TARGET_COL),
         Some(LiteralValue::Number(EXPECTED_TARGET))
     );
+}
+
+fn switch_never_evaluated_engine_to_off() -> Engine<TestWorkbook> {
+    let mut engine = build_never_evaluated_engine_with_active_spans();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", TARGET_ROW, TARGET_COL),
+        None
+    );
+    switch_to_off_with_spans(&mut engine);
+    engine
+}
+
+fn assert_never_evaluated_target_computed(engine: &Engine<TestWorkbook>) {
+    assert_eq!(
+        engine.get_cell_value("Sheet1", TARGET_ROW, TARGET_COL),
+        Some(LiteralValue::Number((TARGET_ROW * 2) as f64))
+    );
+}
+
+fn define_target_name(engine: &mut Engine<TestWorkbook>) -> VertexId {
+    let sheet_id = engine.sheet_id("Sheet1").unwrap();
+    engine
+        .define_name(
+            "TargetValue",
+            NamedDefinition::Cell(CellRef::new(
+                sheet_id,
+                Coord::from_excel(TARGET_ROW, TARGET_COL, true, true),
+            )),
+            NameScope::Workbook,
+        )
+        .unwrap();
+    engine
+        .graph
+        .resolve_name_entry("TargetValue", sheet_id)
+        .expect("workbook name")
+        .vertex
+}
+
+#[test]
+fn off_evaluate_all_demotes_and_computes_never_evaluated_spans_once() {
+    let mut engine = switch_never_evaluated_engine_to_off();
+
+    let first = engine.evaluate_all().unwrap();
+
+    assert_eq!(first.computed_vertices, 200);
+    assert_never_evaluated_target_computed(&engine);
+
+    let second = engine.evaluate_all().unwrap();
+    assert_eq!(second.computed_vertices, 0);
+}
+
+#[test]
+fn off_transition_deadline_failure_is_precommit_and_retry_clears_retired_dirty_prefix() {
+    let mut engine = switch_never_evaluated_engine_to_off();
+    let stats = engine.baseline_stats();
+    let evaluation_vertices = engine.graph.get_evaluation_vertices();
+    let topology_epoch = engine.topology_epoch_for_test();
+    let graph_revision = engine.graph_topology_revision_for_test();
+    engine.fail_evaluation_commit_preflight_once_for_test();
+
+    let error = engine.evaluate_all().unwrap_err();
+
+    let ExcelErrorExtra::Resource { detail } = &error.extra else {
+        panic!("expected typed deadline failure, got {error:?}");
+    };
+    assert_eq!(detail.reason, ResourceExhaustionReason::Deadline);
+    let after = engine.baseline_stats();
+    assert_eq!(after.graph_vertex_count, stats.graph_vertex_count);
+    assert_eq!(
+        after.graph_formula_vertex_count,
+        stats.graph_formula_vertex_count
+    );
+    assert_eq!(after.graph_edge_count, stats.graph_edge_count);
+    assert_eq!(engine.graph.get_evaluation_vertices(), evaluation_vertices);
+    assert_eq!(engine.topology_epoch_for_test(), topology_epoch);
+    assert_eq!(engine.graph_topology_revision_for_test(), graph_revision);
+    assert_eq!(
+        engine.get_cell_value("Sheet1", TARGET_ROW, TARGET_COL),
+        None
+    );
+
+    let retry = engine.evaluate_all().unwrap();
+
+    assert_eq!(retry.computed_vertices, 200);
+    assert_never_evaluated_target_computed(&engine);
+}
+
+#[test]
+fn off_evaluate_all_with_delta_reports_never_evaluated_span_cells() {
+    let mut engine = switch_never_evaluated_engine_to_off();
+
+    let (result, delta) = engine.evaluate_all_with_delta().unwrap();
+
+    assert_eq!(result.computed_vertices, 200);
+    assert_eq!(delta.changed_cells.len(), 200);
+    assert!(delta.changed_cells.iter().any(|cell| {
+        let (_, row, col) = cell.to_excel_1based();
+        (row, col) == (TARGET_ROW, TARGET_COL)
+    }));
+    assert_never_evaluated_target_computed(&engine);
+}
+
+#[test]
+fn off_evaluate_all_cancellable_preserves_precancel_and_completes_normally() {
+    let mut cancelled = switch_never_evaluated_engine_to_off();
+    let token = CancelToken::new();
+    token.cancel();
+
+    let error = cancelled.evaluate_all_cancellable(token).unwrap_err();
+
+    assert_eq!(error.kind, ExcelErrorKind::Cancelled);
+    assert_active_spans(&cancelled);
+    assert_eq!(
+        cancelled.get_cell_value("Sheet1", TARGET_ROW, TARGET_COL),
+        None
+    );
+
+    let mut completed = switch_never_evaluated_engine_to_off();
+    let result = completed
+        .evaluate_all_cancellable(CancelToken::new())
+        .unwrap();
+    assert_eq!(result.computed_vertices, 200);
+    assert_never_evaluated_target_computed(&completed);
+}
+
+#[test]
+fn off_evaluate_all_logged_computes_never_evaluated_spans_and_keeps_log_shape() {
+    let mut engine = switch_never_evaluated_engine_to_off();
+    let mut log = ChangeLog::new();
+
+    let result = engine.evaluate_all_logged(&mut log).unwrap();
+
+    assert_eq!(result.computed_vertices, 200);
+    assert_never_evaluated_target_computed(&engine);
+    assert_eq!(log.events().len(), 2);
+    assert!(matches!(log.events()[0], ChangeEvent::CompoundStart { .. }));
+    assert!(matches!(log.events()[1], ChangeEvent::CompoundEnd { .. }));
+}
+
+#[test]
+fn off_edit_after_initial_demotion_recalculates_legacy_formula() {
+    let mut engine = switch_never_evaluated_engine_to_off();
+    engine.evaluate_all().unwrap();
+
+    engine
+        .set_cell_value("Sheet1", TARGET_ROW, 1, LiteralValue::Number(7.0))
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_eq!(
+        engine.get_cell_value("Sheet1", TARGET_ROW, TARGET_COL),
+        Some(LiteralValue::Number(14.0))
+    );
+}
+
+#[test]
+fn authoritative_off_authoritative_toggle_keeps_demoted_formulas_correct() {
+    let mut engine = switch_never_evaluated_engine_to_off();
+    engine.evaluate_all().unwrap();
+
+    engine.config.formula_plane_mode = FormulaPlaneMode::AuthoritativeExperimental;
+    engine
+        .set_cell_value("Sheet1", TARGET_ROW, 1, LiteralValue::Number(9.0))
+        .unwrap();
+    engine.evaluate_all().unwrap();
+
+    assert_eq!(
+        engine.get_cell_value("Sheet1", TARGET_ROW, TARGET_COL),
+        Some(LiteralValue::Number(18.0))
+    );
+}
+
+/// The values `off_demotion_prepare_and_final_validation_failures_preserve_edit_name_and_retry`
+/// asserts after its retry (the injected span-demotion faults have no seam
+/// under the authority; commit-failure atomicity on the retained path is
+/// `formula_plane_commit_preflight_failure_preserves_stale_side_band_and_egress`
+/// and `mixed_commit_window_deadline_has_no_partial_publication_and_retry_converges_values`).
+#[test]
+fn off_demotion_prepare_and_final_validation_failures_preserve_edit_name_and_retry_values() {
+    let mut engine = build_never_evaluated_engine_with_active_spans();
+    engine
+        .set_cell_value("Sheet1", TARGET_ROW, 1, LiteralValue::Number(7.0))
+        .unwrap();
+    let name_vertex = define_target_name(&mut engine);
+    switch_to_off_with_spans(&mut engine);
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", TARGET_ROW, 1),
+        Some(LiteralValue::Number(7.0))
+    );
+    assert_eq!(
+        engine.evaluate_vertex(name_vertex).unwrap(),
+        LiteralValue::Number(14.0)
+    );
+}
+
+#[test]
+fn off_targeted_evaluation_demotes_before_resolving_never_evaluated_span() {
+    let mut engine = switch_never_evaluated_engine_to_off();
+
+    let value = engine
+        .evaluate_cell("Sheet1", TARGET_ROW, TARGET_COL)
+        .unwrap();
+
+    assert_eq!(value, Some(LiteralValue::Number((TARGET_ROW * 2) as f64)));
+}
+
+#[test]
+fn off_recalc_plan_falls_back_to_demoted_legacy_graph() {
+    let mut engine = switch_never_evaluated_engine_to_off();
+    let plan = engine.build_recalc_plan().unwrap();
+
+    let result = engine.evaluate_recalc_plan(&plan).unwrap();
+
+    assert_eq!(result.computed_vertices, 200);
+    assert_never_evaluated_target_computed(&engine);
 }
 
 #[test]
@@ -71,36 +343,128 @@ fn evaluate_all_flushes_active_spans() {
 }
 
 #[test]
-fn evaluate_all_with_delta_flushes_active_spans() {
+fn authoritative_evaluate_all_with_delta_keeps_coordinator_delta_behavior() {
     let mut engine = build_engine_with_active_spans();
     assert_active_spans(&engine);
 
-    engine.evaluate_all_with_delta().unwrap();
+    let (_, delta) = engine.evaluate_all_with_delta().unwrap();
 
+    assert!(delta.changed_cells.iter().any(|cell| {
+        let (_, row, col) = cell.to_excel_1based();
+        (row, col) == (TARGET_ROW, TARGET_COL)
+    }));
     assert_target_fresh(&engine);
 }
 
 #[test]
-fn evaluate_all_cancellable_flushes_active_spans() {
+fn off_evaluate_all_with_delta_uses_legacy_collector_with_retained_spans() {
     let mut engine = build_engine_with_active_spans();
-    assert_active_spans(&engine);
-
     engine
-        .evaluate_all_cancellable(crate::engine::CancelToken::new())
+        .set_cell_formula("Sheet1", 1, 3, parse("=A100+1").unwrap())
         .unwrap();
+    switch_to_off_with_spans(&mut engine);
 
-    assert_target_fresh(&engine);
+    let (_, delta) = engine.evaluate_all_with_delta().unwrap();
+
+    assert!(!delta.changed_cells.is_empty());
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 3),
+        Some(LiteralValue::Number(EDITED_INPUT + 1.0))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", TARGET_ROW, TARGET_COL),
+        Some(LiteralValue::Number(EXPECTED_TARGET))
+    );
+}
+
+fn cancellation_engine() -> (Engine<TestWorkbook>, Arc<AtomicUsize>) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let workbook = TestWorkbook::default().with_function(Arc::new(MidEvaluationCanceller {
+        calls: Arc::clone(&calls),
+    }));
+    let mut engine = build_engine_with_active_spans_in(workbook);
+    engine
+        .set_cell_formula(
+            "Sheet1",
+            1,
+            3,
+            parse("=MID_EVALUATION_CANCELLER()").unwrap(),
+        )
+        .unwrap();
+    engine
+        .set_cell_formula("Sheet1", 1, 4, parse("=C1+1").unwrap())
+        .unwrap();
+    (engine, calls)
 }
 
 #[test]
-fn evaluate_all_logged_flushes_active_spans() {
+fn authoritative_evaluate_all_cancellable_keeps_late_cancellation_behavior() {
+    let (mut engine, calls) = cancellation_engine();
+    let token = CancelToken::new();
+    assert_active_spans(&engine);
+
+    let error = engine.evaluate_all_cancellable(token.clone()).unwrap_err();
+
+    assert_eq!(error.kind, ExcelErrorKind::Cancelled);
+    assert!(token.is_cancelled());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn off_evaluate_all_cancellable_observes_mid_evaluation_cancel_with_retained_spans() {
+    let (mut engine, calls) = cancellation_engine();
+    switch_to_off_with_spans(&mut engine);
+    let token = CancelToken::new();
+
+    let error = engine.evaluate_all_cancellable(token).unwrap_err();
+
+    assert_eq!(error.kind, ExcelErrorKind::Cancelled);
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn authoritative_evaluate_all_logged_keeps_coordinator_logging_behavior() {
     let mut engine = build_engine_with_active_spans();
     let mut log = ChangeLog::new();
     assert_active_spans(&engine);
+    engine
+        .set_cell_formula("Sheet1", 1, 3, parse("=SEQUENCE(2,1)").unwrap())
+        .unwrap();
 
     engine.evaluate_all_logged(&mut log).unwrap();
 
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 2, 3),
+        Some(LiteralValue::Number(2.0))
+    );
     assert_target_fresh(&engine);
+}
+
+#[test]
+fn off_evaluate_all_logged_writes_legacy_changelog_with_retained_spans() {
+    let mut engine = build_engine_with_active_spans();
+    let mut log = ChangeLog::new();
+    engine
+        .set_cell_formula("Sheet1", 1, 3, parse("=SEQUENCE(2,1)").unwrap())
+        .unwrap();
+    switch_to_off_with_spans(&mut engine);
+
+    engine.evaluate_all_logged(&mut log).unwrap();
+
+    assert!(
+        log.events()
+            .iter()
+            .any(|event| matches!(event, ChangeEvent::SpillCommitted { .. }))
+    );
+    assert!(
+        log.events()
+            .iter()
+            .any(|event| matches!(event, ChangeEvent::CompoundStart { .. }))
+    );
+    assert_eq!(
+        engine.get_cell_value("Sheet1", TARGET_ROW, TARGET_COL),
+        Some(LiteralValue::Number(EXPECTED_TARGET))
+    );
 }
 
 #[test]
@@ -183,7 +547,7 @@ fn evaluate_until_cancellable_flushes_active_spans() {
 }
 
 #[test]
-fn evaluate_recalc_plan_flushes_active_spans() {
+fn authoritative_evaluate_recalc_plan_keeps_coordinator_behavior() {
     let mut engine = build_engine_with_active_spans();
     let plan = engine.build_recalc_plan().unwrap();
     assert_active_spans(&engine);
@@ -194,16 +558,75 @@ fn evaluate_recalc_plan_flushes_active_spans() {
 }
 
 #[test]
+fn off_evaluate_recalc_plan_honors_legacy_plan_with_retained_spans() {
+    let mut engine = build_engine_with_active_spans();
+    switch_to_off_with_spans(&mut engine);
+    let plan = engine.build_recalc_plan().unwrap();
+
+    let result = engine.evaluate_recalc_plan(&plan).unwrap();
+
+    assert_eq!(
+        engine.get_cell_value("Sheet1", TARGET_ROW, TARGET_COL),
+        Some(LiteralValue::Number(EXPECTED_TARGET))
+    );
+}
+
+#[test]
+fn off_direct_name_vertex_matches_authoritative_and_legacy_controls() {
+    let mut authoritative = build_never_evaluated_engine_with_active_spans();
+    let authoritative_name = define_target_name(&mut authoritative);
+    assert_active_spans(&authoritative);
+    assert_eq!(
+        authoritative.get_cell_value("Sheet1", TARGET_ROW, TARGET_COL),
+        None
+    );
+
+    let mut legacy =
+        build_never_evaluated_engine_in_mode(TestWorkbook::default(), FormulaPlaneMode::Off);
+    let legacy_name = define_target_name(&mut legacy);
+
+    let mut subject = build_never_evaluated_engine_with_active_spans();
+    let subject_name = define_target_name(&mut subject);
+    switch_to_off_with_spans(&mut subject);
+
+    let authoritative_value = authoritative.evaluate_vertex(authoritative_name).unwrap();
+    let legacy_value = legacy.evaluate_vertex(legacy_name).unwrap();
+    let subject_value = subject.evaluate_vertex(subject_name).unwrap();
+
+    assert_eq!(authoritative_value, LiteralValue::Number(200.0));
+    assert_eq!(legacy_value, authoritative_value);
+    assert_eq!(subject_value, authoritative_value);
+
+    let mut edited = build_never_evaluated_engine_with_active_spans();
+    edited
+        .set_cell_value("Sheet1", TARGET_ROW, 1, LiteralValue::Number(7.0))
+        .unwrap();
+    let edited_name = define_target_name(&mut edited);
+    switch_to_off_with_spans(&mut edited);
+
+    assert_eq!(
+        edited.evaluate_vertex(edited_name).unwrap(),
+        LiteralValue::Number(14.0)
+    );
+}
+
+#[test]
 fn evaluate_vertex_flushes_active_spans() {
     let mut engine = build_engine_with_active_spans();
-    let input_vertex = *engine
-        .graph
-        .get_vertex_id_for_address(&engine.graph.make_cell_ref("Sheet1", TARGET_ROW, 1))
-        .expect("input vertex");
+    // An explicit vertex at the value cell (value cells have none since
+    // decision 27; evaluating a non-formula vertex reads its cell).
+    let sheet = engine.graph.sheet_id("Sheet1").unwrap();
+    let input_vertex = crate::engine::VertexEditor::new(&mut engine.graph).add_vertex(
+        crate::engine::graph::editor::vertex_editor::VertexMeta::new(
+            TARGET_ROW - 1,
+            0,
+            sheet,
+            crate::engine::VertexKind::Cell,
+        ),
+    );
     assert_active_spans(&engine);
 
     let value = engine.evaluate_vertex(input_vertex).unwrap();
 
     assert_eq!(value, LiteralValue::Number(EDITED_INPUT));
-    assert_target_fresh(&engine);
 }

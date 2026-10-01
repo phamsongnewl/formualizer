@@ -161,6 +161,15 @@ impl<'g> TransactionContext<'g> {
 
     /// Apply rollback for a list of changes
     fn apply_rollback(&mut self, changes: Vec<ChangeEvent>) -> Result<(), TransactionError> {
+        self.graph
+            .authority_set_replay(crate::engine::authority::history::Replay::Undo);
+        let rolled_back = self.apply_rollback_events(changes);
+        self.graph
+            .authority_set_replay(crate::engine::authority::history::Replay::Forward);
+        rolled_back
+    }
+
+    fn apply_rollback_events(&mut self, changes: Vec<ChangeEvent>) -> Result<(), TransactionError> {
         // Disable logging during rollback to avoid recording rollback operations
         self.change_log.set_enabled(false);
 
@@ -168,16 +177,28 @@ impl<'g> TransactionContext<'g> {
         let mut compound_stack = Vec::new();
 
         // Apply changes in reverse order
-        for change in changes.into_iter().rev() {
+        for i in (0..changes.len()).rev() {
+            let change = changes[i].clone();
             match change {
                 ChangeEvent::CompoundEnd { depth } => {
                     // Starting to rollback a compound operation (remember, we're going backwards)
                     compound_stack.push(depth);
+                    if let Some(description) =
+                        super::change_log::compound_start_description(i, |j| &changes[j])
+                    {
+                        VertexEditor::new(self.graph).inverse_compound_end(description);
+                    }
                 }
                 ChangeEvent::CompoundStart { depth, .. } => {
                     // Finished rolling back a compound operation
                     if compound_stack.last() == Some(&depth) {
                         compound_stack.pop();
+                    }
+                    // A structural edit's marker shifts the retired-id side
+                    // table back, as the other backward replays do.
+                    if let Err(e) = self.apply_inverse(change) {
+                        self.change_log.set_enabled(true);
+                        return Err(TransactionError::RollbackFailed(e.to_string()));
                     }
                 }
                 _ => {
@@ -279,7 +300,7 @@ mod tests {
         // Set initial formula outside transaction (formulas are graph-owned and should rollback).
         let original = parse("=1").unwrap();
         let _ = graph.set_cell_formula("Sheet1", 1, 1, original.clone());
-        let vid = *graph
+        let vid = graph
             .get_vertex_id_for_address(&cell_ref(0, 1, 1))
             .expect("vertex for A1");
 

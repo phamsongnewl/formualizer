@@ -142,8 +142,8 @@ pub fn parse_criteria(v: &LiteralValue) -> Result<CriteriaPredicate, ExcelError>
 
             let plain = unquote(s_trim);
 
-            // Wildcards * or ? => TextLike
-            if plain.contains('*') || plain.contains('?') {
+            // Wildcards or escaped tilde => TextLike (including literal ~* and ~?).
+            if plain.contains('*') || plain.contains('?') || plain.contains("~~") {
                 return Ok(CriteriaPredicate::TextLike {
                     pattern: plain,
                     case_insensitive: true,
@@ -271,7 +271,8 @@ pub fn validate_and_prepare<'a, 'b>(
                                 Cow::Owned(tl)
                             }
                             crate::traits::CalcValue::Range(rv) => Cow::Owned(rv.get_cell(0, 0)),
-                            crate::traits::CalcValue::Scalar(s) => Cow::Owned(s),
+                            crate::traits::CalcValue::Scalar(s)
+                            | crate::traits::CalcValue::AnnotatedScalar(s, _) => Cow::Owned(s),
                             crate::traits::CalcValue::Callable(_) => {
                                 Cow::Owned(LiteralValue::Error(
                                     ExcelError::new(ExcelErrorKind::Calc)

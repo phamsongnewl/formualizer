@@ -62,11 +62,14 @@ __all__ = [
     "Workbook",
     "WorkbookConfig",
     "WorkbookMode",
+    "XlsxPathSource",
     "load_workbook",
     "load_workbook_bytes",
     "parse",
     "parse_formula",
     "recalculate_file",
+    "recalculate_xlsx_bytes",
+    "recalculate_xlsx_file",
     "tokenize",
     "DependencyStateUnavailableError",
     "ExcelEvaluationError",
@@ -299,6 +302,17 @@ class CycleTelemetry:
         Identical-bit NaN comparisons treated as converged (spec §6 NaN rule).
         """
     @property
+    def reused_sccs(self) -> builtins.int:
+        r"""
+        Retained exactly-converged SCCs that had no dirty member at the start of this request and were
+        therefore served without a re-run (#368).
+        """
+    @property
+    def reused_scc_members(self) -> builtins.int:
+        r"""
+        Members of the SCCs counted in `reused_sccs`.
+        """
+    @property
     def elapsed_ms(self) -> builtins.int:
         r"""
         Wall-clock milliseconds spent inside Runtime SCC tasks.
@@ -407,6 +421,16 @@ class EvaluationConfig:
         When enabled, copied formula spans may be evaluated
         by the experimental FormulaPlane runtime instead of materialized as
         per-cell graph formulas.
+        """
+    @property
+    def strict_preparation(self) -> builtins.bool: ...
+    @strict_preparation.setter
+    def strict_preparation(self, value: builtins.bool) -> None:
+        r"""
+        Fail formula preparation on a reference to a missing sheet or table
+        (the behavior before 0.10). Disabled by default: such a formula is
+        accepted, evaluates to an error while the target is missing, and
+        re-binds when the sheet or table is added.
         """
     @property
     def max_work_units(self) -> typing.Optional[builtins.int]: ...
@@ -1544,7 +1568,7 @@ class Workbook:
         """
     def __new__(cls, *, mode: typing.Optional[WorkbookMode] = None, config: typing.Optional[WorkbookConfig] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook: ...
     @classmethod
-    def load_path(cls, path: builtins.str, strategy: typing.Optional[builtins.str] = None, backend: typing.Optional[builtins.str] = None, *, mode: typing.Optional[WorkbookMode] = None, config: typing.Optional[WorkbookConfig] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook:
+    def load_path(cls, path: builtins.str, strategy: typing.Optional[builtins.str] = None, backend: typing.Optional[builtins.str] = None, *, path_source: typing.Optional[XlsxPathSource] = None, mode: typing.Optional[WorkbookMode] = None, config: typing.Optional[WorkbookConfig] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook:
         r"""
         Class method: load an XLSX workbook from a file path.
         
@@ -1553,13 +1577,19 @@ class Workbook:
         Args:
             path: Path to the `.xlsx` file.
             backend: Backend name (currently defaults to `calamine`).
+            path_source: `XlsxPathSource.SHARED_FILE` (the safe default) or
+                `XlsxPathSource.DIRECT_MMAP`. Direct mmap requires a native
+                Calamine `.xlsx` path whose underlying file is not destructively
+                modified or truncated while the workbook loads.
             mode/config: Optional workbook configuration.
         
         Example:
         ```python
             import formualizer as fz
         
-            wb = fz.Workbook.load_path("model.xlsx")
+            wb = fz.Workbook.load_path(
+                "model.xlsx", path_source=fz.XlsxPathSource.DIRECT_MMAP
+            )
             print(wb.sheet_names)
         ```
         """
@@ -1583,7 +1613,7 @@ class Workbook:
         ```
         """
     @classmethod
-    def from_path(cls, path: builtins.str, backend: typing.Optional[builtins.str] = None, *, mode: typing.Optional[WorkbookMode] = None, config: typing.Optional[WorkbookConfig] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook: ...
+    def from_path(cls, path: builtins.str, backend: typing.Optional[builtins.str] = None, *, path_source: typing.Optional[XlsxPathSource] = None, mode: typing.Optional[WorkbookMode] = None, config: typing.Optional[WorkbookConfig] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook: ...
     @classmethod
     def from_bytes(cls, data: bytes, backend: typing.Optional[builtins.str] = None, *, mode: typing.Optional[WorkbookMode] = None, config: typing.Optional[WorkbookConfig] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook:
         r"""
@@ -1780,6 +1810,18 @@ class Workbook:
             print(wb.evaluate_cell("Data", 3, 1))
         ```
         """
+    def set_deterministic_clock(self, deterministic_timestamp_utc: datetime.datetime, deterministic_timezone: typing.Optional[typing.Any] = None) -> None:
+        r"""
+        Pin the evaluation clock to a caller-supplied instant, so the
+        volatile date/time builtins (TODAY, NOW) evaluate deterministically
+        on the next recalculation. Takes effect on a live workbook; no
+        reload is required.
+        
+        `deterministic_timezone` accepts `"utc"`, `"local"`, or a fixed
+        offset in seconds — the same spelling as
+        `SheetPortSession.evaluate_once(deterministic_timezone=...)`.
+        Omitted means UTC.
+        """
     def evaluate_all(self) -> None: ...
     def last_cycle_telemetry(self) -> CycleTelemetry:
         r"""
@@ -1810,6 +1852,10 @@ class Workbook:
     def get_eval_plan(self, targets: list, *, build_graph_if_needed: builtins.bool = True) -> EvaluationPlan: ...
     def cancel(self) -> None: ...
     def reset_cancel(self) -> None: ...
+    def set_temporal_egress(self, policy: builtins.str) -> None:
+        r"""
+        Choose temporal output as native Python datetime values (default) or floats.
+        """
     def get_value(self, sheet: builtins.str, row: builtins.int, col: builtins.int) -> typing.Optional[typing.Any]: ...
     def get_formula(self, sheet: builtins.str, row: builtins.int, col: builtins.int) -> typing.Optional[builtins.str]: ...
     def set_changelog_enabled(self, enabled: builtins.bool) -> None: ...
@@ -2030,7 +2076,24 @@ class WorkbookMode(enum.Enum):
     def __str__(self) -> builtins.str: ...
     def __repr__(self) -> builtins.str: ...
 
-def load_workbook(path: builtins.str, strategy: typing.Optional[builtins.str] = None, *, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook:
+@typing.final
+class XlsxPathSource(enum.Enum):
+    r"""
+    XLSX filesystem backing source used by Calamine path loads.
+    """
+    SHARED_FILE = ...
+    r"""
+    Safe default: one retained file handle with shared serialized I/O.
+    """
+    DIRECT_MMAP = ...
+    r"""
+    Explicit read-only mmap; see the filesystem mutation contract.
+    """
+
+    def __str__(self) -> builtins.str: ...
+    def __repr__(self) -> builtins.str: ...
+
+def load_workbook(path: builtins.str, strategy: typing.Optional[builtins.str] = None, *, path_source: typing.Optional[XlsxPathSource] = None, span_evaluation: typing.Optional[builtins.bool] = None) -> Workbook:
     r"""
     Load an XLSX workbook from a filesystem path.
     
@@ -2040,12 +2103,19 @@ def load_workbook(path: builtins.str, strategy: typing.Optional[builtins.str] = 
         path: Path to an `.xlsx` file.
         strategy: Currently accepted for backward compatibility.
             (The backend/strategy is currently fixed to `calamine` + eager load.)
+        path_source: `XlsxPathSource.SHARED_FILE` (the safe default) or
+            `XlsxPathSource.DIRECT_MMAP`. Direct mmap retains an actual read-only
+            mapping; the underlying file must not be destructively modified or
+            truncated while the workbook loads.
     
     Example:
     ```python
         import formualizer as fz
     
-        wb = fz.load_workbook("financial_model.xlsx")
+        wb = fz.load_workbook(
+            "financial_model.xlsx",
+            path_source=fz.XlsxPathSource.DIRECT_MMAP,
+        )
         print(wb.evaluate_cell("Summary", 1, 2))
     ```
     """
@@ -2102,6 +2172,17 @@ def recalculate_file(path: builtins.str, output: typing.Optional[builtins.str] =
     Note:
         Formula text is preserved. Cached-value typing follows the active
         `umya-spreadsheet` implementation.
+    """
+
+def recalculate_xlsx_bytes(data: bytes, *, error_location_limit: typing.Optional[builtins.int] = None) -> typing.Any:
+    r"""
+    Recalculate XLSX formula caches in memory without rewriting unrelated package parts.
+    Returns a dictionary with output ``bytes``, a ``summary``, and formula/cache/worksheet counts.
+    """
+
+def recalculate_xlsx_file(path: builtins.str, output: typing.Optional[builtins.str] = None, *, error_location_limit: typing.Optional[builtins.int] = None) -> typing.Any:
+    r"""
+    Recalculate XLSX formula caches from a path using atomic output replacement.
     """
 
 def tokenize(formula: builtins.str, dialect: typing.Optional[FormulaDialect] = None) -> Tokenizer:

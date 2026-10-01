@@ -19,21 +19,27 @@ fn test_insert_rows() {
 
     // Setup: A1=10, A2=20, A3=30, A4=SUM(A1:A3)
     // Excel uses 1-based indexing
-    graph.set_cell_value("Sheet1", 1, 1, lit_num(10.0)).unwrap();
-    graph.set_cell_value("Sheet1", 2, 1, lit_num(20.0)).unwrap();
-    graph.set_cell_value("Sheet1", 3, 1, lit_num(30.0)).unwrap();
+    graph
+        .set_cell_formula("Sheet1", 1, 1, super::common::literal_ast(lit_num(10.0)))
+        .unwrap();
+    graph
+        .set_cell_formula("Sheet1", 2, 1, super::common::literal_ast(lit_num(20.0)))
+        .unwrap();
+    graph
+        .set_cell_formula("Sheet1", 3, 1, super::common::literal_ast(lit_num(30.0)))
+        .unwrap();
     let sum_result = graph
         .set_cell_formula("Sheet1", 4, 1, parse("=SUM(A1:A3)").unwrap())
         .unwrap();
     let sum_id = sum_result.affected_vertices[0];
 
-    let a1_id = *graph
+    let a1_id = graph
         .get_vertex_id_for_address(&sheet1_cell(&graph, 1, 1))
         .unwrap();
-    let a2_id = *graph
+    let a2_id = graph
         .get_vertex_id_for_address(&sheet1_cell(&graph, 2, 1))
         .unwrap();
-    let a3_id = *graph
+    let a3_id = graph
         .get_vertex_id_for_address(&sheet1_cell(&graph, 3, 1))
         .unwrap();
 
@@ -49,19 +55,19 @@ fn test_insert_rows() {
     // Verify shifts via vertex mapping
     assert_eq!(
         graph.get_vertex_id_for_address(&sheet1_cell(&graph, 1, 1)),
-        Some(&a1_id)
+        Some(a1_id)
     );
     assert_eq!(
         graph.get_vertex_id_for_address(&sheet1_cell(&graph, 4, 1)),
-        Some(&a2_id)
+        Some(a2_id)
     );
     assert_eq!(
         graph.get_vertex_id_for_address(&sheet1_cell(&graph, 5, 1)),
-        Some(&a3_id)
+        Some(a3_id)
     );
     assert_eq!(
         graph.get_vertex_id_for_address(&sheet1_cell(&graph, 6, 1)),
-        Some(&sum_id)
+        Some(sum_id)
     );
 
     // Formula should be updated: SUM(A1:A3) -> SUM(A1:A5)
@@ -80,16 +86,21 @@ fn test_delete_rows() {
     // Setup: A1 through A5 with values
     for i in 1..=5 {
         graph
-            .set_cell_value("Sheet1", i, 1, lit_num(i as f64 * 10.0))
+            .set_cell_formula(
+                "Sheet1",
+                i,
+                1,
+                super::common::literal_ast(lit_num(i as f64 * 10.0)),
+            )
             .unwrap();
     }
-    let a1_id = *graph
+    let a1_id = graph
         .get_vertex_id_for_address(&sheet1_cell(&graph, 1, 1))
         .unwrap();
-    let a4_id = *graph
+    let a4_id = graph
         .get_vertex_id_for_address(&sheet1_cell(&graph, 4, 1))
         .unwrap();
-    let a5_id = *graph
+    let a5_id = graph
         .get_vertex_id_for_address(&sheet1_cell(&graph, 5, 1))
         .unwrap();
     let formula_result = graph
@@ -106,15 +117,15 @@ fn test_delete_rows() {
     // Verify remaining vertices
     assert_eq!(
         graph.get_vertex_id_for_address(&sheet1_cell(&graph, 1, 1)),
-        Some(&a1_id)
+        Some(a1_id)
     );
     assert_eq!(
         graph.get_vertex_id_for_address(&sheet1_cell(&graph, 2, 1)),
-        Some(&a4_id)
+        Some(a4_id)
     );
     assert_eq!(
         graph.get_vertex_id_for_address(&sheet1_cell(&graph, 3, 1)),
-        Some(&a5_id)
+        Some(a5_id)
     );
     assert!(
         graph
@@ -131,8 +142,12 @@ fn test_insert_rows_adjusts_formulas() {
     let mut graph = super::common::graph_truth_graph();
 
     // Create cells with formulas
-    graph.set_cell_value("Sheet1", 1, 1, lit_num(10.0)).unwrap();
-    graph.set_cell_value("Sheet1", 3, 1, lit_num(30.0)).unwrap();
+    graph
+        .set_cell_formula("Sheet1", 1, 1, super::common::literal_ast(lit_num(10.0)))
+        .unwrap();
+    graph
+        .set_cell_formula("Sheet1", 3, 1, super::common::literal_ast(lit_num(30.0)))
+        .unwrap();
 
     // B1 = A1 * 2
     graph
@@ -162,9 +177,13 @@ fn test_delete_row_creates_ref_error() {
     let mut graph = super::common::graph_truth_graph();
 
     // A1 = 10
-    graph.set_cell_value("Sheet1", 1, 1, lit_num(10.0)).unwrap();
+    graph
+        .set_cell_formula("Sheet1", 1, 1, super::common::literal_ast(lit_num(10.0)))
+        .unwrap();
     // A2 = 20
-    graph.set_cell_value("Sheet1", 2, 1, lit_num(20.0)).unwrap();
+    graph
+        .set_cell_formula("Sheet1", 2, 1, super::common::literal_ast(lit_num(20.0)))
+        .unwrap();
     // B2 = A2 * 2
     let b2_result = graph
         .set_cell_formula("Sheet1", 2, 2, parse("=A2*2").unwrap())
@@ -195,10 +214,10 @@ fn test_insert_rows_with_absolute_references() {
 
     // Setup cells
     graph
-        .set_cell_value("Sheet1", 1, 1, lit_num(100.0))
+        .set_cell_formula("Sheet1", 1, 1, super::common::literal_ast(lit_num(100.0)))
         .unwrap();
     graph
-        .set_cell_value("Sheet1", 5, 1, lit_num(500.0))
+        .set_cell_formula("Sheet1", 5, 1, super::common::literal_ast(lit_num(500.0)))
         .unwrap();
 
     // Formula with absolute reference: =$A$1+A5
@@ -227,10 +246,15 @@ fn test_multiple_row_operations() {
     // Setup initial data
     for i in 1..=10 {
         graph
-            .set_cell_value("Sheet1", i, 1, lit_num(i as f64))
+            .set_cell_formula(
+                "Sheet1",
+                i,
+                1,
+                super::common::literal_ast(lit_num(i as f64)),
+            )
             .unwrap();
     }
-    let a1_id = *graph
+    let a1_id = graph
         .get_vertex_id_for_address(&sheet1_cell(&graph, 1, 1))
         .unwrap();
 
@@ -255,6 +279,6 @@ fn test_multiple_row_operations() {
     // Verify final state: original A1 should now be at A2
     assert_eq!(
         graph.get_vertex_id_for_address(&sheet1_cell(&graph, 2, 1)),
-        Some(&a1_id)
+        Some(a1_id)
     );
 }

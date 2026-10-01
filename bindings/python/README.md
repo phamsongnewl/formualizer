@@ -1,9 +1,9 @@
-<h1 align="center">Formualizer for Python</h1>
+<h1 align="center">Formualizer</h1>
 
 <p align="center">
   <img alt="Arrow Powered" src="https://img.shields.io/badge/Arrow-Powered-0A66C2?logo=apache&logoColor=white" />
   <a href="https://pypi.org/project/formualizer/"><img alt="PyPI" src="https://img.shields.io/pypi/v/formualizer.svg" /></a>
-  <a href="../../LICENSE-MIT"><img alt="License: MIT/Apache-2.0" src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg" /></a>
+  <a href="https://github.com/PSU3D0/formualizer/blob/main/LICENSE-MIT"><img alt="License: MIT/Apache-2.0" src="https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg" /></a>
   <a href="https://www.formualizer.dev/docs/quickstarts/python-quickstart"><img alt="Documentation" src="https://img.shields.io/badge/docs-formualizer.dev-blue" /></a>
 </p>
 
@@ -11,11 +11,16 @@
   <img alt="Formualizer banner" src="https://raw.githubusercontent.com/psu3d0/formualizer/main/assets/formualizer-banner.png" />
 </p>
 
-<br />
+**The fastest open-source spreadsheet engine. Native speed, from Python.**
 
-**Parse, evaluate, and mutate Excel workbooks at native speed from Python.**
+Load Excel workbooks, change inputs, recalculate and read results—in-process, with no Excel installation or office-suite service. Formualizer runs the calculation in Rust and gives you a Python API. Built for financial models, data pipelines and AI agents.
 
-A Rust-powered spreadsheet engine with 320+ Excel-compatible functions, exposed through a clean Pythonic API. Tokenize formulas, walk ASTs, evaluate workbooks, and use SheetPort to treat spreadsheets as typed APIs.
+- **No compromise on speed.** Copied formulas compute as families over Arrow columns; lookups reuse indexes; only affected cells recalculate. See the [benchmarks and methodology](https://github.com/psu3d0/formualizer#how-fast).
+- **Excel-compatible.** 400+ functions, dynamic arrays, `LET`, `LAMBDA`, names and cross-sheet references. Unlike a file reader, Formualizer computes formulas rather than just returning cached values.
+- **Built for agents.** Inspect dependencies, track edits with undo/redo, inject a clock and random seed, and expose typed inputs and outputs through SheetPort.
+- **Portable.** Native wheels for Linux, macOS and Windows, plus a separate [Pyodide build](#using-in-pyodide-browser--webassembly). The same engine also ships for [Rust and JavaScript](https://github.com/psu3d0/formualizer#bindings).
+
+Need CLI or MCP tools for an agent rather than an embedded library? Use [agent-spreadsheet](https://github.com/PSU3D0/agent-spreadsheet), built on Formualizer.
 
 ## Installation
 
@@ -23,7 +28,7 @@ A Rust-powered spreadsheet engine with 320+ Excel-compatible functions, exposed 
 pip install formualizer
 ```
 
-Prebuilt wheels are available for Python 3.10-3.13 on Linux, macOS, and Windows. No Rust toolchain required.
+Prebuilt stable-ABI (`abi3`) wheels are published for Python 3.10 and newer on Linux (glibc and musl), macOS, and Windows. No Rust toolchain required.
 
 ## Documentation
 
@@ -31,13 +36,15 @@ Full documentation at **[formualizer.dev](https://www.formualizer.dev/docs)**:
 
 - [Python Quickstart](https://www.formualizer.dev/docs/quickstarts/python-quickstart)
 - [Python API Reference](https://www.formualizer.dev/docs/reference/python-api-map)
-- [Function Reference](https://www.formualizer.dev/docs/reference/functions) — 320+ built-in functions
+- [Function Reference](https://www.formualizer.dev/docs/reference/functions) — 400+ built-in functions
 - [SheetPort Guide](https://www.formualizer.dev/docs/sheetport) — spreadsheets as typed APIs
 - [Workbook Edits and Batching](https://www.formualizer.dev/docs/guides/workbook-edits-and-batching)
 
 ## Quick start
 
-### Evaluate a workbook
+Rows and columns are **1-based**: row 3, column 2 is B3.
+
+### Create and calculate a model
 
 ```python
 import formualizer as fz
@@ -58,8 +65,18 @@ print(wb.evaluate_cell("Sheet1", 1, 2))  # ~85.61
 ```python
 import formualizer as fz
 
+# Use a workbook with Assumptions and Summary sheets.
 wb = fz.load_workbook("financial_model.xlsx", strategy="eager_all")
-print(wb.evaluate_cell("Summary", 1, 2))
+wb.set_value("Assumptions", 3, 2, 0.07)  # B3: change an input
+wb.evaluate_all()  # calculate affected formulas
+print(wb.get_value("Summary", 5, 2))  # B5: read an output
+
+# Optional native read-only mapping. The underlying file must not be
+# destructively modified or truncated while it is loading.
+mapped = fz.load_workbook(
+    "financial_model.xlsx",
+    path_source=fz.XlsxPathSource.DIRECT_MMAP,
+)
 ```
 
 ### Load and save XLSX bytes
@@ -94,6 +111,21 @@ summary = fz.recalculate_file(
 > Formula text is preserved. Cached-value typing follows the active
 > `umya-spreadsheet` implementation.
 
+### Cache-only XLSX recalculation
+
+```python
+result = fz.recalculate_xlsx_bytes(payload)
+assert isinstance(result["bytes"], bytes)
+print(result["summary"]["status"], result["cache_cells_changed"])
+
+# The file API snapshots input and atomically replaces the destination on success.
+result = fz.recalculate_xlsx_file("model.xlsx", output="model.recalc.xlsx")
+```
+
+These APIs use the shared cache-only Rust implementation, retaining formula text
+and unrelated package members. Safe core resource limits apply;
+`error_location_limit=` only caps retained error locations.
+
 ### Parse and analyze formulas
 
 ```python
@@ -115,7 +147,7 @@ print(collect_function_names(ast))  # ['SUMIFS']
 |---|---|
 | **Tokenization** | Break formulas into structured `Token` objects with byte spans and operator metadata |
 | **Parsing** | Produce a rich AST with reference normalization, source tracking, and 64-bit structural fingerprints |
-| **320+ built-in functions** | Math, text, lookup (XLOOKUP, VLOOKUP), date/time, financial, statistics, database, engineering |
+| **400+ built-in functions** | Math, text, lookup (XLOOKUP, VLOOKUP), date/time, financial, statistics, database, engineering |
 | **Workbook evaluation** | Set values and formulas, evaluate cells/ranges, load XLSX/CSV/JSON |
 | **XLSX cache writeback** | `recalculate_file(path, output=None)` recalculates formulas and writes cached values back |
 | **Batch operations** | `set_values_batch` / `set_formulas_batch` for efficient bulk updates |
@@ -179,7 +211,7 @@ Key semantics:
 - Return Python primitives, datetime/date/time/timedelta, dict error objects, or nested lists for array spill output.
 - Python callback exceptions are sanitized and mapped to `#VALUE!`.
 
-Runnable example: `python bindings/python/examples/custom_function_registration.py`
+Runnable [custom-function example](https://github.com/psu3d0/formualizer/blob/main/bindings/python/examples/custom_function_registration.py) (from a source checkout: `python bindings/python/examples/custom_function_registration.py`).
 
 ## Batch operations
 
@@ -285,16 +317,18 @@ print(result["final_price"])  # 120.0
 ```python
 tokenize(formula: str, dialect: FormulaDialect = None) -> Tokenizer
 parse(formula: str, dialect: FormulaDialect = None) -> ASTNode
-load_workbook(path: str, strategy: str = None) -> Workbook
-load_workbook_bytes(data: bytes, strategy: str = None, backend: str | None = None) -> Workbook
+load_workbook(path: str, strategy: str = None, *, path_source: XlsxPathSource | None = None, span_evaluation: bool | None = None) -> Workbook
+load_workbook_bytes(data: bytes, strategy: str = None, backend: str | None = None, *, span_evaluation: bool | None = None) -> Workbook
 recalculate_file(path: str, output: str | None = None) -> dict
+recalculate_xlsx_bytes(data: bytes, *, error_location_limit: int | None = None) -> dict
+recalculate_xlsx_file(path: str, output: str | None = None, *, error_location_limit: int | None = None) -> dict
 ```
 
 ### Core classes
 
 - **`Workbook`** — create, load, evaluate, undo/redo. Supports `from_path()`, `from_bytes()`, `load_path()`, and `to_xlsx_bytes()`.
 - **`Sheet`** — per-sheet facade for `set_value`, `set_formula`, `get_cell`, batch operations.
-- **`LiteralValue`** — typed values: `.int()`, `.number()`, `.text()`, `.boolean()`, `.date()`, `.empty()`, `.error()`, `.array()`.
+- **`LiteralValue`** — typed values: `.int()`, `.number()`, `.text()`, `.boolean()`, `.date()`, `.time()`, `.datetime()`, `.duration()`, `.empty()`, `.error()`, `.array()`.
 - **`Tokenizer`** — iterable token sequence with `.render()` and `.tokens`.
 - **`ASTNode`** — `.pretty()`, `.to_formula()`, `.fingerprint()`, `.children()`, `.walk_refs()`.
 - **`CellRef` / `RangeRef` / `TableRef` / `NamedRangeRef`** — typed references.
@@ -316,7 +350,7 @@ Full type stubs are included in the package (`.pyi` files) for IDE autocompletio
 
 ## Building from source
 
-Requires Rust >= 1.70 and [maturin](https://github.com/PyO3/maturin):
+Requires Rust 1.93.0 (the pinned release toolchain; edition 2024) and [maturin](https://github.com/PyO3/maturin):
 
 ```bash
 pip install maturin
@@ -327,12 +361,13 @@ maturin develop --release  # optimized build
 
 ## Using in Pyodide (browser / WebAssembly)
 
-`formualizer` ships a Pyodide-tagged wheel (`*-pyodide_<abi>_wasm32.whl`) alongside the native wheels on PyPI. Inside a Pyodide runtime:
+Native wheels are published to PyPI. Pyodide wheels are built and smoke-tested in CI and release workflows, then uploaded only as the `wheels-pyodide` Actions artifact; they are not uploaded to PyPI or attached to GitHub Releases. Download and extract the artifact (or build locally), then host the compatible wheel at a browser-accessible URL with suitable CORS headers. An Actions artifact ZIP is not a wheel URL:
 
 ```python
 import micropip
 
-await micropip.install("formualizer")
+wheel_url = "<your-downloadable-wheel-url>"
+await micropip.install(wheel_url)
 
 import formualizer as fz
 
@@ -344,7 +379,7 @@ wb.set_formula("Sheet1", 1, 2, "=SUM(A1:A2)")
 wb.evaluate_cell("Sheet1", 1, 2)  # -> 42.0
 ```
 
-**Supported Pyodide versions:** 0.29.x (ABI `pyodide_2025_0`). Later minors may require a new wheel — check the PyPI release matrix for your target Pyodide version.
+**Tested Pyodide target:** CI and release smoke tests use Pyodide 0.29.3 and the wheel's derived ABI (currently `pyodide_2025_0`). Rebuild and smoke-test a wheel when targeting another runtime; no persistent public wheel URL is promised.
 
 **Pyodide-specific behavior:**
 - `EvaluationConfig()` and `Workbook()` default `enable_parallel = False` on `sys.platform == "emscripten"` (Pyodide has no threads). You can still opt in, but it falls back to single-threaded execution.
@@ -353,14 +388,14 @@ wb.evaluate_cell("Sheet1", 1, 2)  # -> 42.0
 
 ### Building a Pyodide wheel from source
 
-For local development or targeting a Pyodide version that isn't on PyPI:
+For local development or targeting a Pyodide version without a retained Actions artifact:
 
 ```bash
 ./scripts/build-pyodide-wheel.sh
 ./scripts/smoke-pyodide-wheel.sh dist/pyodide/*-pyodide_*_wasm32.whl
 ```
 
-The build script derives Python, ABI, Emscripten, and Rust toolchain from `pyodide config` (no hardcoded versions), installs Pyodide's custom wasm-EH Rust sysroot over the stock rustup target, and retags the output wheel to the platform tag Pyodide's `micropip` expects.
+The build script defaults to xbuildenv Pyodide 0.29.3, derives Python, ABI, Emscripten, and Rust toolchain values from `pyodide config`, installs Pyodide's custom wasm-EH Rust sysroot over the stock rustup target, and retags the output wheel to the platform tag Pyodide's `micropip` expects. `pyodide-cli` and `pyodide-build` are resolved through `uvx` and are not pinned by the script.
 
 ## Testing
 
@@ -385,4 +420,4 @@ The Python wheel links directly against the Rust crates — there is no runtime 
 
 ## License
 
-Dual-licensed under [MIT](../../LICENSE-MIT) or [Apache-2.0](../../LICENSE-APACHE), at your option.
+Dual-licensed under [MIT](https://github.com/PSU3D0/formualizer/blob/main/LICENSE-MIT) or [Apache-2.0](https://github.com/PSU3D0/formualizer/blob/main/LICENSE-APACHE), at your option. Both license texts ship inside the package.

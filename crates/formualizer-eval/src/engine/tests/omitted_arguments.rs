@@ -220,6 +220,31 @@ fn omitted_argument_oracle_table() {
             "oracle: uniform-rule",
             Expected::Error(ExcelErrorKind::Value),
         ),
+        (
+            "=TEXTJOIN(\",\",,SEQUENCE(3,,2))",
+            "oracle: excel-web",
+            Expected::Text("2,3,4"),
+        ),
+        (
+            "=TEXTJOIN(\",\",,SEQUENCE(3,1,,2))",
+            "oracle: excel-web",
+            Expected::Text("1,3,5"),
+        ),
+        (
+            "=TEXTJOIN(\",\",,SEQUENCE(3,1,2,))",
+            "oracle: excel-web",
+            Expected::Text("2,3,4"),
+        ),
+        (
+            "=TEXTJOIN(\",\",,SEQUENCE(3,,,2))",
+            "oracle: excel-web",
+            Expected::Text("1,3,5"),
+        ),
+        (
+            "=TEXTJOIN(\",\",,SEQUENCE(3,1,0,0))",
+            "oracle: excel-web explicit-zero control",
+            Expected::Text("0,0,0"),
+        ),
         ("=LEFT(0,2)", "negative control", Expected::Text("0")),
         (
             "=EXACT(\"\",0)",
@@ -378,12 +403,6 @@ fn ingest_omitted_formula_set(mode: FormulaPlaneMode) -> Engine<TestWorkbook> {
 fn formula_plane_omitted_argument_values_match_legacy_evaluation() {
     let legacy = ingest_omitted_formula_set(FormulaPlaneMode::Off);
     let formula_plane = ingest_omitted_formula_set(FormulaPlaneMode::AuthoritativeExperimental);
-    assert!(
-        formula_plane
-            .baseline_stats()
-            .formula_plane_active_span_count
-            > 0
-    );
     for row in 1..=20 {
         for col in 1..=4 {
             assert_eq!(

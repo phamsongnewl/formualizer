@@ -4,7 +4,7 @@ use formualizer_common::LiteralValue;
 use formualizer_parse::parser::{ASTNode, ASTNodeType, ReferenceType};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RangeSelfUse {
+pub(super) enum RangeSelfUse {
     NoMatch,
     Excluded,
     IncludedOrUnknown,
@@ -20,12 +20,148 @@ impl RangeSelfUse {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum StructuralEdit {
+    InsertRows { before: u32 },
+    DeleteRows { start: u32, end: u32 },
+    InsertColumns { before: u32 },
+    DeleteColumns { start: u32, end: u32 },
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StructuralOccupancy {
+    occupied_rows: Vec<u32>,
+    occupied_columns: Vec<u32>,
+    conservative: bool,
+}
+
+impl StructuralOccupancy {
+    pub(crate) fn conservative() -> Self {
+        Self {
+            conservative: true,
+            ..Self::default()
+        }
+    }
+
+    /// Tests: the occupancy of cells `(row0, col0)` (as a scan of their
+    /// vertices would give it).
+    #[cfg(test)]
+    pub(crate) fn of_cells_for_test(cells: impl IntoIterator<Item = (u32, u32)>) -> Self {
+        let mut occupancy = Self::default();
+        for (row, col) in cells {
+            occupancy.occupied_rows.push(row);
+            occupancy.occupied_columns.push(col);
+        }
+        occupancy.finish();
+        occupancy
+    }
+
+    fn finish(&mut self) {
+        self.occupied_rows.sort_unstable();
+        self.occupied_rows.dedup();
+        self.occupied_columns.sort_unstable();
+        self.occupied_columns.dedup();
+    }
+
+    pub(crate) fn include_arrow_sheet(&mut self, sheet: &crate::arrow_store::ArrowSheet) {
+        let shapes = sheet.shape();
+        for (col, column) in sheet.columns.iter().enumerate() {
+            let shape_occupied = shapes.get(col).is_some_and(|shape| {
+                shape.has_num || shape.has_bool || shape.has_text || shape.has_err
+            });
+            let sparse_meta_occupied = column.sparse_chunks.values().any(|chunk| {
+                chunk.meta.non_null_num > 0
+                    || chunk.meta.non_null_bool > 0
+                    || chunk.meta.non_null_text > 0
+                    || chunk.meta.non_null_err > 0
+            });
+            let overlay_occupied = column
+                .chunks
+                .iter()
+                .chain(column.sparse_chunks.values())
+                .any(|chunk| {
+                    chunk.overlay.iter().next().is_some()
+                        || chunk.computed_overlay.iter().next().is_some()
+                });
+            if shape_occupied || sparse_meta_occupied || overlay_occupied {
+                self.occupied_columns.push(col as u32);
+            }
+        }
+        self.finish();
+    }
+
+    /// Occupied columns as inclusive runs, when known (`None`: conservative
+    /// or nothing recorded).
+    pub(crate) fn occupied_column_runs(&self) -> Option<Vec<(u32, u32)>> {
+        if self.conservative || self.occupied_columns.is_empty() {
+            return None;
+        }
+        let mut runs: Vec<(u32, u32)> = Vec::new();
+        for &c in &self.occupied_columns {
+            match runs.last_mut() {
+                Some((_, end)) if *end + 1 == c => *end = c,
+                _ => runs.push((c, c)),
+            }
+        }
+        Some(runs)
+    }
+
+    fn intersects(sorted: &[u32], start: u32, end: u32) -> bool {
+        let index = sorted.partition_point(|value| *value < start);
+        sorted.get(index).is_some_and(|value| *value <= end)
+    }
+
+    pub(crate) fn cross_axis_occupied(
+        self_ref: &Self,
+        edit: StructuralEdit,
+        start: u32,
+        end: u32,
+    ) -> bool {
+        if self_ref.conservative {
+            return true;
+        }
+        match edit {
+            StructuralEdit::InsertRows { .. } | StructuralEdit::DeleteRows { .. } => {
+                Self::intersects(&self_ref.occupied_columns, start, end)
+            }
+            StructuralEdit::InsertColumns { .. } | StructuralEdit::DeleteColumns { .. } => {
+                Self::intersects(&self_ref.occupied_rows, start, end)
+            }
+        }
+    }
+}
+
 impl DependencyGraph {
-    pub(crate) fn compressed_range_dependents_intersecting_deleted_rows(
+    #[cfg(any(test, feature = "legacy_oracle"))]
+    pub(crate) fn has_compressed_range_dependencies(&self) -> bool {
+        !self.formula_to_range_deps.is_empty()
+    }
+
+    pub(crate) fn structural_occupancy(&self, sheet_id: SheetId) -> StructuralOccupancy {
+        let mut occupancy = StructuralOccupancy::default();
+        for (id, coord) in self.grid_vertices_in_sheet(sheet_id) {
+            if self.store.kind(id) != VertexKind::Empty {
+                occupancy.occupied_rows.push(coord.row());
+                occupancy.occupied_columns.push(coord.col());
+            }
+        }
+        // Cells the legacy graph held as vertices without a formula (the
+        // extent record) move with a row edit and so change the used extent
+        // of open ranges over their columns: those columns are occupied.
+        // (Column edits pass a conservative occupancy; rows are not needed.)
+        occupancy
+            .occupied_columns
+            .extend(self.extent_record_columns(sheet_id));
+        occupancy.finish();
+        occupancy
+    }
+
+    #[cfg(any(test, feature = "legacy_oracle"))]
+    pub(crate) fn compressed_range_dependents_for_structural_edit(
         &self,
         sheet_id: SheetId,
-        start_row: u32,
-        end_row: u32,
+        edit: StructuralEdit,
+        occupancy: &StructuralOccupancy,
     ) -> Vec<VertexId> {
         self.formula_to_range_deps
             .iter()
@@ -34,52 +170,58 @@ impl DependencyGraph {
                     .iter()
                     .any(|range| {
                         // `Current` is the dependent formula's own sheet. An
-                        // unresolvable sheet name keeps the dependent in the
-                        // candidate set (over-approximating is safe here;
-                        // dropping it would silently lose a dependent).
+                        // unresolvable sheet keeps the candidate conservative.
                         let range_sheet_id = self
                             .sheet_reg
                             .resolve_locator(&range.sheet, self.get_vertex_sheet_id(dependent))
-                            .unwrap_or(sheet_id);
-                        let range_start = range.start_row.map(|bound| bound.index).unwrap_or(0);
-                        let range_end = range.end_row.map(|bound| bound.index).unwrap_or(u32::MAX);
-                        range_sheet_id == sheet_id
-                            && range_start <= end_row
-                            && range_end >= start_row
+                            .ok();
+                        if range_sheet_id.is_some_and(|resolved| resolved != sheet_id) {
+                            return false;
+                        }
+                        let start_row = range.start_row.map(|bound| bound.index).unwrap_or(0);
+                        let end_row = range.end_row.map(|bound| bound.index).unwrap_or(u32::MAX);
+                        let start_col = range.start_col.map(|bound| bound.index).unwrap_or(0);
+                        let end_col = range.end_col.map(|bound| bound.index).unwrap_or(u32::MAX);
+                        let axis_matches = match edit {
+                            StructuralEdit::DeleteRows { start, end } => {
+                                start_row <= end && end_row >= start
+                            }
+                            StructuralEdit::InsertRows { before } => {
+                                (range.start_row.is_none() || start_row < before)
+                                    && before <= end_row
+                            }
+                            StructuralEdit::DeleteColumns { start, end } => {
+                                start_col <= end && end_col >= start
+                            }
+                            StructuralEdit::InsertColumns { before } => {
+                                (range.start_col.is_none() || start_col < before)
+                                    && before <= end_col
+                            }
+                        };
+                        let (cross_start, cross_end) = match edit {
+                            StructuralEdit::InsertRows { .. }
+                            | StructuralEdit::DeleteRows { .. } => (start_col, end_col),
+                            StructuralEdit::InsertColumns { .. }
+                            | StructuralEdit::DeleteColumns { .. } => (start_row, end_row),
+                        };
+                        axis_matches
+                            && (range_sheet_id.is_none()
+                                // An unresolvable sheet candidate must remain
+                                // conservative; occupancy from the edited sheet
+                                // cannot prove that candidate empty.
+                                || StructuralOccupancy::cross_axis_occupied(
+                                    occupancy,
+                                    edit,
+                                    cross_start,
+                                    cross_end,
+                                ))
                     })
                     .then_some(dependent)
             })
             .collect()
     }
 
-    pub(crate) fn compressed_range_dependents_intersecting_deleted_columns(
-        &self,
-        sheet_id: SheetId,
-        start_col: u32,
-        end_col: u32,
-    ) -> Vec<VertexId> {
-        self.formula_to_range_deps
-            .iter()
-            .filter_map(|(&dependent, ranges)| {
-                ranges
-                    .iter()
-                    .any(|range| {
-                        // See the row query above.
-                        let range_sheet_id = self
-                            .sheet_reg
-                            .resolve_locator(&range.sheet, self.get_vertex_sheet_id(dependent))
-                            .unwrap_or(sheet_id);
-                        let range_start = range.start_col.map(|bound| bound.index).unwrap_or(0);
-                        let range_end = range.end_col.map(|bound| bound.index).unwrap_or(u32::MAX);
-                        range_sheet_id == sheet_id
-                            && range_start <= end_col
-                            && range_end >= start_col
-                    })
-                    .then_some(dependent)
-            })
-            .collect()
-    }
-
+    #[cfg(any(test, feature = "legacy_oracle"))]
     /// Visit compressed-range formula dependents covering one cell without
     /// materializing the stripe union used by dirty propagation.
     ///
@@ -171,6 +313,7 @@ impl DependencyGraph {
         true
     }
 
+    #[cfg(any(test, feature = "legacy_oracle"))]
     /// Public wrapper to add range-dependent edges.
     pub fn add_range_edges(
         &mut self,
@@ -181,6 +324,7 @@ impl DependencyGraph {
         self.add_range_dependent_edges(dependent, ranges, current_sheet_id);
     }
 
+    #[cfg(any(test, feature = "legacy_oracle"))]
     /// Return the compressed range dependencies recorded for a formula vertex, if any.
     /// These are `SharedRangeRef` entries that were not expanded into explicit
     /// cell edges due to `range_expansion_limit` or due to infinite/partial bounds.
@@ -236,8 +380,13 @@ impl DependencyGraph {
     /// Record a self-loop edge (vertex → itself). The edge store and Tarjan
     /// both treat self-loops as cycles (`separate_cycles` via `has_self_loop`).
     fn record_self_loop(&mut self, vertex: VertexId) {
-        if !self.has_self_loop(vertex) {
-            self.edges.add_edge(vertex, vertex);
+        #[cfg(not(any(test, feature = "legacy_oracle")))]
+        let _ = (&vertex,);
+        #[cfg(any(test, feature = "legacy_oracle"))]
+        {
+            if !self.has_self_loop(vertex) {
+                self.edges.add_edge(vertex, vertex);
+            }
         }
     }
 
@@ -275,7 +424,7 @@ impl DependencyGraph {
     /// used-bound growth still invalidates the formula; only the synthetic #120
     /// self-loop is omitted when the selected reference cannot contain the
     /// formula cell.
-    fn compressed_range_self_use(
+    pub(super) fn compressed_range_self_use(
         &self,
         dependent: VertexId,
         range_sheet: SheetId,
@@ -460,6 +609,23 @@ impl DependencyGraph {
         ranges: &[SharedRangeRef<'static>],
         current_sheet_id: SheetId,
     ) {
+        if !ranges.is_empty() {
+            self.note_reads_range(dependent);
+        }
+        #[cfg(not(any(test, feature = "legacy_oracle")))]
+        let _ = (&dependent, &ranges, &current_sheet_id);
+        #[cfg(any(test, feature = "legacy_oracle"))]
+        self.oracle_add_range_dependent_edges(dependent, ranges, current_sheet_id);
+    }
+
+    /// The oracle-only half (test/oracle builds) of the function above.
+    #[cfg(any(test, feature = "legacy_oracle"))]
+    pub(super) fn oracle_add_range_dependent_edges(
+        &mut self,
+        dependent: VertexId,
+        ranges: &[SharedRangeRef<'static>],
+        current_sheet_id: SheetId,
+    ) {
         if ranges.is_empty() {
             return;
         }
@@ -490,6 +656,18 @@ impl DependencyGraph {
                     != RangeSelfUse::Excluded
             {
                 self.record_self_loop(dependent);
+            }
+
+            // #376: an all-unbounded range means "the whole sheet". The stripe
+            // classification below would treat it as both column- and
+            // row-striped, fall through both branches, and collapse it to a
+            // single row-0 stripe, hiding edits anywhere else from this
+            // dependent. Register full column coverage instead; the precision
+            // check against `formula_to_range_deps` already treats the missing
+            // bounds as unbounded.
+            if s_row.is_none() && e_row.is_none() && s_col.is_none() && e_col.is_none() {
+                self.register_whole_sheet_stripes(dependent, sheet_id);
+                continue;
             }
 
             let col_stripes = (s_row.is_none() && e_row.is_none())
@@ -626,183 +804,240 @@ impl DependencyGraph {
         }
     }
 
+    /// Register stripes covering every cell of a sheet, for a dependent whose
+    /// range is unbounded on both axes (#376). Dirty-propagation lookups probe
+    /// the column stripe of every edited cell, so covering all columns
+    /// guarantees any edit on the sheet reaches the precision check.
+    fn register_whole_sheet_stripes(&mut self, dependent: VertexId, sheet_id: SheetId) {
+        #[cfg(not(any(test, feature = "legacy_oracle")))]
+        let _ = (&dependent, &sheet_id);
+        #[cfg(any(test, feature = "legacy_oracle"))]
+        {
+            /// Excel sheet column capacity (column XFD), as a 0-based exclusive bound.
+            const SHEET_MAX_COLS: u32 = 16_384;
+            for col in 0..SHEET_MAX_COLS {
+                let key = StripeKey {
+                    sheet_id,
+                    stripe_type: StripeType::Column,
+                    index: col,
+                };
+                self.stripe_to_dependents
+                    .entry(key)
+                    .or_default()
+                    .insert(dependent);
+            }
+        }
+    }
+
     /// Fast-path: add range dependencies using compact RangeKey.
-    pub fn add_range_deps_from_keys(
+    pub(crate) fn add_range_deps_from_keys(
         &mut self,
         dependent: VertexId,
         keys: &[crate::engine::plan::RangeKey],
         current_sheet_id: SheetId,
     ) {
-        use crate::engine::plan::RangeKey as RK;
-        if keys.is_empty() {
-            return;
+        if !keys.is_empty() {
+            self.note_reads_range(dependent);
         }
+        #[cfg(not(any(test, feature = "legacy_oracle")))]
+        let _ = (&dependent, &keys, &current_sheet_id);
+        #[cfg(any(test, feature = "legacy_oracle"))]
+        {
+            use crate::engine::plan::RangeKey as RK;
+            if keys.is_empty() {
+                return;
+            }
 
-        let mut shared_ranges: Vec<SharedRangeRef<'static>> = Vec::with_capacity(keys.len());
-        for k in keys {
-            let sheet_loc = SharedSheetLocator::Id(match k {
-                RK::Rect { sheet, .. }
-                | RK::WholeRow { sheet, .. }
-                | RK::WholeCol { sheet, .. }
-                | RK::OpenRect { sheet, .. } => *sheet,
-            });
+            let mut shared_ranges: Vec<SharedRangeRef<'static>> = Vec::with_capacity(keys.len());
+            for k in keys {
+                let sheet_loc = SharedSheetLocator::Id(match k {
+                    RK::Rect { sheet, .. }
+                    | RK::WholeRow { sheet, .. }
+                    | RK::WholeCol { sheet, .. }
+                    | RK::OpenRect { sheet, .. } => *sheet,
+                });
 
-            let mk_axis = |idx0: u32| formualizer_common::AxisBound::new(idx0, false);
+                let mk_axis = |idx0: u32| formualizer_common::AxisBound::new(idx0, false);
 
-            let built = match k {
-                RK::Rect { start, end, .. } => {
-                    let sr = mk_axis(start.row());
-                    let sc = mk_axis(start.col());
-                    let er = mk_axis(end.row());
-                    let ec = mk_axis(end.col());
-                    SharedRangeRef::from_parts(sheet_loc, Some(sr), Some(sc), Some(er), Some(ec))
+                let built = match k {
+                    RK::Rect { start, end, .. } => {
+                        let sr = mk_axis(start.row());
+                        let sc = mk_axis(start.col());
+                        let er = mk_axis(end.row());
+                        let ec = mk_axis(end.col());
+                        SharedRangeRef::from_parts(
+                            sheet_loc,
+                            Some(sr),
+                            Some(sc),
+                            Some(er),
+                            Some(ec),
+                        )
                         .ok()
+                    }
+                    RK::WholeRow { row, .. } => {
+                        let r0 = row.saturating_sub(1);
+                        let b = mk_axis(r0);
+                        SharedRangeRef::from_parts(sheet_loc, Some(b), None, Some(b), None).ok()
+                    }
+                    RK::WholeCol { col, .. } => {
+                        let c0 = col.saturating_sub(1);
+                        let b = mk_axis(c0);
+                        SharedRangeRef::from_parts(sheet_loc, None, Some(b), None, Some(b)).ok()
+                    }
+                    RK::OpenRect {
+                        start_row,
+                        start_col,
+                        end_row,
+                        end_col,
+                        ..
+                    } => SharedRangeRef::from_parts(
+                        sheet_loc,
+                        start_row.map(mk_axis),
+                        start_col.map(mk_axis),
+                        end_row.map(mk_axis),
+                        end_col.map(mk_axis),
+                    )
+                    .ok(),
+                };
+
+                if let Some(r) = built {
+                    shared_ranges.push(r.into_owned());
                 }
-                RK::WholeRow { row, .. } => {
-                    let r0 = row.saturating_sub(1);
-                    let b = mk_axis(r0);
-                    SharedRangeRef::from_parts(sheet_loc, Some(b), None, Some(b), None).ok()
-                }
-                RK::WholeCol { col, .. } => {
-                    let c0 = col.saturating_sub(1);
-                    let b = mk_axis(c0);
-                    SharedRangeRef::from_parts(sheet_loc, None, Some(b), None, Some(b)).ok()
-                }
-                RK::OpenRect { start, end, .. } => {
-                    let (sr, sc) = match start {
-                        Some(p) => (Some(mk_axis(p.row())), Some(mk_axis(p.col()))),
-                        None => (None, None),
-                    };
-                    let (er, ec) = match end {
-                        Some(p) => (Some(mk_axis(p.row())), Some(mk_axis(p.col()))),
-                        None => (None, None),
-                    };
-                    SharedRangeRef::from_parts(sheet_loc, sr, sc, er, ec).ok()
-                }
-            };
-
-            if let Some(r) = built {
-                shared_ranges.push(r.into_owned());
-            }
-        }
-
-        if shared_ranges.is_empty() {
-            return;
-        }
-
-        self.formula_to_range_deps
-            .insert(dependent, shared_ranges.clone());
-
-        for range in &shared_ranges {
-            // See add_range_dependent_edges.
-            let sheet_id = self
-                .sheet_reg
-                .resolve_locator(&range.sheet, current_sheet_id)
-                .unwrap_or(current_sheet_id);
-
-            let s_row = range.start_row.map(|b| b.index);
-            let e_row = range.end_row.map(|b| b.index);
-            let s_col = range.start_col.map(|b| b.index);
-            let e_col = range.end_col.map(|b| b.index);
-
-            // #120: see add_range_dependent_edges — compressed range covering
-            // the formula's own cell records a self-loop for SCC detection.
-            if self.range_region_contains_self(dependent, sheet_id, s_row, e_row, s_col, e_col)
-                && self.compressed_range_self_use(dependent, sheet_id, (s_row, e_row, s_col, e_col))
-                    != RangeSelfUse::Excluded
-            {
-                self.record_self_loop(dependent);
             }
 
-            let col_stripes = (s_row.is_none() && e_row.is_none())
-                || (s_col.is_some() && e_col.is_some() && (s_row.is_none() || e_row.is_none()));
-            let row_stripes = (s_col.is_none() && e_col.is_none())
-                || (s_row.is_some() && e_row.is_some() && (s_col.is_none() || e_col.is_none()));
+            if shared_ranges.is_empty() {
+                return;
+            }
 
-            if col_stripes && !row_stripes {
-                let sc = s_col.unwrap_or(0);
-                let ec = e_col.unwrap_or(sc);
-                for col in sc..=ec {
-                    let key = StripeKey {
+            self.formula_to_range_deps
+                .insert(dependent, shared_ranges.clone());
+
+            for range in &shared_ranges {
+                // See add_range_dependent_edges.
+                let sheet_id = self
+                    .sheet_reg
+                    .resolve_locator(&range.sheet, current_sheet_id)
+                    .unwrap_or(current_sheet_id);
+
+                let s_row = range.start_row.map(|b| b.index);
+                let e_row = range.end_row.map(|b| b.index);
+                let s_col = range.start_col.map(|b| b.index);
+                let e_col = range.end_col.map(|b| b.index);
+
+                // #120: see add_range_dependent_edges — compressed range covering
+                // the formula's own cell records a self-loop for SCC detection.
+                if self.range_region_contains_self(dependent, sheet_id, s_row, e_row, s_col, e_col)
+                    && self.compressed_range_self_use(
+                        dependent,
                         sheet_id,
-                        stripe_type: StripeType::Column,
-                        index: col,
-                    };
-                    self.stripe_to_dependents
-                        .entry(key)
-                        .or_default()
-                        .insert(dependent);
+                        (s_row, e_row, s_col, e_col),
+                    ) != RangeSelfUse::Excluded
+                {
+                    self.record_self_loop(dependent);
                 }
-                continue;
-            }
 
-            if row_stripes && !col_stripes {
-                let sr = s_row.unwrap_or(0);
-                let er = e_row.unwrap_or(sr);
-                for row in sr..=er {
-                    let key = StripeKey {
-                        sheet_id,
-                        stripe_type: StripeType::Row,
-                        index: row,
-                    };
-                    self.stripe_to_dependents
-                        .entry(key)
-                        .or_default()
-                        .insert(dependent);
+                // #376: an all-unbounded range means "the whole sheet". The stripe
+                // classification below would treat it as both column- and
+                // row-striped, fall through both branches, and collapse it to a
+                // single row-0 stripe, hiding edits anywhere else from this
+                // dependent. Register full column coverage instead; the precision
+                // check against `formula_to_range_deps` already treats the missing
+                // bounds as unbounded.
+                if s_row.is_none() && e_row.is_none() && s_col.is_none() && e_col.is_none() {
+                    self.register_whole_sheet_stripes(dependent, sheet_id);
+                    continue;
                 }
-                continue;
-            }
 
-            let start_row = s_row.unwrap_or(0);
-            let start_col = s_col.unwrap_or(0);
-            let end_row = e_row.unwrap_or(start_row);
-            let end_col = e_col.unwrap_or(start_col);
+                let col_stripes = (s_row.is_none() && e_row.is_none())
+                    || (s_col.is_some() && e_col.is_some() && (s_row.is_none() || e_row.is_none()));
+                let row_stripes = (s_col.is_none() && e_col.is_none())
+                    || (s_row.is_some() && e_row.is_some() && (s_col.is_none() || e_col.is_none()));
 
-            let height = end_row.saturating_sub(start_row) + 1;
-            let width = end_col.saturating_sub(start_col) + 1;
-
-            if self.config.enable_block_stripes && height > 1 && width > 1 {
-                let start_block_row = start_row / BLOCK_H;
-                let end_block_row = end_row / BLOCK_H;
-                let start_block_col = start_col / BLOCK_W;
-                let end_block_col = end_col / BLOCK_W;
-
-                for block_row in start_block_row..=end_block_row {
-                    for block_col in start_block_col..=end_block_col {
+                if col_stripes && !row_stripes {
+                    let sc = s_col.unwrap_or(0);
+                    let ec = e_col.unwrap_or(sc);
+                    for col in sc..=ec {
                         let key = StripeKey {
                             sheet_id,
-                            stripe_type: StripeType::Block,
-                            index: block_index(block_row * BLOCK_H, block_col * BLOCK_W),
+                            stripe_type: StripeType::Column,
+                            index: col,
                         };
                         self.stripe_to_dependents
                             .entry(key)
                             .or_default()
                             .insert(dependent);
                     }
+                    continue;
                 }
-            } else if height > width {
-                for col in start_col..=end_col {
-                    let key = StripeKey {
-                        sheet_id,
-                        stripe_type: StripeType::Column,
-                        index: col,
-                    };
-                    self.stripe_to_dependents
-                        .entry(key)
-                        .or_default()
-                        .insert(dependent);
+
+                if row_stripes && !col_stripes {
+                    let sr = s_row.unwrap_or(0);
+                    let er = e_row.unwrap_or(sr);
+                    for row in sr..=er {
+                        let key = StripeKey {
+                            sheet_id,
+                            stripe_type: StripeType::Row,
+                            index: row,
+                        };
+                        self.stripe_to_dependents
+                            .entry(key)
+                            .or_default()
+                            .insert(dependent);
+                    }
+                    continue;
                 }
-            } else {
-                for row in start_row..=end_row {
-                    let key = StripeKey {
-                        sheet_id,
-                        stripe_type: StripeType::Row,
-                        index: row,
-                    };
-                    self.stripe_to_dependents
-                        .entry(key)
-                        .or_default()
-                        .insert(dependent);
+
+                let start_row = s_row.unwrap_or(0);
+                let start_col = s_col.unwrap_or(0);
+                let end_row = e_row.unwrap_or(start_row);
+                let end_col = e_col.unwrap_or(start_col);
+
+                let height = end_row.saturating_sub(start_row) + 1;
+                let width = end_col.saturating_sub(start_col) + 1;
+
+                if self.config.enable_block_stripes && height > 1 && width > 1 {
+                    let start_block_row = start_row / BLOCK_H;
+                    let end_block_row = end_row / BLOCK_H;
+                    let start_block_col = start_col / BLOCK_W;
+                    let end_block_col = end_col / BLOCK_W;
+
+                    for block_row in start_block_row..=end_block_row {
+                        for block_col in start_block_col..=end_block_col {
+                            let key = StripeKey {
+                                sheet_id,
+                                stripe_type: StripeType::Block,
+                                index: block_index(block_row * BLOCK_H, block_col * BLOCK_W),
+                            };
+                            self.stripe_to_dependents
+                                .entry(key)
+                                .or_default()
+                                .insert(dependent);
+                        }
+                    }
+                } else if height > width {
+                    for col in start_col..=end_col {
+                        let key = StripeKey {
+                            sheet_id,
+                            stripe_type: StripeType::Column,
+                            index: col,
+                        };
+                        self.stripe_to_dependents
+                            .entry(key)
+                            .or_default()
+                            .insert(dependent);
+                    }
+                } else {
+                    for row in start_row..=end_row {
+                        let key = StripeKey {
+                            sheet_id,
+                            stripe_type: StripeType::Row,
+                            index: row,
+                        };
+                        self.stripe_to_dependents
+                            .entry(key)
+                            .or_default()
+                            .insert(dependent);
+                    }
                 }
             }
         }

@@ -7,7 +7,7 @@ use formualizer_macros::func_caps;
 
 fn scalar_like_value(arg: &ArgumentHandle<'_, '_>) -> Result<LiteralValue, ExcelError> {
     Ok(match arg.value()? {
-        crate::traits::CalcValue::Scalar(v) => v,
+        crate::traits::CalcValue::Scalar(v) | crate::traits::CalcValue::AnnotatedScalar(v, _) => v,
         crate::traits::CalcValue::Range(rv) => rv.get_cell(0, 0),
         crate::traits::CalcValue::Callable(_) => LiteralValue::Error(
             ExcelError::new(ExcelErrorKind::Calc).with_message("LAMBDA value must be invoked"),
@@ -229,7 +229,7 @@ impl Function for SearchFn {
                 ExcelError::new_value(),
             )));
         }
-        let found = if needle.contains('*') || needle.contains('?') {
+        let found = if needle.contains('*') || needle.contains('?') || needle.contains("~~") {
             let pat: Vec<char> = needle.chars().collect();
             char_wildcard_search(&pat, &hay_chars, start)
         } else {
@@ -273,23 +273,12 @@ fn char_find(hay: &str, needle: &str, start: usize) -> Option<usize> {
 fn char_wildcard_search(pat: &[char], hay: &[char], start: usize) -> Option<usize> {
     let mut i = start;
     while i <= hay.len() {
-        if wildcard_match_chars(pat, &hay[i..]) {
+        if crate::builtins::utils::wildcard_match_units(pat, &hay[i..], true) {
             return Some(i);
         }
         i += 1;
     }
     None
-}
-
-fn wildcard_match_chars(p: &[char], t: &[char]) -> bool {
-    if p.is_empty() {
-        return true;
-    }
-    match p[0] {
-        '*' => (0..=t.len()).any(|i| wildcard_match_chars(&p[1..], &t[i..])),
-        '?' => !t.is_empty() && wildcard_match_chars(&p[1..], &t[1..]),
-        c => !t.is_empty() && t[0] == c && wildcard_match_chars(&p[1..], &t[1..]),
-    }
 }
 
 // EXACT(text1,text2)

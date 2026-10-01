@@ -301,6 +301,10 @@ impl FormulaReplaySpool for MemoryFormulaReplaySpool {
     }
 }
 
+/// Write size of a spilled spool's buffered frames.
+#[cfg(not(target_arch = "wasm32"))]
+const SPILL_WRITE_BLOCK: usize = 64 * 1024;
+
 pub(super) struct FormulaSpoolLimits {
     pub sheet_bytes: u64,
     pub workbook_bytes_remaining: u64,
@@ -318,11 +322,18 @@ pub(super) struct HybridFormulaReplaySpool {
     memory: Vec<u8>,
     encoded_bytes: u64,
     peak_memory_bytes: u64,
+    /// Frames appended (a capacity hint for replay).
+    frames: usize,
     #[cfg(test)]
     append_scratch_heap_allocations: u64,
     limits: FormulaSpoolLimits,
     #[cfg(not(target_arch = "wasm32"))]
     file: Option<tempfile::NamedTempFile>,
+    /// Frames appended since the last file write. A spilled spool writes
+    /// whole blocks of `SPILL_WRITE_BLOCK` bytes instead of two small writes
+    /// per frame; reads flush it first.
+    #[cfg(not(target_arch = "wasm32"))]
+    pending: Vec<u8>,
     #[cfg(test)]
     fail_write: bool,
     #[cfg(test)]
@@ -335,16 +346,54 @@ impl HybridFormulaReplaySpool {
             memory: [MAGIC.as_slice(), &[VERSION]].concat(),
             encoded_bytes: HEADER_LEN as u64,
             peak_memory_bytes: HEADER_LEN as u64,
+            frames: 0,
             #[cfg(test)]
             append_scratch_heap_allocations: 0,
             limits,
             #[cfg(not(target_arch = "wasm32"))]
             file: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            pending: Vec::new(),
             #[cfg(test)]
             fail_write: false,
             #[cfg(test)]
             fail_replay_io: false,
         }
+    }
+
+    fn read_at(&mut self, offset: u64) -> Result<OwnedSpoolFormulaRecord, SpoolError> {
+        if offset < HEADER_LEN as u64 || offset >= self.encoded_bytes {
+            return Err(SpoolError::Truncated);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.flush_pending()?;
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(file) = self.file.as_mut() {
+            let mut reader = BufReader::new(
+                file.as_file()
+                    .try_clone()
+                    .map_err(|e| SpoolError::Io(e.kind()))?,
+            );
+            reader
+                .seek(SeekFrom::Start(offset))
+                .map_err(|e| SpoolError::Io(e.kind()))?;
+            return decode_frame_from_reader(&mut reader, &mut (self.encoded_bytes - offset));
+        }
+        let mut cursor = usize::try_from(offset).map_err(|_| SpoolError::OffsetOverflow)?;
+        decode_frame(&self.memory, &mut cursor)
+    }
+
+    /// Writes the buffered frames of a spilled spool to its file.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn flush_pending(&mut self) -> Result<(), SpoolError> {
+        if let Some(file) = self.file.as_mut()
+            && !self.pending.is_empty()
+        {
+            let written = file.write_all(&self.pending);
+            self.pending.clear();
+            written.map_err(|e| SpoolError::Io(e.kind()))?;
+        }
+        Ok(())
     }
 
     pub(super) fn peak_memory_bytes(&self) -> u64 {
@@ -373,10 +422,44 @@ impl HybridFormulaReplaySpool {
     }
 }
 
+type ExactReplayLocator = (Vec<(u32, u32, u64)>, Vec<(usize, u64)>);
+
 pub(super) struct CalamineDeferredFormulaReplay {
+    /// Lazy, text-free coordinate/offset locator. None means not scanned yet;
+    /// The second buffer maps shared ids to anchor offsets, never anchor text.
+    /// Err means unsupported metadata requires conservative replay.
+    ordinary_index: Option<Result<ExactReplayLocator, ()>>,
+    cache_footprint: std::sync::Arc<std::sync::atomic::AtomicU64>,
     spool: HybridFormulaReplaySpool,
     sheet_name: String,
     sheet_instance: u32,
+}
+
+/// Stable sort by source order without a scratch copy of the records (a
+/// stable sort's buffer is as large as the input): usually already sorted;
+/// else sort indices, then permute in place.
+fn sort_by_source_order(formulas: &mut [DeferredReplayFormula]) {
+    if formulas.is_sorted_by_key(|f| f.source_order) {
+        return;
+    }
+    let mut order: Vec<u32> = (0..formulas.len() as u32).collect();
+    order.sort_unstable_by_key(|&i| (formulas[i as usize].source_order, i));
+    // `order[k]` is the record that goes to slot k: follow each cycle.
+    for start in 0..order.len() {
+        if order[start] == u32::MAX {
+            continue;
+        }
+        let mut slot = start;
+        loop {
+            let from = order[slot] as usize;
+            order[slot] = u32::MAX;
+            if from == start {
+                break;
+            }
+            formulas.swap(slot, from);
+            slot = from;
+        }
+    }
 }
 
 impl CalamineDeferredFormulaReplay {
@@ -386,6 +469,8 @@ impl CalamineDeferredFormulaReplay {
         sheet_instance: u32,
     ) -> Self {
         Self {
+            ordinary_index: None,
+            cache_footprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             spool,
             sheet_name,
             sheet_instance,
@@ -397,7 +482,7 @@ impl CalamineDeferredFormulaReplay {
         disposition: &FormulaReplayDisposition,
         partitions: &[PartitionedSourceFormulaFamily],
     ) -> Result<Vec<DeferredReplayFormula>, String> {
-        let mut formulas = Vec::new();
+        let mut formulas = Vec::with_capacity(self.spool.frames);
         let sheet_instance = self.sheet_instance;
         let partition_router =
             FormulaReplayPartitionRouter::new(partitions).map_err(str::to_string)?;
@@ -407,7 +492,7 @@ impl CalamineDeferredFormulaReplay {
             |shared_index, coord0| {
                 let family = SourceFamilyId {
                     sheet_instance,
-                    source_index: shared_index,
+                    source_index: super::shared_source_index(shared_index),
                 };
                 let coordinate_disposition =
                     partition_router.shared_disposition(disposition, family, coord0);
@@ -416,7 +501,7 @@ impl CalamineDeferredFormulaReplay {
             |sequence, coord0, text, family| {
                 let family = family.map(|shared_index| SourceFamilyId {
                     sheet_instance,
-                    source_index: shared_index,
+                    source_index: super::shared_source_index(shared_index),
                 });
                 let (coordinate_disposition, partition_owner) = match family {
                     Some(family) => (
@@ -444,7 +529,7 @@ impl CalamineDeferredFormulaReplay {
             },
         )
         .map_err(|error| error.to_string())?;
-        formulas.sort_by_key(|formula| formula.source_order);
+        sort_by_source_order(&mut formulas);
         Ok(formulas)
     }
 
@@ -453,17 +538,22 @@ impl CalamineDeferredFormulaReplay {
         row: u32,
         col: u32,
     ) -> Result<Option<DeferredReplayFormula>, String> {
-        let mut found = None;
+        let mut found: Option<DeferredReplayFormula> = None;
         let sheet_instance = self.sheet_instance;
         replay_spool_with_family(
             &mut self.spool,
             &self.sheet_name,
             |_, _| true,
             |sequence, coord0, text, family| {
-                if coord0.row + 1 == row && coord0.col + 1 == col {
+                if coord0.row + 1 == row
+                    && coord0.col + 1 == col
+                    && found
+                        .as_ref()
+                        .is_none_or(|prior| prior.source_order < SourceFormulaOrder::new(sequence))
+                {
                     let family = family.map(|shared_index| SourceFamilyId {
                         sheet_instance,
-                        source_index: shared_index,
+                        source_index: super::shared_source_index(shared_index),
                     });
                     found = Some(DeferredReplayFormula {
                         source_order: SourceFormulaOrder::new(sequence),
@@ -483,6 +573,10 @@ impl CalamineDeferredFormulaReplay {
 }
 
 impl DeferredFormulaReplay for CalamineDeferredFormulaReplay {
+    fn selection_cache_footprint(&self) -> Option<std::sync::Weak<std::sync::atomic::AtomicU64>> {
+        Some(std::sync::Arc::downgrade(&self.cache_footprint))
+    }
+
     fn replay(
         &mut self,
         disposition: &FormulaReplayDisposition,
@@ -496,6 +590,179 @@ impl DeferredFormulaReplay for CalamineDeferredFormulaReplay {
         partitions: &[PartitionedSourceFormulaFamily],
     ) -> Result<Vec<DeferredReplayFormula>, String> {
         self.replay_routed(disposition, partitions)
+    }
+
+    fn replay_selected_ordinary(
+        &mut self,
+        coordinates: &[(u32, u32)],
+        checkpoint: &mut dyn FnMut(u64, u64) -> Result<(), formualizer_common::ExcelError>,
+    ) -> Result<Option<Vec<DeferredReplayFormula>>, formualizer_common::ExcelError> {
+        Ok(self
+            .replay_selected_exact(coordinates, checkpoint)?
+            .filter(|records| records.iter().all(|record| record.family.is_none())))
+    }
+
+    fn replay_selected_exact(
+        &mut self,
+        coordinates: &[(u32, u32)],
+        checkpoint: &mut dyn FnMut(u64, u64) -> Result<(), formualizer_common::ExcelError>,
+    ) -> Result<Option<Vec<DeferredReplayFormula>>, formualizer_common::ExcelError> {
+        use formualizer_common::{ExcelError, ExcelErrorKind};
+        let error =
+            |e: SpoolError| ExcelError::new(ExcelErrorKind::Value).with_message(e.to_string());
+        if self.ordinary_index.is_none() {
+            #[cfg(not(target_arch = "wasm32"))]
+            let encoded_bytes = self.spool.encoded_bytes;
+            let mut iter = self.spool.replay().map_err(error)?;
+            let mut index = Vec::new();
+            let mut anchors = Vec::new();
+            loop {
+                checkpoint(1, 0)?;
+                let offset = match &iter {
+                    FormulaReplayIter::Memory { cursor, .. } => *cursor as u64,
+                    #[cfg(not(target_arch = "wasm32"))]
+                    FormulaReplayIter::Native { remaining, .. } => encoded_bytes - remaining,
+                };
+                let Some(record) = iter.next() else {
+                    break;
+                };
+                let coord0 = match record.map_err(error)? {
+                    OwnedSpoolFormulaRecord::Ordinary { coord0, .. }
+                    | OwnedSpoolFormulaRecord::SharedDescendant { coord0, .. } => coord0,
+                    OwnedSpoolFormulaRecord::SharedAnchor {
+                        coord0,
+                        shared_index,
+                        ..
+                    } => {
+                        if anchors.len() == anchors.capacity() {
+                            let additional = anchors.capacity().max(16);
+                            checkpoint(0, additional as u64 * 16)?;
+                            let admitted_capacity = anchors.capacity() + additional;
+                            anchors.try_reserve_exact(additional).map_err(|_| {
+                                ExcelError::new(ExcelErrorKind::Value)
+                                    .with_message("shared anchor locator allocation failed")
+                            })?;
+                            checkpoint(0, (anchors.capacity() - admitted_capacity) as u64 * 16)?;
+                        }
+                        anchors.push((shared_index, offset));
+                        coord0
+                    }
+                    OwnedSpoolFormulaRecord::Unsupported { .. } => {
+                        self.ordinary_index = Some(Err(()));
+                        return Ok(None);
+                    }
+                };
+                if index.len() == index.capacity() {
+                    let additional = index.capacity().max(256);
+                    checkpoint(0, (additional as u64).saturating_mul(16))?;
+                    let admitted_capacity = index.capacity() + additional;
+                    index.try_reserve_exact(additional).map_err(|_| {
+                        ExcelError::new(ExcelErrorKind::Value)
+                            .with_message("ordinary source locator allocation failed")
+                    })?;
+                    // Allocators may provide more capacity than requested. Admit
+                    // that excess before this allocation can become retained.
+                    checkpoint(0, (index.capacity() - admitted_capacity) as u64 * 16)?;
+                }
+                index.push((coord0.row + 1, coord0.col + 1, offset));
+            }
+            checkpoint(
+                (index.len() as u64)
+                    .saturating_mul(u64::from(usize::BITS - index.len().max(1).leading_zeros())),
+                0,
+            )?;
+            index.sort_unstable();
+            if !anchors.is_empty() {
+                checkpoint(anchors.len() as u64 * 64, 0)?;
+                anchors.sort_unstable();
+            }
+            self.cache_footprint.store(
+                index.capacity() as u64 * std::mem::size_of::<(u32, u32, u64)>() as u64
+                    + anchors.capacity() as u64 * std::mem::size_of::<(usize, u64)>() as u64,
+                std::sync::atomic::Ordering::Release,
+            );
+            self.ordinary_index = Some(Ok((index, anchors)));
+        }
+        let Some(Ok((index, anchors))) = &self.ordinary_index else {
+            return Ok(None);
+        };
+        let mut formulas = Vec::new();
+        for &(row, col) in coordinates {
+            checkpoint(1, 0)?;
+            let start = index.partition_point(|&(r, c, _)| (r, c) < (row, col));
+            for &(_, _, offset) in index[start..]
+                .iter()
+                .take_while(|&&(r, c, _)| (r, c) == (row, col))
+            {
+                checkpoint(1, 0)?;
+                let record = self.spool.read_at(offset).map_err(error)?;
+                let (sequence, coord0, text, family) = match record {
+                    OwnedSpoolFormulaRecord::Ordinary {
+                        sequence,
+                        coord0,
+                        text,
+                    } => (sequence, coord0, text, None),
+                    OwnedSpoolFormulaRecord::SharedAnchor {
+                        sequence,
+                        coord0,
+                        text,
+                        shared_index,
+                        ..
+                    } => (sequence, coord0, text, Some(shared_index)),
+                    OwnedSpoolFormulaRecord::SharedDescendant {
+                        sequence,
+                        coord0,
+                        shared_index,
+                    } => {
+                        let start = anchors.partition_point(|&(id, _)| id < shared_index);
+                        let end = anchors.partition_point(|&(id, _)| id <= shared_index);
+                        let family_anchors = &anchors[start..end];
+                        if family_anchors.is_empty() {
+                            // Full replay's established missing-anchor policy remains authoritative.
+                            return Ok(None);
+                        }
+                        let preceding =
+                            family_anchors.partition_point(|&(_, anchor)| anchor < offset);
+                        let anchor_offset = family_anchors[preceding.saturating_sub(1)].1;
+                        checkpoint(1, 0)?;
+                        let OwnedSpoolFormulaRecord::SharedAnchor {
+                            coord0: anchor,
+                            text: template,
+                            ..
+                        } = self.spool.read_at(anchor_offset).map_err(error)?
+                        else {
+                            unreachable!()
+                        };
+                        let mut text = String::new();
+                        expand_shared_formula_into(
+                            &template,
+                            (anchor.row, anchor.col),
+                            (coord0.row, coord0.col),
+                            &mut text,
+                        )
+                        .map_err(|e| {
+                            ExcelError::new(ExcelErrorKind::Value).with_message(e.to_string())
+                        })?;
+                        (sequence, coord0, text, Some(shared_index))
+                    }
+                    OwnedSpoolFormulaRecord::Unsupported { .. } => return Ok(None),
+                };
+                let family = family.map(|source_index| SourceFamilyId {
+                    sheet_instance: self.sheet_instance,
+                    source_index: super::shared_source_index(source_index),
+                });
+                formulas.push(DeferredReplayFormula {
+                    source_order: SourceFormulaOrder::new(sequence),
+                    row: coord0.row + 1,
+                    col: coord0.col + 1,
+                    text,
+                    family,
+                    partition_owner: family,
+                });
+            }
+        }
+        formulas.sort_by_key(|formula| formula.source_order);
+        Ok(Some(formulas))
     }
 
     fn formula_at(&mut self, row: u32, col: u32) -> Result<Option<DeferredReplayFormula>, String> {
@@ -560,14 +827,18 @@ impl FormulaReplaySpool for HybridFormulaReplaySpool {
             return Err(SpoolError::Io(std::io::ErrorKind::WriteZero));
         }
         #[cfg(not(target_arch = "wasm32"))]
-        if let Some(file) = self.file.as_mut() {
-            write_frame(file, record)?;
+        if self.file.is_some() {
+            append_frame_to_vec(&mut self.pending, record)?;
+            if self.pending.len() >= SPILL_WRITE_BLOCK {
+                self.flush_pending()?;
+            }
         } else {
             append_frame_to_vec(&mut self.memory, record)?;
         }
         #[cfg(target_arch = "wasm32")]
         append_frame_to_vec(&mut self.memory, record)?;
         self.encoded_bytes = attempted;
+        self.frames += 1;
         self.peak_memory_bytes = self
             .peak_memory_bytes
             .max(u64::try_from(self.memory.len()).unwrap_or(u64::MAX));
@@ -579,6 +850,8 @@ impl FormulaReplaySpool for HybridFormulaReplaySpool {
         if self.fail_replay_io {
             return Err(SpoolError::Io(std::io::ErrorKind::Other));
         }
+        #[cfg(not(target_arch = "wasm32"))]
+        self.flush_pending()?;
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(file) = self.file.as_mut() {
             file.flush().map_err(|e| SpoolError::Io(e.kind()))?;
@@ -739,18 +1012,6 @@ fn varint_len(mut value: u64) -> usize {
         value >>= 7;
     }
     len
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn write_frame(
-    file: &mut tempfile::NamedTempFile,
-    record: SpoolFormulaRecord<'_>,
-) -> Result<(), SpoolError> {
-    let mut prefix = StackEncoder::new();
-    let text = encode_frame_prefix(record, &mut prefix)?;
-    file.write_all(prefix.as_slice())
-        .and_then(|_| file.write_all(text))
-        .map_err(|e| SpoolError::Io(e.kind()))
 }
 
 struct StackEncoder {
@@ -951,7 +1212,7 @@ impl OwnedSpoolFormulaRecord {
                 FormulaSourceKind::SharedAnchor {
                     family: SourceFamilyId {
                         sheet_instance,
-                        source_index: shared_index,
+                        source_index: super::shared_source_index(shared_index),
                     },
                     declared_range,
                     formula: Arc::from(text),
@@ -971,7 +1232,7 @@ impl OwnedSpoolFormulaRecord {
                 FormulaSourceKind::SharedDescendant {
                     family: SourceFamilyId {
                         sheet_instance,
-                        source_index: shared_index,
+                        source_index: super::shared_source_index(shared_index),
                     },
                     metadata: FormulaMetadataEnvelope::Shared {
                         shared_index,
@@ -1279,9 +1540,9 @@ pub(super) fn replay_spool_per_cell_with_coordinate_disposition<S: FormulaReplay
 pub(super) fn expand_source_events_per_cell(
     events: &[FormulaSourceEvent],
 ) -> Result<Vec<ExpandedFormulaCell>, SourceFormulaError> {
-    let mut shared: rustc_hash::FxHashMap<usize, (SourceCoord, Arc<str>)> =
+    let mut shared: rustc_hash::FxHashMap<u32, (SourceCoord, Arc<str>)> =
         rustc_hash::FxHashMap::default();
-    let mut pending: rustc_hash::FxHashMap<usize, Vec<SourceCoord>> =
+    let mut pending: rustc_hash::FxHashMap<u32, Vec<SourceCoord>> =
         rustc_hash::FxHashMap::default();
     let mut expanded = Vec::with_capacity(events.len());
     let mut expansion = String::with_capacity(128);
@@ -1355,6 +1616,34 @@ pub(super) fn expand_source_events_per_cell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_order_sort_is_stable_and_in_place() {
+        let rec = |seq: u64, row: u32| DeferredReplayFormula {
+            source_order: SourceFormulaOrder::new(seq),
+            row,
+            col: 1,
+            text: format!("={row}"),
+            family: None,
+            partition_owner: None,
+        };
+        let seqs = [5u64, 3, 9, 3, 1, 7, 5, 0, 2, 9];
+        let mut v: Vec<_> = seqs
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| rec(q, i as u32))
+            .collect();
+        let mut expected: Vec<(u64, u32)> = seqs
+            .iter()
+            .enumerate()
+            .map(|(i, &q)| (q, i as u32))
+            .collect();
+        expected.sort_by_key(|&(q, _)| q);
+        sort_by_source_order(&mut v);
+        let got: Vec<(u64, u32)> = v.iter().map(|f| (seqs[f.row as usize], f.row)).collect();
+        assert_eq!(got, expected);
+        assert!(v.iter().all(|f| f.text == format!("={}", f.row)));
+    }
 
     fn coord(row: u32, col: u32) -> SourceCoord {
         SourceCoord { row, col }
@@ -1707,6 +1996,351 @@ mod tests {
         }
     }
 
+    #[test]
+    fn indexed_ordinary_selection_preserves_duplicate_coordinate_source_order() {
+        let mut spool = HybridFormulaReplaySpool::new(hybrid_limits(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            false,
+        ));
+        for (sequence, text) in [(20, "2"), (10, "1"), (30, "3")] {
+            spool
+                .append(SpoolFormulaRecord::Ordinary {
+                    sequence,
+                    coord0: coord(0, 0),
+                    text,
+                })
+                .unwrap();
+        }
+        let mut replay = CalamineDeferredFormulaReplay::new(spool, "Sheet1".into(), 0);
+        let records = replay
+            .replay_selected_ordinary(&[(1, 1)], &mut |_, _| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            records
+                .iter()
+                .map(|record| record.text.as_str())
+                .collect::<Vec<_>>(),
+            ["1", "2", "3"]
+        );
+        let mut disposition = FormulaReplayDisposition::default();
+        disposition.extend_suppressed_excel_coords([(1, 1)]);
+        assert!(replay.replay(&disposition).unwrap().is_empty());
+    }
+
+    #[test]
+    fn indexed_shared_forward_override_lookup_uses_source_order_not_emission_order() {
+        let mut spool = HybridFormulaReplaySpool::new(hybrid_limits(
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            u64::MAX,
+            false,
+        ));
+        spool
+            .append(SpoolFormulaRecord::SharedDescendant {
+                sequence: 0,
+                coord0: coord(1, 1),
+                shared_index: 9,
+            })
+            .unwrap();
+        spool
+            .append(SpoolFormulaRecord::Ordinary {
+                sequence: 1,
+                coord0: coord(1, 1),
+                text: "99",
+            })
+            .unwrap();
+        spool
+            .append(SpoolFormulaRecord::SharedAnchor {
+                sequence: 2,
+                coord0: coord(0, 1),
+                shared_index: 9,
+                declared_range: None,
+                text: "A1+1",
+            })
+            .unwrap();
+        let mut replay = CalamineDeferredFormulaReplay::new(spool, "Sheet1".into(), 0);
+        assert_eq!(replay.formula_at(2, 2).unwrap().unwrap().text, "99");
+        let selected = replay
+            .replay_selected_exact(&[(2, 2)], &mut |_, _| Ok(()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|record| record.text.as_str())
+                .collect::<Vec<_>>(),
+            ["A2+1", "99"]
+        );
+        let mut work = 0;
+        assert!(
+            replay
+                .replay_selected_exact(&[(2, 2)], &mut |units, _| {
+                    work += units;
+                    if work >= 3 {
+                        Err(formualizer_common::ExcelError::new(
+                            formualizer_common::ExcelErrorKind::Value,
+                        )
+                        .with_message("cancelled anchor read"))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .is_err()
+        );
+        assert!(
+            replay
+                .cache_footprint
+                .load(std::sync::atomic::Ordering::Acquire)
+                > 0
+        );
+        assert_eq!(
+            replay
+                .replay_selected_exact(&[(2, 2)], &mut |_, _| Ok(()))
+                .unwrap()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(replay.formula_at(2, 2).unwrap().unwrap().text, "99");
+    }
+
+    #[test]
+    fn indexed_shared_selection_preserves_forward_anchors_overrides_and_bounded_reads() {
+        use formualizer_common::{ExcelError, ExcelErrorKind};
+        for disk in [false, true] {
+            let mut spool = HybridFormulaReplaySpool::new(hybrid_limits(
+                u64::MAX,
+                u64::MAX,
+                if disk { 1 } else { u64::MAX },
+                u64::MAX,
+                disk,
+            ));
+            spool
+                .append(SpoolFormulaRecord::SharedDescendant {
+                    sequence: 0,
+                    coord0: coord(1, 1),
+                    shared_index: 9,
+                })
+                .unwrap();
+            spool
+                .append(SpoolFormulaRecord::SharedAnchor {
+                    sequence: 1,
+                    coord0: coord(0, 1),
+                    shared_index: 9,
+                    declared_range: None,
+                    text: "A1+1",
+                })
+                .unwrap();
+            for row in 2..10_000 {
+                spool
+                    .append(SpoolFormulaRecord::SharedDescendant {
+                        sequence: row as u64,
+                        coord0: coord(row, 1),
+                        shared_index: 9,
+                    })
+                    .unwrap();
+            }
+            spool
+                .append(SpoolFormulaRecord::Ordinary {
+                    sequence: 10000,
+                    coord0: coord(1, 1),
+                    text: "99",
+                })
+                .unwrap();
+            // A repeated shared index changes subsequent descendants' template,
+            // but must not change the original forward descendant's expansion.
+            spool
+                .append(SpoolFormulaRecord::SharedAnchor {
+                    sequence: 10001,
+                    coord0: coord(0, 2),
+                    shared_index: 9,
+                    declared_range: None,
+                    text: "A1+100",
+                })
+                .unwrap();
+            spool
+                .append(SpoolFormulaRecord::SharedDescendant {
+                    sequence: 10002,
+                    coord0: coord(1, 2),
+                    shared_index: 9,
+                })
+                .unwrap();
+            let mut replay = CalamineDeferredFormulaReplay::new(spool, "Sheet1".into(), 0);
+            assert!(replay.ordinary_index.is_none());
+            let mut work = 0;
+            assert!(
+                replay
+                    .replay_selected_exact(&[(2, 2)], &mut |units, _| {
+                        work += units;
+                        if work > 100 {
+                            Err(ExcelError::new(ExcelErrorKind::Value)
+                                .with_message("cancelled locator"))
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .is_err()
+            );
+            assert!(replay.ordinary_index.is_none());
+            let mut bytes = 0;
+            let first = std::time::Instant::now();
+            let selected = replay
+                .replay_selected_exact(&[(2, 2), (2, 3)], &mut |_, allocation| {
+                    bytes += allocation;
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                selected.iter().map(|r| r.text.as_str()).collect::<Vec<_>>(),
+                ["A2+1", "99", "A2+100"]
+            );
+            let first = first.elapsed();
+            let repeated = std::time::Instant::now();
+            let mut work = 0;
+            for row in 3..103 {
+                let selected = replay
+                    .replay_selected_exact(&[(row, 2)], &mut |units, _| {
+                        work += units;
+                        Ok(())
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(selected.len(), 1);
+                assert_eq!(selected[0].text, format!("A{row}+1"));
+            }
+            assert_eq!(work, 300);
+            eprintln!(
+                "shared locator disk={disk} bytes={bytes} first={first:?} next100={:?} work={work}",
+                repeated.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_ordinary_selection_is_lazy_bounded_and_retryable() {
+        use formualizer_common::{ExcelError, ExcelErrorKind};
+        for disk in [false, true] {
+            let mut spool = HybridFormulaReplaySpool::new(hybrid_limits(
+                u64::MAX,
+                u64::MAX,
+                if disk { 1 } else { u64::MAX },
+                u64::MAX,
+                disk,
+            ));
+            for row in 0..10_000 {
+                spool
+                    .append(SpoolFormulaRecord::Ordinary {
+                        sequence: row as u64,
+                        coord0: coord(row, 0),
+                        text: "1+2",
+                    })
+                    .unwrap();
+            }
+            let mut replay = CalamineDeferredFormulaReplay::new(spool, "Sheet1".into(), 0);
+            assert!(replay.ordinary_index.is_none());
+            let footprint = replay.selection_cache_footprint().unwrap();
+            let mut scanned = 0;
+            let failure = replay
+                .replay_selected_ordinary(&[(1, 1)], &mut |work, _| {
+                    scanned += work;
+                    if scanned > 32 {
+                        Err(ExcelError::new(ExcelErrorKind::Cancelled))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap_err();
+            assert_eq!(failure.kind, ExcelErrorKind::Cancelled);
+            assert!(replay.ordinary_index.is_none());
+            let denied = replay.replay_selected_ordinary(&[(1, 1)], &mut |_, bytes| {
+                if bytes > 0 {
+                    Err(ExcelError::new(ExcelErrorKind::Value)
+                        .with_message("injected locator admission denial"))
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(denied.is_err());
+            assert!(replay.ordinary_index.is_none());
+            assert_eq!(
+                footprint
+                    .upgrade()
+                    .unwrap()
+                    .load(std::sync::atomic::Ordering::Acquire),
+                0
+            );
+            // Cancel on the first indexed lookup, after construction/publication.
+            let mut sorted = false;
+            let failed = replay.replay_selected_ordinary(&[(1, 1)], &mut |work, _| {
+                if sorted {
+                    return Err(ExcelError::new(ExcelErrorKind::Cancelled));
+                }
+                sorted = work > 10_000;
+                Ok(())
+            });
+            assert!(failed.is_err());
+            let capacity = replay
+                .ordinary_index
+                .as_ref()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .0
+                .capacity() as u64
+                * 16;
+            assert_eq!(
+                footprint
+                    .upgrade()
+                    .unwrap()
+                    .load(std::sync::atomic::Ordering::Acquire),
+                capacity
+            );
+            let mut bytes = 0;
+            let started = std::time::Instant::now();
+            let records = replay
+                .replay_selected_ordinary(&[(1, 1)], &mut |_, allocated| {
+                    bytes += allocated;
+                    Ok(())
+                })
+                .unwrap()
+                .unwrap();
+            let first = started.elapsed();
+            assert_eq!(records.len(), 1);
+            assert_eq!(bytes, 0, "retry reuses the retained locator");
+            assert!((160_000..=320_000).contains(&capacity));
+            let mut work = 0;
+            let started = std::time::Instant::now();
+            for row in 2..=101 {
+                let records = replay
+                    .replay_selected_ordinary(&[(row, 1)], &mut |units, allocated| {
+                        work += units;
+                        assert_eq!(allocated, 0);
+                        Ok(())
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].row, row);
+            }
+            assert_eq!(work, 200);
+            eprintln!(
+                "ordinary locator disk={disk} records=10000 locator_bytes={capacity} retry={first:?} next100={:?} bounded_work={work}",
+                started.elapsed()
+            );
+            drop(replay);
+            assert!(
+                footprint.upgrade().is_none(),
+                "observation must not retain a dead cache"
+            );
+        }
+    }
+
     fn ordinary(text: &str) -> SpoolFormulaRecord<'_> {
         SpoolFormulaRecord::Ordinary {
             sequence: 0,
@@ -1855,6 +2489,51 @@ mod tests {
         );
         drop(spool);
         assert!(!path.exists());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn native_spill_buffers_frames_and_reads_see_every_append() {
+        let mut spool =
+            HybridFormulaReplaySpool::new(hybrid_limits(1 << 30, 1 << 30, 64, 1 << 30, true));
+        let texts: Vec<String> = (0..20_000).map(|i| format!("A{i}+B{i}*2")).collect();
+        let mut offsets = Vec::new();
+        for (i, text) in texts.iter().enumerate() {
+            offsets.push(
+                spool
+                    .append(SpoolFormulaRecord::Ordinary {
+                        sequence: i as u64,
+                        coord0: coord(i as u32, 1),
+                        text,
+                    })
+                    .unwrap(),
+            );
+            // Reads between appends (the exact-selection path) see the
+            // frames still buffered.
+            if i % 7_001 == 3 {
+                let back = spool.read_at(offsets[i].0).unwrap();
+                assert!(
+                    matches!(&back, OwnedSpoolFormulaRecord::Ordinary { text: t, .. } if t == text)
+                );
+            }
+        }
+        assert_eq!(spool.storage_kind(), SpoolStorageKind::NativeFile);
+        assert!(spool.pending.len() < SPILL_WRITE_BLOCK);
+        let records = spool
+            .replay()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(records.len(), texts.len());
+        for (record, text) in records.iter().zip(&texts) {
+            assert!(
+                matches!(record, OwnedSpoolFormulaRecord::Ordinary { text: t, .. } if t == text)
+            );
+        }
+        let last = spool.read_at(offsets.last().unwrap().0).unwrap();
+        assert!(
+            matches!(&last, OwnedSpoolFormulaRecord::Ordinary { text: t, .. } if t == texts.last().unwrap())
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]

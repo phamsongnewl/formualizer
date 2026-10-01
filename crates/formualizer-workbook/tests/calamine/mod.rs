@@ -5,6 +5,10 @@ mod common;
 #[cfg(feature = "calamine")]
 mod calcpr;
 #[cfg(feature = "calamine")]
+mod criteria_ingest_blank;
+#[cfg(feature = "calamine")]
+mod criteria_wildcard_parity;
+#[cfg(feature = "calamine")]
 mod date_arithmetic;
 #[cfg(feature = "calamine")]
 mod dates;
@@ -13,6 +17,10 @@ mod deltas;
 #[cfg(feature = "calamine")]
 mod engine;
 #[cfg(feature = "calamine")]
+mod family_grouping;
+#[cfg(feature = "calamine")]
+mod format_channel;
+#[cfg(feature = "calamine")]
 mod formulas;
 #[cfg(feature = "calamine")]
 mod issue162_unbounded_index;
@@ -20,6 +28,8 @@ mod issue162_unbounded_index;
 mod it;
 #[cfg(feature = "calamine")]
 mod iterate_corpus_calcpr_fuzz;
+#[cfg(feature = "calamine")]
+mod iterative_cycle_order;
 #[cfg(feature = "calamine")]
 mod large;
 #[cfg(feature = "calamine")]
@@ -36,3 +46,17 @@ mod semantic_epoch_replay;
 mod shared_formulas;
 #[cfg(feature = "calamine")]
 mod sheet_load;
+#[cfg(feature = "umya")]
+mod temporal_roundtrip;
+
+/// `WorkbookConfig::interactive()` with `PreparationPolicy::Strict`. Tests
+/// that use a missing sheet to provoke a preparation failure opt into the
+/// pre-0.10 policy explicitly (the default became `BestEffort`).
+#[cfg(feature = "calamine")]
+pub(crate) fn strict_interactive() -> formualizer_workbook::WorkbookConfig {
+    let mut config = formualizer_workbook::WorkbookConfig::interactive();
+    config.eval.preparation_policy = formualizer_eval::engine::PreparationPolicy::Strict;
+    config
+}
+#[cfg(feature = "calamine")]
+mod referenced_extent;
