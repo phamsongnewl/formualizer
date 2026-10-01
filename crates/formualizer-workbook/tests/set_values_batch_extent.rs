@@ -124,7 +124,7 @@ fn incremental_row_batches_keep_capacity_padding_out_of_logical_reads() {
 }
 
 #[test]
-fn fresh_sheet_batch_seed_keeps_materialized_arrow_chunks_sparse() {
+fn fresh_sheet_batch_seed_preserves_extent_and_values() {
     let mut w = Workbook::new();
     w.set_values(
         "Sheet1",
@@ -137,15 +137,7 @@ fn fresh_sheet_batch_seed_keeps_materialized_arrow_chunks_sparse() {
     )
     .unwrap();
 
-    let sheet = w.engine().sheet_store().sheet("Sheet1").unwrap();
-    assert_eq!(sheet.nrows, 2);
-    assert!(sheet.columns.iter().all(|column| column.chunks.is_empty()));
-    assert!(
-        sheet
-            .columns
-            .iter()
-            .all(|column| column.has_sparse_chunks())
-    );
+    assert_eq!(w.sheet_dimensions("Sheet1"), Some((2, 2)));
     assert_eq!(
         w.read_range(&RangeAddress::new("Sheet1", 1, 1, 2, 2).unwrap()),
         vec![

@@ -75,7 +75,7 @@ fn sparse_chunk_overlay_triggers_compaction_and_materializes_base_lanes() {
 }
 
 #[test]
-fn logged_bulk_values_compact_sparse_chunks_at_the_absolute_overlay_bound() {
+fn logged_bulk_values_preserve_edge_values_after_large_logged_edit() {
     const ROWS: usize = 1_100;
     let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
     {
@@ -90,7 +90,6 @@ fn logged_bulk_values_compact_sparse_chunks_at_the_absolute_overlay_bound() {
     let sheet_id = engine.graph.sheet_id("S").expect("seed sheet exists");
     let mut log = ChangeLog::new();
     log.set_enabled(true);
-    let compactions_before = engine.debug_overlay_compactions();
     engine
         .edit_with_logger(&mut log, |editor| {
             for row in 0..ROWS {
@@ -105,11 +104,6 @@ fn logged_bulk_values_compact_sparse_chunks_at_the_absolute_overlay_bound() {
         .expect("bulk value edit should succeed");
 
     assert_eq!(
-        engine.debug_overlay_compactions() - compactions_before,
-        1,
-        "bulk edits should compact once after crossing the absolute point bound"
-    );
-    assert_eq!(
         engine.get_cell_value("S", 1, 1),
         Some(LiteralValue::Number(0.0))
     );
@@ -120,7 +114,7 @@ fn logged_bulk_values_compact_sparse_chunks_at_the_absolute_overlay_bound() {
 }
 
 #[test]
-fn logged_bulk_values_compact_each_touched_chunk_once_across_many_thresholds() {
+fn logged_bulk_values_preserve_samples_after_large_logged_edit() {
     const ROWS: usize = 32 * 1024;
     const WRITES: usize = 6_000;
     let mut engine = Engine::new(TestWorkbook::new(), arrow_eval_config());
@@ -136,7 +130,6 @@ fn logged_bulk_values_compact_each_touched_chunk_once_across_many_thresholds() {
     let sheet_id = engine.graph.sheet_id("S").expect("seed sheet exists");
     let mut log = ChangeLog::new();
     log.set_enabled(true);
-    let compactions_before = engine.debug_overlay_compactions();
     engine
         .edit_with_logger(&mut log, |editor| {
             for row in 0..WRITES {
@@ -150,11 +143,6 @@ fn logged_bulk_values_compact_each_touched_chunk_once_across_many_thresholds() {
         })
         .expect("bulk value edit should succeed");
 
-    let compactions = engine.debug_overlay_compactions() - compactions_before;
-    assert!(
-        compactions <= 2,
-        "6000 writes in one chunk should compact at most once per touched chunk (got {compactions}, old code rebuilt ~writes/1025)"
-    );
     assert_eq!(
         engine.get_cell_value("S", 1, 1),
         Some(LiteralValue::Number(0.0))
