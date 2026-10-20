@@ -88,38 +88,45 @@ fn calc_from_literal<'b>(
  *   same values as `EvalConfig::default().max_sheet_rows/max_sheet_cols`).
  *   A generated array larger than a sheet can never spill successfully
  *   (`SpillBoundsPolicy::Strict`), so it is `#NUM!` unconditionally.
- * - Total cells: 2^24 (16,777,216). `LiteralValue` is ≥32 bytes, so this
- *   already bounds the transient allocation near ~0.5 GiB — three orders
- *   of magnitude above the engine's default spill cap
- *   (`SpillConfig::max_spill_cells` = 10,000) which would reject the
- *   result downstream anyway. Anything larger risks OOM before that
- *   downstream guard can run.
+ * - Total cells: the materialisation cell budget
+ *   (`evaluation_budgets.scratch.materialized_array_cells`, default 2^24 =
+ *   16,777,216). `LiteralValue` is ≥32 bytes, so the default bounds the
+ *   transient allocation near ~0.5 GiB — three orders of magnitude above
+ *   the engine's default spill cap (`SpillConfig::max_spill_cells` = 10,000)
+ *   which would reject the result downstream anyway. Anything larger risks
+ *   OOM before that downstream guard can run. The same budget bounds every
+ *   range or array copied into a dense array (`CalcValue::into_literal`,
+ *   array operators, functions that copy their input).
  *
- * This is a fixed per-array bound, not configured resource accounting: it
- * does not charge the evaluation ledger or observe `EvaluationBudgets`.
+ * This is a per-array bound, not resource accounting: it does not charge
+ * the evaluation ledger.
  */
 pub(crate) const GENERATED_ARRAY_MAX_ROWS: i64 = 1_048_576;
 pub(crate) const GENERATED_ARRAY_MAX_COLS: i64 = 16_384;
-pub(crate) const GENERATED_ARRAY_MAX_CELLS: i64 = 1 << 24;
+pub(crate) const GENERATED_ARRAY_MAX_CELLS: u64 =
+    crate::engine::resource_ledger::DEFAULT_MATERIALIZED_ARRAY_CELLS;
 
 /// Returns `Some(#NUM!)` when a `rows x cols` generated array exceeds the
-/// allocation guard; uses checked arithmetic so overflowing products fail
-/// closed. Callers have already rejected `rows <= 0 || cols <= 0`.
-pub(crate) fn generated_array_too_large(rows: i64, cols: i64) -> Option<ExcelError> {
+/// grid or the materialisation cell budget (`cells`, from
+/// `FunctionContext::materialized_array_cells`, default
+/// [`GENERATED_ARRAY_MAX_CELLS`]); the cell count is the shared check in
+/// `resource_ledger`. Callers have already rejected `rows <= 0 || cols <= 0`.
+pub(crate) fn generated_array_too_large(rows: i64, cols: i64, cells: u64) -> Option<ExcelError> {
     if rows > GENERATED_ARRAY_MAX_ROWS || cols > GENERATED_ARRAY_MAX_COLS {
         return Some(ExcelError::new(formualizer_common::ExcelErrorKind::Num));
     }
-    match rows.checked_mul(cols) {
-        Some(total) if total <= GENERATED_ARRAY_MAX_CELLS => None,
-        _ => Some(ExcelError::new(formualizer_common::ExcelErrorKind::Num)),
-    }
+    // 1 <= rows, cols within the grid here, so both fit usize.
+    crate::engine::resource_ledger::materialized_cells_exceed(rows as usize, cols as usize, cells)
 }
 
 /// [`generated_array_too_large`] for an already-computed output shape.
 /// Dimensions that do not fit `i64` fail closed.
-pub(crate) fn materialized_shape_too_large(shape: (usize, usize)) -> Option<ExcelError> {
+pub(crate) fn materialized_shape_too_large(
+    shape: (usize, usize),
+    cells: u64,
+) -> Option<ExcelError> {
     match (i64::try_from(shape.0), i64::try_from(shape.1)) {
-        (Ok(rows), Ok(cols)) => generated_array_too_large(rows, cols),
+        (Ok(rows), Ok(cols)) => generated_array_too_large(rows, cols, cells),
         _ => Some(ExcelError::new(formualizer_common::ExcelErrorKind::Num)),
     }
 }
@@ -217,6 +224,13 @@ where
     };
 
     if shape != (1, 1) {
+        if let Some(error) = crate::engine::resource_ledger::materialized_cells_exceed(
+            shape.0,
+            shape.1,
+            ctx.materialized_array_cells(),
+        ) {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+        }
         let mut out: Vec<Vec<LiteralValue>> = Vec::with_capacity(shape.0);
         if let Ok(view) = args[0].range_view() {
             view.for_each_row(&mut |row| {
@@ -313,6 +327,13 @@ where
     let target = broadcast_shape(&[s0, s1])?;
 
     if target != (1, 1) {
+        if let Some(error) = crate::engine::resource_ledger::materialized_cells_exceed(
+            target.0,
+            target.1,
+            ctx.materialized_array_cells(),
+        ) {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(error)));
+        }
         let mut out: Vec<Vec<LiteralValue>> = Vec::with_capacity(target.0);
         for r in 0..target.0 {
             let mut out_row = Vec::with_capacity(target.1);
@@ -396,22 +417,33 @@ pub fn collapse_if_scalar(
 // ─────────────────────────────── Criteria helpers (shared by *IF* aggregators) ───────────────────────────────
 
 /// Match a value against a parsed `CriteriaPredicate` (see `crate::args::CriteriaPredicate`).
-/// Implements Excel-style semantics for equality (case-insensitive text, lenient numeric),
-/// inequality comparisons with numeric coercion, wildcard text matching, and type tests.
+/// Implements Excel's criteria semantics: equality is case-insensitive for text and
+/// lenient for numeric text (`5` matches the text `"5"`), but a number never matches
+/// a blank cell or a boolean; numeric comparisons only match numbers; wildcard and
+/// text comparisons only match text.
 pub fn criteria_match(pred: &crate::args::CriteriaPredicate, v: &LiteralValue) -> bool {
     use crate::args::CriteriaPredicate as P;
     match pred {
         P::Eq(t) => values_equal_invariant(t, v),
         P::Ne(t) => !values_equal_invariant(t, v),
-        P::Gt(n) => value_to_number(v).map(|x| x > *n).unwrap_or(false),
-        P::Ge(n) => value_to_number(v).map(|x| x >= *n).unwrap_or(false),
-        P::Lt(n) => value_to_number(v).map(|x| x < *n).unwrap_or(false),
-        P::Le(n) => value_to_number(v).map(|x| x <= *n).unwrap_or(false),
+        P::Gt(n) => criteria_number(v).is_some_and(|x| x > *n),
+        P::Ge(n) => criteria_number(v).is_some_and(|x| x >= *n),
+        P::Lt(n) => criteria_number(v).is_some_and(|x| x < *n),
+        P::Le(n) => criteria_number(v).is_some_and(|x| x <= *n),
         P::TextLike {
             pattern,
             case_insensitive,
         } => text_like_match(pattern, *case_insensitive, v),
+        P::NotTextLike {
+            pattern,
+            case_insensitive,
+        } => !text_like_match(pattern, *case_insensitive, v),
+        P::TextGt(t) => text_compare(v, t).is_some_and(|o| o.is_gt()),
+        P::TextGe(t) => text_compare(v, t).is_some_and(|o| o.is_ge()),
+        P::TextLt(t) => text_compare(v, t).is_some_and(|o| o.is_lt()),
+        P::TextLe(t) => text_compare(v, t).is_some_and(|o| o.is_le()),
         P::IsBlank => matches!(v, LiteralValue::Empty),
+        P::NotBlank => !matches!(v, LiteralValue::Empty),
         P::IsNumber => value_to_number(v).is_ok(),
         P::IsText => matches!(v, LiteralValue::Text(_)),
         P::IsLogical => matches!(v, LiteralValue::Boolean(_)),
@@ -420,6 +452,24 @@ pub fn criteria_match(pred: &crate::args::CriteriaPredicate, v: &LiteralValue) -
 
 fn value_to_number(v: &LiteralValue) -> Result<f64, ExcelError> {
     crate::coercion::to_number_lenient(v)
+}
+
+/// The number a numeric comparison (`>5`) sees: numbers and dates only.
+/// Blank cells, text (even numeric text), booleans and errors never match.
+fn criteria_number(v: &LiteralValue) -> Option<f64> {
+    match v {
+        LiteralValue::Boolean(_) => None,
+        other => other.as_serial_number(),
+    }
+}
+
+/// Case-insensitive ordering of a text cell against a text operand; `None`
+/// for any other cell.
+fn text_compare(v: &LiteralValue, operand: &str) -> Option<std::cmp::Ordering> {
+    match v {
+        LiteralValue::Text(t) => Some(t.to_lowercase().cmp(&operand.to_lowercase())),
+        _ => None,
+    }
 }
 
 fn values_equal_invariant(a: &LiteralValue, b: &LiteralValue) -> bool {
@@ -435,38 +485,36 @@ fn values_equal_invariant(a: &LiteralValue, b: &LiteralValue) -> bool {
         // Date/time/duration equality: compare by serial value.
         // This matches criteria semantics (COUNTIF(S), SUMIF(S), database criteria, etc.) where
         // date-like values participate in numeric comparisons.
-        (x, y) if x.as_serial_number().is_some() && y.as_serial_number().is_some() => x
-            .as_serial_number()
-            .zip(y.as_serial_number())
-            .map(|(sx, sy)| (sx - sy).abs() < 1e-12)
-            .unwrap_or(false),
-        (LiteralValue::Number(x), _) => value_to_number(b)
-            .map(|y| (x - y).abs() < 1e-12)
-            .unwrap_or(false),
-        (_, LiteralValue::Number(_)) => values_equal_invariant(b, a),
+        (x, y) if criteria_number(x).is_some() && criteria_number(y).is_some() => {
+            criteria_number(x)
+                .zip(criteria_number(y))
+                .is_some_and(|(sx, sy)| (sx - sy).abs() < 1e-12)
+        }
+        // A number equals numeric text (Excel's criteria coerce text), but never a
+        // blank cell, a boolean or an error.
+        (LiteralValue::Number(_) | LiteralValue::Int(_), LiteralValue::Text(_)) => {
+            criteria_number(a)
+                .zip(value_to_number(b).ok())
+                .is_some_and(|(x, y)| (x - y).abs() < 1e-12)
+        }
+        (LiteralValue::Text(_), LiteralValue::Number(_) | LiteralValue::Int(_)) => {
+            values_equal_invariant(b, a)
+        }
         _ => false,
     }
 }
 
+/// Wildcard criteria match text cells only: Excel never matches a number,
+/// boolean, error or blank cell against `*`, `?` or `~` patterns.
 fn text_like_match(pattern: &str, case_insensitive: bool, v: &LiteralValue) -> bool {
     let s = match v {
-        LiteralValue::Text(t) => t.clone(),
-        LiteralValue::Number(n) => n.to_string(),
-        LiteralValue::Int(i) => i.to_string(),
-        LiteralValue::Boolean(b) => {
-            if *b {
-                "TRUE".into()
-            } else {
-                "FALSE".into()
-            }
-        }
-        LiteralValue::Empty => String::new(),
+        LiteralValue::Text(t) => t.as_str(),
         _ => return false,
     };
     let (pat, text) = if case_insensitive {
         (pattern.to_lowercase(), s.to_lowercase())
     } else {
-        (pattern.to_string(), s)
+        (pattern.to_string(), s.to_string())
     };
 
     // Fast-path for anchored patterns without '?' or escape sequences

@@ -59,6 +59,580 @@ fn reject(parts: &BTreeMap<String, String>) {
     assert!(recalculate_xlsx_bytes(&pack(parts), XlsxRecalculateOptions::default()).is_err());
 }
 #[test]
+fn defined_constant_is_calculated_not_published_as_name_error() {
+    let mut p = single("Rate*2", "<v>99</v>");
+    let workbook = p.get_mut("xl/workbook.xml").unwrap();
+    *workbook = workbook.replace(
+        "</workbook>",
+        "<definedNames><definedName name=\"Rate\">0.07</definedName></definedNames></workbook>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(0.14));
+    assert_eq!(member(&out.bytes, "xl/workbook.xml"), p["xl/workbook.xml"]);
+    assert_eq!(out.summary.errors, 0);
+    assert_eq!(
+        recalculate_xlsx_bytes(&out.bytes, Default::default())
+            .unwrap()
+            .bytes,
+        out.bytes
+    );
+}
+fn with_names(mut p: BTreeMap<String, String>, names: &str) -> BTreeMap<String, String> {
+    let workbook = p.get_mut("xl/workbook.xml").unwrap();
+    *workbook = workbook.replace(
+        "</workbook>",
+        &format!("<definedNames>{names}</definedNames></workbook>"),
+    );
+    p
+}
+
+#[test]
+fn grounded_formula_names_and_transitive_dependencies() {
+    let p = with_names(
+        parts(
+            "<row r=\"1\"><c r=\"A1\"><v>3</v></c></row><row r=\"2\"><c r=\"A2\"><f>Answer</f><v>99</v></c></row>",
+        ),
+        "<definedName name=\"Answer\">DoubleBase</definedName><definedName name=\"DoubleBase\">SUM(Sheet1!$A$1,Sheet1!$A$1)</definedName>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 1), Data::Float(6.0));
+    assert_eq!(data(&out.bytes, 0), Data::Float(3.0));
+    assert_eq!(member(&out.bytes, "xl/workbook.xml"), p["xl/workbook.xml"]);
+    assert_eq!(
+        recalculate_xlsx_bytes(&out.bytes, Default::default())
+            .unwrap()
+            .bytes,
+        out.bytes
+    );
+}
+
+#[test]
+fn current_workbook_index_zero_resolves_names_and_keeps_formula_text() {
+    // Excel stores `[0]!Name` for a workbook-scoped name qualified with the
+    // current workbook (external links are numbered from 1).
+    let p = with_names(
+        parts(
+            "<row r=\"1\"><c r=\"A1\"><v>7</v></c><c r=\"B1\"><f>INDEX([0]!MPRR,2,1)</f></c></row>\
+             <row r=\"2\"><c r=\"A2\"><v>8</v></c><c r=\"B2\"><f>SUM([0]!MPRR)+[0]Sheet1!A1</f></c></row>",
+        ),
+        "<definedName name=\"MPRR\">Sheet1!$A$1:$A$2</definedName>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0).to_string(), "7");
+    let mut x = Xlsx::new(Cursor::new(&out.bytes)).unwrap();
+    let range = x.worksheet_range("Sheet1").unwrap();
+    assert_eq!(range.get_value((0, 1)), Some(&Data::Float(8.0)));
+    assert_eq!(range.get_value((1, 1)), Some(&Data::Float(22.0)));
+    let sheet = member(&out.bytes, SHEET);
+    assert!(sheet.contains("<f>INDEX([0]!MPRR,2,1)</f>"), "{sheet}");
+    assert!(
+        sheet.contains("<f>SUM([0]!MPRR)+[0]Sheet1!A1</f>"),
+        "{sheet}"
+    );
+}
+
+#[test]
+fn original_cross_sheet_formula_name_and_reference_control() {
+    for (definition, formula) in [("Base!$A$1*2", "DoubleBase"), ("Base!$A$1", "DoubleBase*2")] {
+        let mut p = with_names(
+            single(formula, "<v>99</v>"),
+            &format!("<definedName name=\"DoubleBase\">{definition}</definedName>"),
+        );
+        let workbook = p.get_mut("xl/workbook.xml").unwrap();
+        *workbook = workbook.replace(
+            "</sheets>",
+            "<sheet name=\"Base\" sheetId=\"2\" r:id=\"rId2\"/></sheets>",
+        );
+        let relationships = p.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+        *relationships = relationships.replace("</Relationships>", &format!("<Relationship Id=\"rId2\" Type=\"{OFFICE}/worksheet\" Target=\"worksheets/sheet2.xml\"/></Relationships>"));
+        let types = p.get_mut("[Content_Types].xml").unwrap();
+        *types = types.replace("</Types>", "<Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/></Types>");
+        p.insert("xl/worksheets/sheet2.xml".into(), format!("<worksheet xmlns=\"{MAIN}\"><sheetData><row r=\"1\"><c r=\"A1\"><v>3</v></c></row></sheetData></worksheet>"));
+        let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+        assert_eq!(data(&out.bytes, 0), Data::Float(6.0));
+        assert_eq!(
+            member(&out.bytes, "xl/worksheets/sheet2.xml"),
+            p["xl/worksheets/sheet2.xml"]
+        );
+        assert_eq!(out.summary.errors, 0);
+    }
+}
+
+#[test]
+fn calculation_name_literal_types_and_legitimate_error() {
+    for (definition, expected) in [
+        ("TRUE", Data::Bool(true)),
+        ("FALSE", Data::Bool(false)),
+        ("&quot;a &amp; b&quot;", Data::String("a & b".into())),
+        ("#N/A", Data::Error(calamine::CellErrorType::NA)),
+        ("#DIV/0!", Data::Error(calamine::CellErrorType::Div0)),
+        ("#VALUE!", Data::Error(calamine::CellErrorType::Value)),
+        ("#REF!", Data::Error(calamine::CellErrorType::Ref)),
+        ("Sheet1!#REF!", Data::Error(calamine::CellErrorType::Ref)),
+        ("#NUM!", Data::Error(calamine::CellErrorType::Num)),
+        ("#NULL!", Data::Error(calamine::CellErrorType::Null)),
+        ("#NAME?", Data::Error(calamine::CellErrorType::Name)),
+        ("-0.07", Data::Float(-0.07)),
+    ] {
+        let p = with_names(
+            single("ValueName", "<v>99</v>"),
+            &format!("<definedName name=\"ValueName\">{definition}</definedName>"),
+        );
+        let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+        assert_eq!(data(&out.bytes, 0), expected, "{definition}");
+        assert_eq!(member(&out.bytes, "xl/workbook.xml"), p["xl/workbook.xml"]);
+    }
+}
+
+#[test]
+fn calculation_name_local_shadowing_and_local_formula_base() {
+    let p = with_names(
+        parts(
+            "<row r=\"1\"><c r=\"A1\"><v>3</v></c></row><row r=\"2\"><c r=\"A2\"><f>ResultName</f><v>99</v></c></row>",
+        ),
+        "<definedName name=\"Rate\">10</definedName><definedName name=\"Rate\" localSheetId=\"0\">2</definedName><definedName name=\"ResultName\" localSheetId=\"0\">$A$1*Rate</definedName>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 1), Data::Float(6.0));
+}
+
+#[test]
+fn unsupported_and_cyclic_calculation_names_refuse_publication() {
+    for names in [
+        "<definedName name=\"ResultName\">Sheet1!$A$1,Sheet1!$B$1</definedName>",
+        "<definedName name=\"ResultName\">Sheet1!A1</definedName>",
+        "<definedName name=\"ResultName\">$A$1*2</definedName>",
+        "<definedName name=\"ResultName\">Sheet1!A1*2</definedName>",
+        "<definedName name=\"ResultName\">INDIRECT(&quot;A1&quot;)</definedName>",
+        "<definedName name=\"ResultName\">ROW()</definedName>",
+        "<definedName name=\"ResultName\">OFFSET(#REF!,0,0,2,1)</definedName>",
+        "<definedName name=\"ResultName\">OFFSET(Sheet1!$A$1,0,0,2,1)</definedName>",
+        "<definedName name=\"ResultName\">[0]!X</definedName>",
+        "<definedName name=\"ResultName\">{1,2}</definedName>",
+        "<definedName name=\"ResultName\">[other.xlsx]Sheet1!$A$1</definedName>",
+        "<definedName name=\"ResultName\">ResultName</definedName>",
+        "<definedName name=\"ResultName\">OtherName</definedName><definedName name=\"OtherName\">ResultName</definedName>",
+    ] {
+        let p = with_names(single("ResultName", "<v>99</v>"), names);
+        let input = pack(&p);
+        assert!(
+            matches!(
+                recalculate_xlsx_bytes(&input, Default::default()),
+                Err(formualizer_workbook::IoError::Unsupported { .. })
+            ),
+            "{names}"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.xlsx");
+        let destination = dir.path().join("output.xlsx");
+        std::fs::write(&source, &input).unwrap();
+        std::fs::write(&destination, b"keep original destination").unwrap();
+        assert!(
+            formualizer_workbook::recalculate_xlsx_file(
+                &source,
+                Some(&destination),
+                Default::default()
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), input);
+        assert_eq!(
+            std::fs::read(&destination).unwrap(),
+            b"keep original destination"
+        );
+    }
+}
+
+fn inert_fixture(kind: &str, first: bool, formula: &str) -> BTreeMap<String, String> {
+    let mut p = parts(&format!(
+        "<row r=\"1\"><c r=\"A1\"><f>{formula}</f><v>99</v></c></row>"
+    ));
+    let inert = if kind == "empty" {
+        "<sheet name=\"Inert\" sheetId=\"3\" state=\"veryHidden\" r:id=\"\"/>".to_owned()
+    } else {
+        "<sheet name=\"Inert\" sheetId=\"3\" r:id=\"rId3\"/>".to_owned()
+    };
+    let workbook = p.get_mut("xl/workbook.xml").unwrap();
+    if first {
+        *workbook = workbook.replace("<sheets>", &format!("<sheets>{inert}"));
+    } else {
+        *workbook = workbook.replace("</sheets>", &format!("{inert}</sheets>"));
+    }
+    *workbook = workbook.replace(
+        "</sheets>",
+        "<sheet name=\"After\" sheetId=\"2\" r:id=\"rId2\"/></sheets>",
+    );
+    if kind == "empty" && !first {
+        *workbook = workbook
+            .replace(&inert, "")
+            .replace("</sheets>", &format!("{inert}</sheets>"));
+    }
+    let scope = if kind == "empty" && !first { 1 } else { 2 };
+    *workbook = workbook.replace("</workbook>", &format!("<definedNames><definedName name=\"Rate\" localSheetId=\"{scope}\">7</definedName></definedNames></workbook>"));
+    let rels = p.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+    *rels = rels.replace("</Relationships>", &format!("<Relationship Id=\"rId2\" Type=\"{OFFICE}/worksheet\" Target=\"worksheets/sheet2.xml\"/></Relationships>"));
+    let types = p.get_mut("[Content_Types].xml").unwrap();
+    *types = types.replace("</Types>", "<Override PartName=\"/xl/worksheets/sheet2.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/></Types>");
+    p.insert("xl/worksheets/sheet2.xml".into(), format!("<worksheet xmlns=\"{MAIN}\"><sheetData><row r=\"1\"><c r=\"A1\"><f>Rate</f><v>99</v></c></row></sheetData></worksheet>"));
+    if kind != "empty" {
+        let rels = p.get_mut("xl/_rels/workbook.xml.rels").unwrap();
+        *rels = rels.replace("</Relationships>", &format!("<Relationship Id=\"rId3\" Type=\"{OFFICE}/{kind}\" Target=\"{kind}s/sheet3.xml\"/></Relationships>"));
+        let types = p.get_mut("[Content_Types].xml").unwrap();
+        *types = types.replace("</Types>", &format!("<Override PartName=\"/xl/{kind}s/sheet3.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.{kind}+xml\"/></Types>"));
+        p.insert(
+            format!("xl/{kind}s/sheet3.xml"),
+            format!("<{kind} xmlns=\"{MAIN}\"/>"),
+        );
+        p.insert(format!("xl/{kind}s/_rels/sheet3.xml.rels"), format!("<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\"><Relationship Id=\"drawing\" Type=\"{OFFICE}/drawing\" Target=\"../drawings/drawing1.xml\"/></Relationships>"));
+        p.insert("xl/drawings/drawing1.xml".into(), "<drawing/>".into());
+        p.insert("xl/charts/chart1.xml".into(), "<chart/>".into());
+    }
+    p
+}
+
+#[test]
+fn inert_sheets_keep_scope_order_and_original_parts() {
+    let mut failures = Vec::new();
+    for (kind, first) in [
+        ("chartsheet", false),
+        ("dialogsheet", false),
+        ("empty", false),
+        ("empty", true),
+    ] {
+        let p = inert_fixture(kind, first, "1+1");
+        let out = match recalculate_xlsx_bytes(&pack(&p), Default::default()) {
+            Ok(out) => out,
+            Err(error) => {
+                failures.push(format!("{kind}, first={first}: {error}"));
+                continue;
+            }
+        };
+        let expected = if first {
+            vec!["Inert", "Sheet1", "After"]
+        } else {
+            vec!["Sheet1", "Inert", "After"]
+        };
+        if kind != "empty" {
+            let mut x = Xlsx::new(Cursor::new(&out.bytes)).unwrap();
+            assert_eq!(x.sheet_names(), expected);
+            assert_eq!(
+                x.worksheet_range("After").unwrap().get_value((0, 0)),
+                Some(&Data::Float(7.0))
+            );
+        } else {
+            assert!(member(&out.bytes, "xl/worksheets/sheet2.xml").contains("<v>7</v>"));
+        }
+        let zip = ZipArchive::new(Cursor::new(&out.bytes)).unwrap();
+        assert_eq!(zip.len(), p.len());
+        assert!(!zip.file_names().any(|n| n.contains("__inert_sheet")));
+        for (name, original) in &p {
+            if !name.starts_with("xl/worksheets/") {
+                assert_eq!(member(&out.bytes, name), *original);
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn inert_sheet_direct_and_three_dimensional_references_refuse() {
+    for formula in ["Inert!A1", "SUM(Sheet1:After!A1)"] {
+        let p = inert_fixture("chartsheet", false, formula);
+        match recalculate_xlsx_bytes(&pack(&p), Default::default()) {
+            Err(formualizer_workbook::IoError::Unsupported { feature, .. }) => {
+                assert_eq!(feature, "reference to a non-worksheet sheet")
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn inert_sheet_unicode_case_references_refuse() {
+    for (kind, name, folded) in [
+        ("chartsheet", "Ärger", "ärger"),
+        ("empty", "MÓDULO", "módulo"),
+    ] {
+        for formula in [
+            format!("'{folded}'!A1"),
+            format!("SUM(Sheet1:'{folded}'!A1)"),
+            format!("INDIRECT(&quot;'{folded}'!A1&quot;)"),
+            format!("INDIRECT(&quot;'{folded}'!Missing&quot;)"),
+            format!("SUM('{folded}'!A:A)"),
+        ] {
+            let mut p = inert_fixture(kind, false, &formula);
+            let workbook = p.get_mut("xl/workbook.xml").unwrap();
+            *workbook = workbook.replace("name=\"Inert\"", &format!("name=\"{name}\""));
+            assert!(
+                matches!(recalculate_xlsx_bytes(&pack(&p), Default::default()),
+                Err(formualizer_workbook::IoError::Unsupported { feature, .. })
+                if feature == "reference to a non-worksheet sheet"),
+                "{kind}: {formula}"
+            );
+        }
+    }
+}
+
+#[test]
+fn inert_sheet_indirect_references_are_guarded() {
+    for formula in [
+        "INDIRECT(&quot;Inert!A1&quot;)",
+        "INDIRECT(&quot;Inert!R1C1&quot;,FALSE)",
+        "INDIRECT(&quot;Sheet1:After!A1&quot;)",
+        "_XLFN._XLWS.INDIRECT(&quot;Inert!A1&quot;)",
+    ] {
+        let p = inert_fixture("chartsheet", false, formula);
+        assert!(
+            matches!(recalculate_xlsx_bytes(&pack(&p), Default::default()),
+            Err(formualizer_workbook::IoError::Unsupported { feature, .. }) if feature == "reference to a non-worksheet sheet")
+        );
+    }
+    let p = inert_fixture(
+        "chartsheet",
+        false,
+        "INDIRECT(&quot;After!&quot;&amp;&quot;A1&quot;)",
+    );
+    assert!(
+        matches!(recalculate_xlsx_bytes(&pack(&p), Default::default()),
+        Err(formualizer_workbook::IoError::Unsupported { feature, .. }) if feature == "nonliteral INDIRECT in a workbook with non-worksheet sheets")
+    );
+    let p = inert_fixture("chartsheet", false, "INDIRECT(&quot;After!A1&quot;)");
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(7.0));
+}
+
+#[test]
+fn inert_sheet_positions_are_visible_to_metadata_functions() {
+    for (formula, expected) in [
+        ("SHEET(&quot;After&quot;)", 3.0),
+        ("SHEETS()", 3.0),
+        ("SHEET()", 1.0),
+    ] {
+        let p = inert_fixture("chartsheet", false, formula);
+        let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+        assert_eq!(data(&out.bytes, 0), Data::Float(expected));
+    }
+}
+
+#[test]
+fn unused_local_name_does_not_shadow_other_sheet_scope() {
+    let mut p = inert_fixture("chartsheet", false, "1+1");
+    let workbook = p.get_mut("xl/workbook.xml").unwrap();
+    *workbook = workbook.replace(
+        "</definedNames>",
+        "<definedName name=\"Rate\" localSheetId=\"0\">{1,2}</definedName></definedNames>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert!(member(&out.bytes, "xl/worksheets/sheet2.xml").contains("<v>7</v>"));
+    assert_eq!(member(&out.bytes, "xl/workbook.xml"), p["xl/workbook.xml"]);
+}
+
+#[test]
+fn other_nonworksheet_sheet_types_remain_refused() {
+    for kind in ["macrosheet", "intlmacrosheet"] {
+        let p = inert_fixture(kind, false, "1+1");
+        assert!(
+            matches!(recalculate_xlsx_bytes(&pack(&p), Default::default()),
+            Err(formualizer_workbook::IoError::Unsupported { feature, .. }) if feature == "non-worksheet sheet")
+        );
+    }
+}
+
+#[test]
+fn unused_unevaluable_names_are_preserved() {
+    let mut failures = Vec::new();
+    for names in [
+        "<definedName name=\"Unused\">{1,2}</definedName>",
+        "<definedName name=\"Unused\">OFFSET(Sheet1!$A$1,0,0,2,1)</definedName>",
+        "<definedName name=\"Unused\">OFFSET(#REF!,0,0,2,1)</definedName>",
+        "<definedName name=\"Unused\">[0]!X</definedName>",
+        "<definedName name=\"Unused\">Other</definedName><definedName name=\"Other\">Unused</definedName>",
+        "<definedName name=\"Unused\">Other</definedName><definedName name=\"Other\">OFFSET(Unused,0,0)</definedName>",
+        "<definedName name=\"Unused\">'#10'!$A$4:$AJ$23</definedName>",
+    ] {
+        let p = with_names(single("1+1", "<v>99</v>"), names);
+        match recalculate_xlsx_bytes(&pack(&p), Default::default()) {
+            Ok(out) => {
+                assert_eq!(data(&out.bytes, 0), Data::Float(2.0));
+                assert_eq!(member(&out.bytes, "xl/workbook.xml"), p["xl/workbook.xml"]);
+            }
+            Err(error) => failures.push(format!("{names}: {error}")),
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn unevaluable_name_readers_follow_engine_unicode_case_folding() {
+    let p = with_names(
+        single("äBAD", "<v>99</v>"),
+        "<definedName name=\"Äbad\">{1,2}</definedName>",
+    );
+    assert!(
+        matches!(recalculate_xlsx_bytes(&pack(&p), Default::default()),
+        Err(formualizer_workbook::IoError::Unsupported { feature, .. }) if feature == "unsupported or cyclic calculation name")
+    );
+}
+
+#[test]
+fn unregistrable_ordinary_names_are_kept_raw_only_when_unused() {
+    let names = "<definedName name=\"a10intld\\\">7</definedName>";
+    let p = with_names(single("1+1", "<v>99</v>"), names);
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(2.0));
+    assert_eq!(member(&out.bytes, "xl/workbook.xml"), p["xl/workbook.xml"]);
+}
+
+#[test]
+fn unregistrable_ordinary_name_readers_refuse() {
+    let names = "<definedName name=\"a10intld\\\">7</definedName>";
+    for formula in ["a10intld\\", "INDIRECT(&quot;a10intld\\&quot;)"] {
+        let p = with_names(single(formula, "<v>99</v>"), names);
+        assert!(
+            matches!(recalculate_xlsx_bytes(&pack(&p), Default::default()),
+            Err(formualizer_workbook::IoError::Unsupported { feature, .. }) if feature == "unsupported or cyclic calculation name")
+        );
+    }
+    let p = with_names(
+        single("1+1", "<v>99</v>"),
+        "<definedName name=\"a10intld\\\">1+1</definedName><definedName name=\"Reader\">a10intld\\+1</definedName>",
+    );
+    assert!(
+        matches!(recalculate_xlsx_bytes(&pack(&p), Default::default()),
+        Err(formualizer_workbook::IoError::Unsupported { feature, .. }) if feature == "unsupported or cyclic calculation name")
+    );
+}
+
+#[test]
+fn newly_admitted_workbooks_do_not_expose_masked_legacy_name_errors() {
+    let legacy = "<definedName name=\"_xlnm.Auto_Open_hook\">[1]!Register.DClick</definedName>";
+    let p = with_names(
+        single("1+1", "<v>99</v>"),
+        &format!("{legacy}<definedName name=\"Unused\">{{1,2}}</definedName>"),
+    );
+    assert!(
+        matches!(recalculate_xlsx_bytes(&pack(&p), Default::default()),
+        Err(formualizer_workbook::IoError::Unsupported { feature, .. }) if feature == "unsupported or cyclic calculation name")
+    );
+    let p = with_names(single("1+1", "<v>99</v>"), legacy);
+    assert!(matches!(
+        recalculate_xlsx_bytes(&pack(&p), Default::default()),
+        Err(formualizer_workbook::IoError::Calamine(_))
+    ));
+    let mut p = inert_fixture("chartsheet", false, "1+1");
+    let workbook = p.get_mut("xl/workbook.xml").unwrap();
+    *workbook = workbook.replace("</definedNames>", &format!("{legacy}</definedNames>"));
+    assert!(
+        matches!(recalculate_xlsx_bytes(&pack(&p), Default::default()),
+        Err(formualizer_workbook::IoError::Unsupported { feature, .. }) if feature == "unsupported or cyclic calculation name")
+    );
+}
+
+#[test]
+fn document_name_cycles_and_raw_readers_keep_legacy_refusals() {
+    for names in [
+        "<definedName name=\"_xlnm.Print_Area\">_xlnm.Print_Area</definedName>",
+        "<definedName name=\"_xlnm.Print_Area\">Sheet1!$A$1,Sheet1!$B$1</definedName><definedName name=\"Unused\">OFFSET(_xlnm.Print_Area,0,0)</definedName>",
+    ] {
+        let p = with_names(single("1+1", "<v>99</v>"), names);
+        assert!(matches!(
+            recalculate_xlsx_bytes(&pack(&p), Default::default()),
+            Err(formualizer_workbook::IoError::Unsupported { .. })
+        ));
+    }
+}
+
+#[test]
+fn malformed_document_range_keeps_legacy_phantom_sheet_import() {
+    let p = with_names(
+        single("SHEETS()", "<v>99</v>"),
+        "<definedName name=\"_xlnm.Print_Area\">Missing!$A$1</definedName>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(2.0));
+    assert_eq!(member(&out.bytes, "xl/workbook.xml"), p["xl/workbook.xml"]);
+}
+
+#[test]
+fn generic_calamine_load_omits_unused_cycle() {
+    use formualizer_eval::engine::ingest::EngineLoadStream;
+    use formualizer_workbook::SpreadsheetReader;
+    let p = with_names(
+        single("1+1", "<v>99</v>"),
+        "<definedName name=\"Unused\">Other</definedName><definedName name=\"Other\">Unused</definedName>",
+    );
+    let mut adapter = formualizer_workbook::CalamineAdapter::open_bytes(pack(&p)).unwrap();
+    let mut engine = formualizer_eval::engine::Engine::new(
+        formualizer_workbook::workbook::WBResolver::default(),
+        Default::default(),
+    );
+    adapter.stream_into_engine(&mut engine).unwrap();
+    engine.evaluate_all().unwrap();
+    assert_eq!(
+        engine.get_cell_value("Sheet1", 1, 1),
+        Some(formualizer_common::LiteralValue::Number(2.0))
+    );
+    assert_eq!(adapter.name_import_diagnostics().len(), 2);
+}
+
+#[test]
+fn literal_indirect_reads_unevaluable_names() {
+    let p = with_names(
+        single("INDIRECT(&quot;BadName&quot;)", "<v>99</v>"),
+        "<definedName name=\"FirstBad\">{1,2}</definedName><definedName name=\"BadName\">OFFSET(Sheet1!$A$2,0,0)</definedName>",
+    );
+    assert!(
+        matches!(recalculate_xlsx_bytes(&pack(&p), Default::default()),
+        Err(formualizer_workbook::IoError::Unsupported { feature, context }) if feature == "unsupported or cyclic calculation name" && context == "BadName")
+    );
+}
+
+#[test]
+fn nonliteral_indirect_is_guarded_only_for_newly_omitted_names() {
+    let formula = "INDIRECT(&quot;A&quot;&amp;&quot;2&quot;)";
+    let p = with_names(
+        single(formula, "<v>99</v>"),
+        "<definedName name=\"Unused\">{1,2}</definedName>",
+    );
+    assert!(
+        matches!(recalculate_xlsx_bytes(&pack(&p), Default::default()),
+        Err(formualizer_workbook::IoError::Unsupported { feature, .. }) if feature == "nonliteral INDIRECT in a workbook with unevaluable names")
+    );
+    let p = with_names(
+        single(formula, "<v>99</v>"),
+        "<definedName name=\"_xlnm.Print_Area\">Sheet1!$A$1,Sheet1!$B$1</definedName>",
+    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert_eq!(member(&out.bytes, "xl/workbook.xml"), p["xl/workbook.xml"]);
+}
+
+#[test]
+fn evaluated_name_cannot_read_an_unevaluable_name() {
+    let p = with_names(
+        single("1+1", "<v>99</v>"),
+        "<definedName name=\"Unused\">OFFSET(#REF!,0,0,2,1)</definedName><definedName name=\"Reader\">Unused+1</definedName>",
+    );
+    assert!(recalculate_xlsx_bytes(&pack(&p), Default::default()).is_err());
+}
+
+#[test]
+fn print_filter_metadata_is_preserved_but_referenced_unsupported_name_refuses() {
+    let names = "<definedName name=\"_xlnm.Print_Area\" localSheetId=\"0\">Sheet1!$A$1,Sheet1!$B$1</definedName><definedName name=\"_xlnm._FilterDatabase\" localSheetId=\"0\" hidden=\"1\">Sheet1!$A$1:$B$2</definedName>";
+    let p = with_names(single("1+1", "<v>99</v>"), names);
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(2.0));
+    assert_eq!(member(&out.bytes, "xl/workbook.xml"), p["xl/workbook.xml"]);
+    // Names are case-insensitive: any spelling of the reference refuses.
+    for formula in ["SUM(_xlnm.Print_Area)", "SUM(_XLNM.PRINT_AREA)"] {
+        let p = with_names(single(formula, "<v>99</v>"), names);
+        assert!(matches!(
+            recalculate_xlsx_bytes(&pack(&p), Default::default()),
+            Err(formualizer_workbook::IoError::Unsupported { .. })
+        ));
+    }
+}
+
+#[test]
 fn stale_cache_and_untouched_members_and_metadata() {
     let input = fixture("1+1", "99");
     let out = recalculate_xlsx_bytes(&input, XlsxRecalculateOptions::default()).unwrap();
@@ -268,13 +842,17 @@ fn limits_and_precancellation() {
 }
 #[test]
 fn unsupported_spill_does_not_return_a_partial_package() {
-    assert!(
-        recalculate_xlsx_bytes(
-            &fixture("SEQUENCE(2)", "99"),
-            XlsxRecalculateOptions::default()
-        )
-        .is_err()
+    // Multi-cell spills are published since FORM211; one crossing a merge
+    // is still refused as a whole.
+    let mut p = single("SEQUENCE(2)", "<v>99</v>");
+    let sheet = p.get_mut(SHEET).unwrap();
+    *sheet = sheet.replace(
+        "</sheetData>",
+        "</sheetData><mergeCells count=\"1\"><mergeCell ref=\"A2:B2\"/></mergeCells>",
     );
+    reject(&p);
+    let out = recalculate_xlsx_bytes(&fixture("SEQUENCE(2)", "99"), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 1), Data::Float(2.0));
 }
 #[test]
 fn error_locations_are_bounded() {
@@ -332,7 +910,31 @@ fn defined_names_are_evaluated_without_metadata_rewrite() {
     reject(&p);
 }
 #[test]
-fn nonportable_literal_errors_and_tables_are_explicitly_rejected() {
+fn defined_name_range_endpoints_are_refused_not_written() {
+    // Excel computes the bounding range (14 / 6 / 9 here); the evaluator does
+    // not resolve name endpoints yet, so the package must be refused rather
+    // than rewritten with a cached error.
+    for formula in ["SUM(A1:Total)", "SUM(Start:A3)", "SUM(Start:Total)"] {
+        let mut p = parts(&format!(
+            "<row r=\"1\"><c r=\"A1\"><v>2</v></c><c r=\"B1\"><f>{formula}</f><v>99</v></c></row><row r=\"2\"><c r=\"A2\"><v>3</v></c></row><row r=\"3\"><c r=\"A3\"><v>4</v></c></row>"
+        ));
+        let wb = p.get_mut("xl/workbook.xml").unwrap();
+        *wb = wb.replace(
+            "</workbook>",
+            "<definedNames><definedName name=\"Start\">Sheet1!$A$2</definedName><definedName name=\"Total\">Sheet1!$A$3</definedName></definedNames></workbook>",
+        );
+        let Err(error) = recalculate_xlsx_bytes(&pack(&p), Default::default()) else {
+            panic!("{formula}: recalculation wrote the package");
+        };
+        assert!(
+            matches!(&error, formualizer_workbook::IoError::Unsupported { feature, context }
+                if feature.contains("no approved XLSX cache encoding") && context == "#N/IMPL!"),
+            "{formula}: unexpected error: {error:?}"
+        );
+    }
+}
+#[test]
+fn nonportable_literal_errors_are_refused_and_empty_table_parts_are_inert() {
     let p = parts(
         "<row r=\"1\"><c r=\"A1\" t=\"e\"><v>#SPILL!</v></c><c r=\"B1\"><f>IFERROR(A1,0)</f><v>99</v></c></row>",
     );
@@ -343,10 +945,8 @@ fn nonportable_literal_errors_and_tables_are_explicitly_rejected() {
     let mut p = single("1+1", "<v>99</v>");
     let s = p.get_mut(SHEET).unwrap();
     *s = s.replace("</worksheet>", "<tableParts count=\"0\"/></worksheet>");
-    let error = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap_err();
-    assert!(
-        matches!(error,formualizer_workbook::IoError::Unsupported{feature,..} if feature.contains("table metadata"))
-    );
+    let out = recalculate_xlsx_bytes(&pack(&p), Default::default()).unwrap();
+    assert_eq!(data(&out.bytes, 0), Data::Float(2.0));
 }
 #[test]
 fn engine_specific_errors_are_unsupported_results_not_invented_excel_tokens() {
@@ -528,7 +1128,7 @@ fn duplicate_zip_names_are_not_hidden_by_archive_index() {
     assert!(recalculate_xlsx_bytes(&input, Default::default()).is_err());
 }
 #[test]
-fn data_descriptors_and_inconsistent_headers_are_rejected() {
+fn missing_data_descriptors_and_inconsistent_headers_are_rejected() {
     let original = fixture("1+1", "99");
     let (headers, _) = directory(&original);
     let a = headers[0];
@@ -577,4 +1177,44 @@ fn atomic_native_output_and_permissions() {
     assert_eq!(std::fs::read(&input).unwrap(), source);
     recalculate_xlsx_file(&input, None, Default::default()).unwrap();
     assert_eq!(data(&std::fs::read(&input).unwrap(), 0), Data::Float(2.0));
+}
+#[test]
+fn unparseable_stored_formula_is_a_refusal_naming_the_cell() {
+    use formualizer_eval::engine::FormulaParsePolicy;
+    use formualizer_workbook::IoError;
+    // A second, valid formula keeps both eager and deferred ingestion busy.
+    let mut p = parts(
+        "<row r=\"1\"><c r=\"A1\"><v>1</v></c><c r=\"B1\"><f>A1+1</f><v>9</v></c><c r=\"C1\"><f>SUM((A1</f><v>9</v></c></row>",
+    );
+    let input = pack(&p);
+    for defer in [false, true] {
+        let mut o = XlsxRecalculateOptions::default();
+        o.eval_config.defer_graph_building = defer;
+        match recalculate_xlsx_bytes(&input, o) {
+            Err(IoError::Unsupported { feature, context }) => {
+                assert_eq!(feature, "unparseable formula");
+                assert!(context.starts_with("Sheet1!C1: "), "{context}");
+                assert!(context.contains("parenthesis"), "{context}");
+            }
+            other => panic!("defer={defer}: expected a refusal, got {other:?}"),
+        }
+    }
+    // A caller's explicit non-strict policy keeps its meaning: the coerced
+    // #ERROR! result has no XLSX cache encoding.
+    let mut o = XlsxRecalculateOptions::default();
+    o.eval_config.formula_parse_policy = FormulaParsePolicy::CoerceToError;
+    match recalculate_xlsx_bytes(&input, o) {
+        Err(IoError::Unsupported { feature, context }) => {
+            assert!(
+                feature.contains("no approved XLSX cache encoding"),
+                "{feature}"
+            );
+            assert_eq!(context, "#ERROR!");
+        }
+        other => panic!("expected the coerced-error refusal, got {other:?}"),
+    }
+    // Valid formulas are unaffected.
+    let sheet = p.get_mut(SHEET).unwrap();
+    *sheet = sheet.replace("SUM((A1", "SUM((A1))");
+    assert!(recalculate_xlsx_bytes(&pack(&p), Default::default()).is_ok());
 }

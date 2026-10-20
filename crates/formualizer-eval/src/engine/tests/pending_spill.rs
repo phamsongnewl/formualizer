@@ -41,7 +41,6 @@ fn pending_spill_final_commit_rechecks_before_publication_and_releases_reservati
                 vec![LiteralValue::Number(1.0)],
                 vec![LiteralValue::Number(2.0)],
             ]),
-            None,
         )
         .unwrap();
     assert_eq!(engine.spill_mgr.active_locks.len(), 1);
@@ -189,7 +188,7 @@ fn pending_spill_cancel_and_retained_admission_leave_no_failure_publication() {
     engine.set_evaluation_resource_budgets(budgets);
     let error = engine.evaluate_cell("S", 1, 1).unwrap_err();
     assert!(
-        matches!(error.extra, formualizer_common::ExcelErrorExtra::Resource { ref detail } if detail.reason == formualizer_common::ResourceExhaustionReason::RetainedMemory)
+        matches!(error.extra(), formualizer_common::ExcelErrorExtra::Resource { detail } if detail.reason == formualizer_common::ResourceExhaustionReason::RetainedMemory)
     );
     assert!(engine.blocked_pending_spills.is_empty());
     assert!(engine.spill_mgr.active_locks.is_empty());

@@ -8,7 +8,7 @@ pub enum formualizer_parse::parser::ASTNodeType
 pub formualizer_parse::parser::ASTNodeType::Array(alloc::vec::Vec<alloc::vec::Vec<formualizer_parse::parser::ASTNode>>)
 pub formualizer_parse::parser::ASTNodeType::BinaryOp
 pub formualizer_parse::parser::ASTNodeType::BinaryOp::left: alloc::boxed::Box<formualizer_parse::parser::ASTNode>
-pub formualizer_parse::parser::ASTNodeType::BinaryOp::op: alloc::string::String
+pub formualizer_parse::parser::ASTNodeType::BinaryOp::op: formualizer_parse::parser::BinaryOperator
 pub formualizer_parse::parser::ASTNodeType::BinaryOp::right: alloc::boxed::Box<formualizer_parse::parser::ASTNode>
 pub formualizer_parse::parser::ASTNodeType::Call
 pub formualizer_parse::parser::ASTNodeType::Call::args: alloc::vec::Vec<formualizer_parse::parser::ASTNode>
@@ -23,7 +23,7 @@ pub formualizer_parse::parser::ASTNodeType::Reference::original: alloc::string::
 pub formualizer_parse::parser::ASTNodeType::Reference::reference: formualizer_parse::parser::ReferenceType
 pub formualizer_parse::parser::ASTNodeType::UnaryOp
 pub formualizer_parse::parser::ASTNodeType::UnaryOp::expr: alloc::boxed::Box<formualizer_parse::parser::ASTNode>
-pub formualizer_parse::parser::ASTNodeType::UnaryOp::op: alloc::string::String
+pub formualizer_parse::parser::ASTNodeType::UnaryOp::op: formualizer_parse::parser::UnaryOperator
 impl core::clone::Clone for formualizer_parse::parser::ASTNodeType
 pub fn formualizer_parse::parser::ASTNodeType::clone(&self) -> formualizer_parse::parser::ASTNodeType
 impl core::cmp::PartialEq for formualizer_parse::parser::ASTNodeType
@@ -39,6 +39,44 @@ impl serde_core::ser::Serialize for formualizer_parse::parser::ASTNodeType
 pub fn formualizer_parse::parser::ASTNodeType::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for formualizer_parse::parser::ASTNodeType
 pub fn formualizer_parse::parser::ASTNodeType::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+#[non_exhaustive] pub enum formualizer_parse::parser::BinaryOperator
+pub formualizer_parse::parser::BinaryOperator::Add
+pub formualizer_parse::parser::BinaryOperator::Concat
+pub formualizer_parse::parser::BinaryOperator::Divide
+pub formualizer_parse::parser::BinaryOperator::Equal
+pub formualizer_parse::parser::BinaryOperator::Greater
+pub formualizer_parse::parser::BinaryOperator::GreaterEqual
+pub formualizer_parse::parser::BinaryOperator::Intersection
+pub formualizer_parse::parser::BinaryOperator::Less
+pub formualizer_parse::parser::BinaryOperator::LessEqual
+pub formualizer_parse::parser::BinaryOperator::Multiply
+pub formualizer_parse::parser::BinaryOperator::NotEqual
+pub formualizer_parse::parser::BinaryOperator::Power
+pub formualizer_parse::parser::BinaryOperator::Range
+pub formualizer_parse::parser::BinaryOperator::Subtract
+pub formualizer_parse::parser::BinaryOperator::Union
+impl formualizer_parse::parser::BinaryOperator
+pub const fn formualizer_parse::parser::BinaryOperator::as_str(self) -> &'static str
+impl core::clone::Clone for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::clone(&self) -> formualizer_parse::parser::BinaryOperator
+impl core::cmp::Eq for formualizer_parse::parser::BinaryOperator
+impl core::cmp::PartialEq for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::eq(&self, &formualizer_parse::parser::BinaryOperator) -> bool
+impl core::convert::TryFrom<&str> for formualizer_parse::parser::BinaryOperator
+pub type formualizer_parse::parser::BinaryOperator::Error = &'static str
+pub fn formualizer_parse::parser::BinaryOperator::try_from(&str) -> core::result::Result<Self, Self::Error>
+impl core::fmt::Debug for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::hash<H: core::hash::Hasher>(&self, &mut H)
+impl core::marker::Copy for formualizer_parse::parser::BinaryOperator
+impl core::marker::StructuralPartialEq for formualizer_parse::parser::BinaryOperator
+impl serde_core::ser::Serialize for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 pub enum formualizer_parse::parser::ExternalBookRef
 pub formualizer_parse::parser::ExternalBookRef::Token(alloc::string::String)
 impl formualizer_parse::parser::ExternalBookRef
@@ -285,6 +323,34 @@ impl serde_core::ser::Serialize for formualizer_parse::parser::TableSpecifier
 pub fn formualizer_parse::parser::TableSpecifier::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for formualizer_parse::parser::TableSpecifier
 pub fn formualizer_parse::parser::TableSpecifier::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+#[non_exhaustive] pub enum formualizer_parse::parser::UnaryOperator
+pub formualizer_parse::parser::UnaryOperator::ImplicitIntersection
+pub formualizer_parse::parser::UnaryOperator::Minus
+pub formualizer_parse::parser::UnaryOperator::Percent
+pub formualizer_parse::parser::UnaryOperator::Plus
+pub formualizer_parse::parser::UnaryOperator::Spill
+impl formualizer_parse::parser::UnaryOperator
+pub const fn formualizer_parse::parser::UnaryOperator::as_str(self) -> &'static str
+impl core::clone::Clone for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::clone(&self) -> formualizer_parse::parser::UnaryOperator
+impl core::cmp::Eq for formualizer_parse::parser::UnaryOperator
+impl core::cmp::PartialEq for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::eq(&self, &formualizer_parse::parser::UnaryOperator) -> bool
+impl core::convert::TryFrom<&str> for formualizer_parse::parser::UnaryOperator
+pub type formualizer_parse::parser::UnaryOperator::Error = &'static str
+pub fn formualizer_parse::parser::UnaryOperator::try_from(&str) -> core::result::Result<Self, Self::Error>
+impl core::fmt::Debug for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::hash<H: core::hash::Hasher>(&self, &mut H)
+impl core::marker::Copy for formualizer_parse::parser::UnaryOperator
+impl core::marker::StructuralPartialEq for formualizer_parse::parser::UnaryOperator
+impl serde_core::ser::Serialize for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 pub struct formualizer_parse::parser::ASTNode
 pub formualizer_parse::parser::ASTNode::contains_volatile: bool
 pub formualizer_parse::parser::ASTNode::node_type: formualizer_parse::parser::ASTNodeType
@@ -332,11 +398,13 @@ pub fn formualizer_parse::parser::BatchParser::parse(&mut self, &str) -> core::r
 pub struct formualizer_parse::parser::BatchParserBuilder
 impl formualizer_parse::parser::BatchParserBuilder
 pub fn formualizer_parse::parser::BatchParserBuilder::build(self) -> formualizer_parse::parser::BatchParser
+pub fn formualizer_parse::parser::BatchParserBuilder::cache_capacity(self, usize, usize) -> Self
 pub fn formualizer_parse::parser::BatchParserBuilder::dialect(self, formualizer_parse::types::FormulaDialect) -> Self
 pub fn formualizer_parse::parser::BatchParserBuilder::include_whitespace(self, bool) -> Self
+pub fn formualizer_parse::parser::BatchParserBuilder::limits(self, formualizer_parse::ParserLimits) -> Self
 pub fn formualizer_parse::parser::BatchParserBuilder::with_volatility_classifier<F>(self, F) -> Self where F: core::ops::function::Fn(&str) -> bool + core::marker::Send + core::marker::Sync + 'static
 impl core::default::Default for formualizer_parse::parser::BatchParserBuilder
-pub fn formualizer_parse::parser::BatchParserBuilder::default() -> formualizer_parse::parser::BatchParserBuilder
+pub fn formualizer_parse::parser::BatchParserBuilder::default() -> Self
 pub struct formualizer_parse::parser::CollectPolicy
 pub formualizer_parse::parser::CollectPolicy::expand_small_ranges: bool
 pub formualizer_parse::parser::CollectPolicy::include_names: bool
@@ -387,6 +455,7 @@ pub struct formualizer_parse::parser::ParserBuilder
 impl formualizer_parse::parser::ParserBuilder
 pub fn formualizer_parse::parser::ParserBuilder::build<T: core::convert::AsRef<str>>(self, T) -> core::result::Result<formualizer_parse::parser::Parser, formualizer_parse::tokenizer::TokenizerError>
 pub fn formualizer_parse::parser::ParserBuilder::dialect(self, formualizer_parse::types::FormulaDialect) -> Self
+pub fn formualizer_parse::parser::ParserBuilder::limits(self, formualizer_parse::ParserLimits) -> Self
 pub fn formualizer_parse::parser::ParserBuilder::parse<T: core::convert::AsRef<str>>(self, T) -> core::result::Result<formualizer_parse::parser::ASTNode, formualizer_parse::parser::ParserError>
 pub fn formualizer_parse::parser::ParserBuilder::with_volatility_classifier<F>(self, F) -> Self where F: core::ops::function::Fn(&str) -> bool + core::marker::Send + core::marker::Sync + 'static
 impl core::default::Default for formualizer_parse::parser::ParserBuilder
@@ -445,6 +514,7 @@ impl core::marker::Copy for formualizer_parse::tokenizer::Associativity
 impl core::marker::StructuralPartialEq for formualizer_parse::tokenizer::Associativity
 #[non_exhaustive] pub enum formualizer_parse::tokenizer::RecoveryAction
 pub formualizer_parse::tokenizer::RecoveryAction::InvalidErrorLiteral
+pub formualizer_parse::tokenizer::RecoveryAction::ResourceLimitExceeded
 pub formualizer_parse::tokenizer::RecoveryAction::SkippedUnmatchedCloser
 pub formualizer_parse::tokenizer::RecoveryAction::UnmatchedBracket
 pub formualizer_parse::tokenizer::RecoveryAction::UnmatchedOpener
@@ -532,10 +602,6 @@ pub fn formualizer_parse::tokenizer::Token::get_precedence(&self) -> core::optio
 pub fn formualizer_parse::tokenizer::Token::is_operator(&self) -> bool
 pub fn formualizer_parse::tokenizer::Token::make_operand(alloc::string::String) -> Self
 pub fn formualizer_parse::tokenizer::Token::make_operand_with_span(alloc::string::String, usize, usize) -> Self
-pub fn formualizer_parse::tokenizer::Token::make_separator(&str) -> Self
-pub fn formualizer_parse::tokenizer::Token::make_separator_with_span(&str, usize, usize) -> Self
-pub fn formualizer_parse::tokenizer::Token::make_subexp(&str, bool) -> Self
-pub fn formualizer_parse::tokenizer::Token::make_subexp_with_span(&str, bool, usize, usize) -> Self
 pub fn formualizer_parse::tokenizer::Token::new(alloc::string::String, formualizer_parse::tokenizer::TokenType, formualizer_parse::tokenizer::TokenSubType) -> Self
 pub fn formualizer_parse::tokenizer::Token::new_with_span(alloc::string::String, formualizer_parse::tokenizer::TokenType, formualizer_parse::tokenizer::TokenSubType, usize, usize) -> Self
 impl core::clone::Clone for formualizer_parse::tokenizer::Token
@@ -630,6 +696,7 @@ impl<'a> core::marker::StructuralPartialEq for formualizer_parse::tokenizer::Tok
 pub struct formualizer_parse::tokenizer::Tokenizer
 pub formualizer_parse::tokenizer::Tokenizer::items: alloc::vec::Vec<formualizer_parse::tokenizer::Token>
 impl formualizer_parse::tokenizer::Tokenizer
+pub fn formualizer_parse::tokenizer::Tokenizer::admission_error(&self) -> core::option::Option<&formualizer_parse::tokenizer::TokenizerError>
 pub fn formualizer_parse::tokenizer::Tokenizer::dialect(&self) -> formualizer_parse::types::FormulaDialect
 pub fn formualizer_parse::tokenizer::Tokenizer::from_token_stream(&formualizer_parse::tokenizer::TokenStream) -> Self
 pub fn formualizer_parse::tokenizer::Tokenizer::new(&str) -> core::result::Result<Self, formualizer_parse::tokenizer::TokenizerError>
@@ -687,7 +754,7 @@ pub enum formualizer_parse::ASTNodeType
 pub formualizer_parse::ASTNodeType::Array(alloc::vec::Vec<alloc::vec::Vec<formualizer_parse::parser::ASTNode>>)
 pub formualizer_parse::ASTNodeType::BinaryOp
 pub formualizer_parse::ASTNodeType::BinaryOp::left: alloc::boxed::Box<formualizer_parse::parser::ASTNode>
-pub formualizer_parse::ASTNodeType::BinaryOp::op: alloc::string::String
+pub formualizer_parse::ASTNodeType::BinaryOp::op: formualizer_parse::parser::BinaryOperator
 pub formualizer_parse::ASTNodeType::BinaryOp::right: alloc::boxed::Box<formualizer_parse::parser::ASTNode>
 pub formualizer_parse::ASTNodeType::Call
 pub formualizer_parse::ASTNodeType::Call::args: alloc::vec::Vec<formualizer_parse::parser::ASTNode>
@@ -702,7 +769,7 @@ pub formualizer_parse::ASTNodeType::Reference::original: alloc::string::String
 pub formualizer_parse::ASTNodeType::Reference::reference: formualizer_parse::parser::ReferenceType
 pub formualizer_parse::ASTNodeType::UnaryOp
 pub formualizer_parse::ASTNodeType::UnaryOp::expr: alloc::boxed::Box<formualizer_parse::parser::ASTNode>
-pub formualizer_parse::ASTNodeType::UnaryOp::op: alloc::string::String
+pub formualizer_parse::ASTNodeType::UnaryOp::op: formualizer_parse::parser::UnaryOperator
 impl core::clone::Clone for formualizer_parse::parser::ASTNodeType
 pub fn formualizer_parse::parser::ASTNodeType::clone(&self) -> formualizer_parse::parser::ASTNodeType
 impl core::cmp::PartialEq for formualizer_parse::parser::ASTNodeType
@@ -718,6 +785,44 @@ impl serde_core::ser::Serialize for formualizer_parse::parser::ASTNodeType
 pub fn formualizer_parse::parser::ASTNodeType::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for formualizer_parse::parser::ASTNodeType
 pub fn formualizer_parse::parser::ASTNodeType::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+#[non_exhaustive] pub enum formualizer_parse::BinaryOperator
+pub formualizer_parse::BinaryOperator::Add
+pub formualizer_parse::BinaryOperator::Concat
+pub formualizer_parse::BinaryOperator::Divide
+pub formualizer_parse::BinaryOperator::Equal
+pub formualizer_parse::BinaryOperator::Greater
+pub formualizer_parse::BinaryOperator::GreaterEqual
+pub formualizer_parse::BinaryOperator::Intersection
+pub formualizer_parse::BinaryOperator::Less
+pub formualizer_parse::BinaryOperator::LessEqual
+pub formualizer_parse::BinaryOperator::Multiply
+pub formualizer_parse::BinaryOperator::NotEqual
+pub formualizer_parse::BinaryOperator::Power
+pub formualizer_parse::BinaryOperator::Range
+pub formualizer_parse::BinaryOperator::Subtract
+pub formualizer_parse::BinaryOperator::Union
+impl formualizer_parse::parser::BinaryOperator
+pub const fn formualizer_parse::parser::BinaryOperator::as_str(self) -> &'static str
+impl core::clone::Clone for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::clone(&self) -> formualizer_parse::parser::BinaryOperator
+impl core::cmp::Eq for formualizer_parse::parser::BinaryOperator
+impl core::cmp::PartialEq for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::eq(&self, &formualizer_parse::parser::BinaryOperator) -> bool
+impl core::convert::TryFrom<&str> for formualizer_parse::parser::BinaryOperator
+pub type formualizer_parse::parser::BinaryOperator::Error = &'static str
+pub fn formualizer_parse::parser::BinaryOperator::try_from(&str) -> core::result::Result<Self, Self::Error>
+impl core::fmt::Debug for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::hash<H: core::hash::Hasher>(&self, &mut H)
+impl core::marker::Copy for formualizer_parse::parser::BinaryOperator
+impl core::marker::StructuralPartialEq for formualizer_parse::parser::BinaryOperator
+impl serde_core::ser::Serialize for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for formualizer_parse::parser::BinaryOperator
+pub fn formualizer_parse::parser::BinaryOperator::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 pub enum formualizer_parse::FormulaDialect
 pub formualizer_parse::FormulaDialect::Excel
 pub formualizer_parse::FormulaDialect::OpenFormula
@@ -749,6 +854,7 @@ pub fn formualizer_parse::types::ParsingError::fmt(&self, &mut core::fmt::Format
 impl core::marker::StructuralPartialEq for formualizer_parse::types::ParsingError
 #[non_exhaustive] pub enum formualizer_parse::RecoveryAction
 pub formualizer_parse::RecoveryAction::InvalidErrorLiteral
+pub formualizer_parse::RecoveryAction::ResourceLimitExceeded
 pub formualizer_parse::RecoveryAction::SkippedUnmatchedCloser
 pub formualizer_parse::RecoveryAction::UnmatchedBracket
 pub formualizer_parse::RecoveryAction::UnmatchedOpener
@@ -824,6 +930,34 @@ impl serde_core::ser::Serialize for formualizer_parse::tokenizer::TokenType
 pub fn formualizer_parse::tokenizer::TokenType::serialize<__S>(&self, __S) -> core::result::Result<<__S as serde_core::ser::Serializer>::Ok, <__S as serde_core::ser::Serializer>::Error> where __S: serde_core::ser::Serializer
 impl<'de> serde_core::de::Deserialize<'de> for formualizer_parse::tokenizer::TokenType
 pub fn formualizer_parse::tokenizer::TokenType::deserialize<__D>(__D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
+#[non_exhaustive] pub enum formualizer_parse::UnaryOperator
+pub formualizer_parse::UnaryOperator::ImplicitIntersection
+pub formualizer_parse::UnaryOperator::Minus
+pub formualizer_parse::UnaryOperator::Percent
+pub formualizer_parse::UnaryOperator::Plus
+pub formualizer_parse::UnaryOperator::Spill
+impl formualizer_parse::parser::UnaryOperator
+pub const fn formualizer_parse::parser::UnaryOperator::as_str(self) -> &'static str
+impl core::clone::Clone for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::clone(&self) -> formualizer_parse::parser::UnaryOperator
+impl core::cmp::Eq for formualizer_parse::parser::UnaryOperator
+impl core::cmp::PartialEq for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::eq(&self, &formualizer_parse::parser::UnaryOperator) -> bool
+impl core::convert::TryFrom<&str> for formualizer_parse::parser::UnaryOperator
+pub type formualizer_parse::parser::UnaryOperator::Error = &'static str
+pub fn formualizer_parse::parser::UnaryOperator::try_from(&str) -> core::result::Result<Self, Self::Error>
+impl core::fmt::Debug for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::hash::Hash for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::hash<H: core::hash::Hasher>(&self, &mut H)
+impl core::marker::Copy for formualizer_parse::parser::UnaryOperator
+impl core::marker::StructuralPartialEq for formualizer_parse::parser::UnaryOperator
+impl serde_core::ser::Serialize for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
+impl<'de> serde_core::de::Deserialize<'de> for formualizer_parse::parser::UnaryOperator
+pub fn formualizer_parse::parser::UnaryOperator::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 pub struct formualizer_parse::ASTNode
 pub formualizer_parse::ASTNode::contains_volatile: bool
 pub formualizer_parse::ASTNode::node_type: formualizer_parse::parser::ASTNodeType
@@ -886,10 +1020,34 @@ pub struct formualizer_parse::ParserBuilder
 impl formualizer_parse::parser::ParserBuilder
 pub fn formualizer_parse::parser::ParserBuilder::build<T: core::convert::AsRef<str>>(self, T) -> core::result::Result<formualizer_parse::parser::Parser, formualizer_parse::tokenizer::TokenizerError>
 pub fn formualizer_parse::parser::ParserBuilder::dialect(self, formualizer_parse::types::FormulaDialect) -> Self
+pub fn formualizer_parse::parser::ParserBuilder::limits(self, formualizer_parse::ParserLimits) -> Self
 pub fn formualizer_parse::parser::ParserBuilder::parse<T: core::convert::AsRef<str>>(self, T) -> core::result::Result<formualizer_parse::parser::ASTNode, formualizer_parse::parser::ParserError>
 pub fn formualizer_parse::parser::ParserBuilder::with_volatility_classifier<F>(self, F) -> Self where F: core::ops::function::Fn(&str) -> bool + core::marker::Send + core::marker::Sync + 'static
 impl core::default::Default for formualizer_parse::parser::ParserBuilder
 pub fn formualizer_parse::parser::ParserBuilder::default() -> formualizer_parse::parser::ParserBuilder
+pub struct formualizer_parse::ParserLimits
+impl formualizer_parse::ParserLimits
+pub const fn formualizer_parse::ParserLimits::ast_height(self) -> usize
+pub const fn formualizer_parse::ParserLimits::ast_nodes(self) -> usize
+pub const fn formualizer_parse::ParserLimits::pratt_frames(self) -> usize
+pub const fn formualizer_parse::ParserLimits::source_bytes(self) -> usize
+pub const fn formualizer_parse::ParserLimits::tokens(self) -> usize
+pub const fn formualizer_parse::ParserLimits::with_ast_height(self, usize) -> Self
+pub const fn formualizer_parse::ParserLimits::with_ast_nodes(self, usize) -> Self
+pub const fn formualizer_parse::ParserLimits::with_pratt_frames(self, usize) -> Self
+pub const fn formualizer_parse::ParserLimits::with_source_bytes(self, usize) -> Self
+pub const fn formualizer_parse::ParserLimits::with_tokens(self, usize) -> Self
+impl core::clone::Clone for formualizer_parse::ParserLimits
+pub fn formualizer_parse::ParserLimits::clone(&self) -> formualizer_parse::ParserLimits
+impl core::cmp::Eq for formualizer_parse::ParserLimits
+impl core::cmp::PartialEq for formualizer_parse::ParserLimits
+pub fn formualizer_parse::ParserLimits::eq(&self, &formualizer_parse::ParserLimits) -> bool
+impl core::default::Default for formualizer_parse::ParserLimits
+pub fn formualizer_parse::ParserLimits::default() -> Self
+impl core::fmt::Debug for formualizer_parse::ParserLimits
+pub fn formualizer_parse::ParserLimits::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for formualizer_parse::ParserLimits
+impl core::marker::StructuralPartialEq for formualizer_parse::ParserLimits
 pub struct formualizer_parse::Token
 pub formualizer_parse::Token::end: usize
 pub formualizer_parse::Token::start: usize
@@ -902,10 +1060,6 @@ pub fn formualizer_parse::tokenizer::Token::get_precedence(&self) -> core::optio
 pub fn formualizer_parse::tokenizer::Token::is_operator(&self) -> bool
 pub fn formualizer_parse::tokenizer::Token::make_operand(alloc::string::String) -> Self
 pub fn formualizer_parse::tokenizer::Token::make_operand_with_span(alloc::string::String, usize, usize) -> Self
-pub fn formualizer_parse::tokenizer::Token::make_separator(&str) -> Self
-pub fn formualizer_parse::tokenizer::Token::make_separator_with_span(&str, usize, usize) -> Self
-pub fn formualizer_parse::tokenizer::Token::make_subexp(&str, bool) -> Self
-pub fn formualizer_parse::tokenizer::Token::make_subexp_with_span(&str, bool, usize, usize) -> Self
 pub fn formualizer_parse::tokenizer::Token::new(alloc::string::String, formualizer_parse::tokenizer::TokenType, formualizer_parse::tokenizer::TokenSubType) -> Self
 pub fn formualizer_parse::tokenizer::Token::new_with_span(alloc::string::String, formualizer_parse::tokenizer::TokenType, formualizer_parse::tokenizer::TokenSubType, usize, usize) -> Self
 impl core::clone::Clone for formualizer_parse::tokenizer::Token
@@ -1000,6 +1154,7 @@ impl<'a> core::marker::StructuralPartialEq for formualizer_parse::tokenizer::Tok
 pub struct formualizer_parse::Tokenizer
 pub formualizer_parse::Tokenizer::items: alloc::vec::Vec<formualizer_parse::tokenizer::Token>
 impl formualizer_parse::tokenizer::Tokenizer
+pub fn formualizer_parse::tokenizer::Tokenizer::admission_error(&self) -> core::option::Option<&formualizer_parse::tokenizer::TokenizerError>
 pub fn formualizer_parse::tokenizer::Tokenizer::dialect(&self) -> formualizer_parse::types::FormulaDialect
 pub fn formualizer_parse::tokenizer::Tokenizer::from_token_stream(&formualizer_parse::tokenizer::TokenStream) -> Self
 pub fn formualizer_parse::tokenizer::Tokenizer::new(&str) -> core::result::Result<Self, formualizer_parse::tokenizer::TokenizerError>

@@ -246,7 +246,9 @@ impl UmyaAdapter {
             return Some(LiteralValue::Error(ExcelError::new(kind)));
         }
         match raw {
-            CellRawValue::Numeric(n) => Some(LiteralValue::Number(*n)),
+            // A non-finite number (`<v>NaN</v>`) is #NUM!, as in the other
+            // loaders.
+            CellRawValue::Numeric(n) => Some(LiteralValue::Number(*n).finite_or_num_error()),
             CellRawValue::Bool(b) => Some(LiteralValue::Boolean(*b)),
             CellRawValue::String(s) => Some(LiteralValue::Text(s.to_string())),
             CellRawValue::RichText(rt) => Some(LiteralValue::Text(rt.get_text().to_string())),
@@ -254,7 +256,7 @@ impl UmyaAdapter {
                 // attempt parse
                 let txt = s.as_ref();
                 if let Ok(n) = txt.parse::<f64>() {
-                    Some(LiteralValue::Number(n))
+                    Some(LiteralValue::Number(n).finite_or_num_error())
                 } else if txt.eq_ignore_ascii_case("TRUE") {
                     Some(LiteralValue::Boolean(true))
                 } else if txt.eq_ignore_ascii_case("FALSE") {
@@ -948,7 +950,7 @@ impl UmyaAdapter {
         if let Some(rest) = trimmed.strip_prefix('=') {
             trimmed = rest.trim();
         }
-        if trimmed.is_empty() || trimmed.contains(',') {
+        if trimmed.is_empty() || super::has_union_comma(trimmed) {
             return None;
         }
 
@@ -1069,7 +1071,7 @@ impl UmyaAdapter {
     fn convert_defined_name(defined: &UmyaDefinedName, current_sheet: &str) -> Option<NamedRange> {
         let raw = defined.get_address();
         let trimmed = raw.trim();
-        if trimmed.is_empty() || trimmed.contains(',') {
+        if trimmed.is_empty() || super::has_union_comma(trimmed) {
             return None;
         }
 
@@ -1356,6 +1358,7 @@ where
                         formula_cells += 1;
                     }
                 }
+                staging.finish(engine);
                 formula_handed_to_engine += formulas.len();
                 if !formulas.is_empty() {
                     eager_formula_batches.push(FormulaIngestBatch::new(n.clone(), formulas));

@@ -246,6 +246,11 @@ pub struct ColumnChunk {
 }
 
 impl ColumnChunk {
+    /// Value generations for exact derived products; includes same-layer writes.
+    pub(crate) fn criteria_overlay_epochs(&self) -> (u64, u64) {
+        (self.overlay.epoch, self.computed_overlay.epoch)
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         self.type_tag.len()
@@ -1727,7 +1732,7 @@ impl OverlayFragment {
         let mut merged_ends: Vec<u32> = Vec::with_capacity(run_ends.len());
         let mut merged_values: Vec<OverlayValue> = Vec::with_capacity(values.len());
         let mut prev_end = 0usize;
-        for (end, value) in run_ends.into_iter().zip(values.into_iter()) {
+        for (end, value) in run_ends.into_iter().zip(values) {
             if end <= prev_end || end > len {
                 return None;
             }

@@ -112,7 +112,7 @@ mod tests {
 
         let f = ctx.context.get_function("", "RAND").unwrap();
         let fctx = ctx.function_context(None);
-        let args: Vec<ArgumentHandle<'_, '_>> = Vec::new();
+        let args: smallvec::SmallVec<[ArgumentHandle<'_, '_>; 4]> = smallvec::SmallVec::new();
         let result = f.dispatch(&args, &fctx).unwrap().into_literal();
         match result {
             LiteralValue::Number(n) => assert!((0.0..1.0).contains(&n)),
@@ -239,7 +239,9 @@ impl Function for RandBetweenFn {
                 .with_message("RANDBETWEEN: hi < lo".to_string()));
         }
         let mut rng = ctx.rng_for_current(self.function_salt());
-        let n = if (hi - lo) as u64 == u64::MAX {
+        // `hi >= lo`, so the difference as u64 is exact (wrapping only reinterprets
+        // the sign bit); it is `u64::MAX` only for the full i64 range.
+        let n = if hi.wrapping_sub(lo) as u64 == u64::MAX {
             lo
         } else {
             rng.gen_range(lo..=hi)

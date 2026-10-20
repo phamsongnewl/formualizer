@@ -37,6 +37,7 @@ pub(crate) mod result_finalization;
 pub mod row_visibility;
 pub mod scheduler;
 pub(crate) mod shape_memo;
+mod source_family;
 pub mod spill;
 mod target_preparation;
 #[doc(hidden)]
@@ -100,6 +101,8 @@ pub use formula_source::{
     SourceFamilyMembers, SourceFormulaFamily, SourceFormulaOrder, SourceRect,
 };
 pub use journal::{ActionJournal, ArrowOp, ArrowUndoBatch, GraphUndoBatch};
+#[doc(hidden)]
+pub use source_family::{SourceFamilyCounters, SourceFamilyMode, source_family_process_totals};
 #[allow(deprecated)]
 pub use target_preparation::PrepareTargetsOptions;
 // Use SoA implementation
@@ -570,12 +573,40 @@ impl<R: EvaluationContext> Engine<R> {
         {
             let record = FormulaIngestRecord::member(row, col, family.template, family.anchor);
             grouper.members += 1;
+            grouper.counters.parsed_members += 1;
             grouper.note(row0, col0, family);
             return record;
         }
         let ast_id = self.intern_formula_ast(ast);
         self.note_staged_formula(grouper, row, col, ast_id);
         FormulaIngestRecord::new(row, col, ast_id, formula_text)
+    }
+
+    /// How this engine stages formula text that may be a relocated copy of
+    /// a formula already parsed (see [`SourceFamilyMode`]).
+    #[doc(hidden)]
+    pub fn source_family_mode(&self) -> SourceFamilyMode {
+        self.source_family_mode
+    }
+
+    #[doc(hidden)]
+    pub fn set_source_family_mode(&mut self, mode: SourceFamilyMode) {
+        self.source_family_mode = mode;
+    }
+
+    /// Load-time staging counters accumulated by this engine.
+    #[doc(hidden)]
+    pub fn source_family_counters(&self) -> SourceFamilyCounters {
+        self.source_family_counters
+    }
+
+    /// Fold a finished sheet's staging counters into this engine's (and
+    /// the process') totals, and reset them.
+    #[doc(hidden)]
+    pub fn finish_family_grouper(&mut self, grouper: &mut FormulaFamilyGrouper) {
+        let counters = std::mem::take(&mut grouper.counters);
+        counters.publish();
+        self.source_family_counters.accumulate(&counters);
     }
 
     /// Record a formula interned without [`Self::stage_formula_ast`] (for
@@ -595,6 +626,7 @@ impl<R: EvaluationContext> Engine<R> {
                 template: ast_id,
                 anchor: (row0, col0),
                 rendered: None,
+                lexical: None,
             },
         );
     }
@@ -814,6 +846,28 @@ pub enum PreparationPolicy {
     BestEffort,
 }
 
+/// How the engine combines floating-point numbers where the order of
+/// operations changes the result: the reductions behind `SUM`, `AVERAGE` and
+/// the criteria sums, and Excel's own numeric adjustments.
+///
+/// Every other behaviour is the same under every profile, and results under a
+/// profile are the same on every platform, CPU and thread count.
+///
+/// Only [`NumericProfile::ExcelCompatible`] exists today. The enum is
+/// `#[non_exhaustive]` so that a faster profile can be added without a breaking
+/// change: one that sums in a fixed, documented block order that can be split
+/// across cores and vector lanes, and therefore differs from Excel in the last
+/// bits of some results. Each such difference will be listed on that variant.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum NumericProfile {
+    /// Excel's results, bit for bit where Excel's order is known: sums add
+    /// one value at a time into one running total, arguments left to right
+    /// and each range row by row. A single reduction runs on one core.
+    #[default]
+    ExcelCompatible,
+}
+
 /// Configuration for the evaluation engine
 #[derive(Debug, Clone)]
 pub struct EvalConfig {
@@ -981,6 +1035,9 @@ pub struct EvalConfig {
     /// the formula arena drops the unreachable trees. Formulas read back
     /// identically either way.
     pub formula_compression: bool,
+
+    /// How floating-point reductions are ordered (see [`NumericProfile`]).
+    pub numeric_profile: NumericProfile,
 }
 
 impl Default for EvalConfig {
@@ -1046,6 +1103,7 @@ impl Default for EvalConfig {
             family_kernels: true,
             family_lift: true,
             formula_compression: true,
+            numeric_profile: NumericProfile::ExcelCompatible,
         }
     }
 }

@@ -76,7 +76,7 @@ fn empty_schedule() -> Schedule {
 
 fn commit(e: &mut Engine<TestWorkbook>, vertex: VertexId, value: LiteralValue) {
     let redirtied = e.freshness_batch_redirtied(true, vertex);
-    for effect in e.plan_vertex_effects(vertex, value, None).unwrap() {
+    for effect in e.plan_vertex_effects(vertex, value).unwrap() {
         e.apply_effect(&effect, None, None).unwrap();
     }
     e.freshness_keep_redirtied(redirtied, vertex);
@@ -227,7 +227,7 @@ fn guarded_group_preflight_failure_is_retryable_end_to_end() {
         );
         e.fail_evaluation_commit_preflight_once_for_test();
         let err = e.evaluate_all_cancellable(CancelToken::new()).unwrap_err();
-        let ExcelErrorExtra::Resource { detail } = &err.extra else {
+        let ExcelErrorExtra::Resource { detail } = err.extra() else {
             panic!("expected injected preflight failure, got {err:?}");
         };
         assert_eq!(detail.reason, ResourceExhaustionReason::Deadline);

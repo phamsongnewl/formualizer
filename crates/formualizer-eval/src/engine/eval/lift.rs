@@ -17,6 +17,7 @@ use crate::format::FormatId;
 use crate::interpreter::shift_axis_for_offset as shift_axis;
 use crate::traits::CalcValue;
 use arrow_array::Array as _;
+use formualizer_parse::{BinaryOperator, UnaryOperator};
 
 /// Nodes of a compiled template (children precede parents).
 enum LiftNode {
@@ -29,11 +30,11 @@ enum LiftNode {
         col_abs: bool,
     },
     Unary {
-        op: &'static str,
+        op: UnaryOperator,
         child: usize,
     },
     Binary {
-        op: &'static str,
+        op: BinaryOperator,
         left: usize,
         right: usize,
     },
@@ -64,14 +65,14 @@ enum LiftNode {
 /// A function of `INVARIANT_FUNCTIONS` whose registered implementation is
 /// not volatile, dynamic, environment-binding or spilling.
 pub(super) fn pure_listed_function(
-    functions: &dyn crate::traits::FunctionProvider,
+    functions: &crate::interpreter::ResolvedFunctions,
     name: &str,
 ) -> bool {
     use crate::function::FnCaps;
     INVARIANT_FUNCTIONS
         .iter()
         .any(|f| f.eq_ignore_ascii_case(name))
-        && functions.get_function("", name).is_some_and(|fun| {
+        && functions.get_named(name).is_some_and(|fun| {
             !fun.caps().intersects(
                 FnCaps::VOLATILE
                     | FnCaps::DYNAMIC_DEPENDENCY
@@ -146,31 +147,28 @@ pub(super) struct LiftProgram {
 /// Programs larger than this are left to the walk (bounded compile work).
 const MAX_LIFT_NODES: usize = 256;
 
-fn static_binary(op: &str) -> Option<&'static str> {
-    Some(match op {
-        "+" => "+",
-        "-" => "-",
-        "*" => "*",
-        "/" => "/",
-        "^" => "^",
-        "&" => "&",
-        "=" => "=",
-        "<>" => "<>",
-        ">" => ">",
-        "<" => "<",
-        ">=" => ">=",
-        "<=" => "<=",
-        _ => return None,
-    })
+fn arithmetic_byte(op: BinaryOperator) -> Option<u8> {
+    match op {
+        BinaryOperator::Add => Some(b'+'),
+        BinaryOperator::Subtract => Some(b'-'),
+        BinaryOperator::Multiply => Some(b'*'),
+        BinaryOperator::Divide => Some(b'/'),
+        BinaryOperator::Power => Some(b'^'),
+        _ => None,
+    }
 }
 
-fn static_unary(op: &str) -> Option<&'static str> {
-    Some(match op {
-        "+" => "+",
-        "-" => "-",
-        "%" => "%",
-        _ => return None,
-    })
+fn static_binary(op: BinaryOperator) -> Option<BinaryOperator> {
+    match op {
+        BinaryOperator::Range | BinaryOperator::Union | BinaryOperator::Intersection => None,
+        _ => Some(op),
+    }
+}
+fn static_unary(op: UnaryOperator) -> Option<UnaryOperator> {
+    match op {
+        UnaryOperator::Plus | UnaryOperator::Minus | UnaryOperator::Percent => Some(op),
+        _ => None,
+    }
 }
 
 impl LiftProgram {
@@ -179,7 +177,7 @@ impl LiftProgram {
     /// the run (its second argument: the name is a call's direct argument,
     /// where a range is not intersected with the member).
     pub(super) fn compile(
-        functions: &dyn crate::traits::FunctionProvider,
+        functions: &crate::interpreter::ResolvedFunctions,
         ds: &DataStore,
         template: AstNodeId,
         names: &dyn Fn(&str, bool) -> bool,
@@ -206,13 +204,13 @@ impl LiftProgram {
     /// The maximal run-invariant calls strictly inside `root` (their value
     /// is one for the whole run; the walk can compute them once).
     pub(super) fn invariant_subtrees(
-        functions: &dyn crate::traits::FunctionProvider,
+        functions: &crate::interpreter::ResolvedFunctions,
         ds: &DataStore,
         root: AstNodeId,
         names: &dyn Fn(&str, bool) -> bool,
     ) -> Vec<AstNodeId> {
         fn visit(
-            functions: &dyn crate::traits::FunctionProvider,
+            functions: &crate::interpreter::ResolvedFunctions,
             ds: &DataStore,
             id: AstNodeId,
             is_root: bool,
@@ -248,7 +246,7 @@ impl LiftProgram {
 
     /// Whether `id` is a run-invariant expression (see `LiftNode::Invariant`).
     pub(super) fn invariant(
-        functions: &dyn crate::traits::FunctionProvider,
+        functions: &crate::interpreter::ResolvedFunctions,
         ds: &DataStore,
         id: AstNodeId,
         names: &dyn Fn(&str, bool) -> bool,
@@ -260,7 +258,7 @@ impl LiftProgram {
     /// an operator's operand it is implicitly intersected with the member's
     /// row or column.
     fn invariant_in(
-        functions: &dyn crate::traits::FunctionProvider,
+        functions: &crate::interpreter::ResolvedFunctions,
         ds: &DataStore,
         id: AstNodeId,
         as_arg: bool,
@@ -270,7 +268,7 @@ impl LiftProgram {
             Some(AstNodeData::Literal(vref)) => {
                 !matches!(ds.retrieve_value(*vref), LiteralValue::Array(_))
             }
-            Some(AstNodeData::Reference { ref_type, .. }) => match ref_type {
+            Some(AstNodeData::Reference { ref_type, .. }) => match ds.compact_ref(*ref_type) {
                 CompactRefType::Cell { row_abs, row, .. } => *row_abs && *row > 0,
                 CompactRefType::Range {
                     start_row,
@@ -308,7 +306,7 @@ impl LiftProgram {
 
     fn compile_node(
         &mut self,
-        functions: &dyn crate::traits::FunctionProvider,
+        functions: &crate::interpreter::ResolvedFunctions,
         ds: &DataStore,
         id: AstNodeId,
         names: &dyn Fn(&str, bool) -> bool,
@@ -316,7 +314,7 @@ impl LiftProgram {
         if self.nodes.len() >= MAX_LIFT_NODES {
             return None;
         }
-        let node = match ds.get_node(id)? {
+        let node = match &ds.expanded_node(id)? {
             AstNodeData::Literal(vref) => {
                 let value = ds.retrieve_value(*vref);
                 if matches!(value, LiteralValue::Array(_)) {
@@ -342,18 +340,18 @@ impl LiftProgram {
                 row_abs: *row_abs,
                 col_abs: *col_abs,
             },
-            AstNodeData::UnaryOp { op_id, expr_id } => {
-                let op = static_unary(ds.resolve_ast_string(*op_id))?;
+            AstNodeData::UnaryOp { operator, expr_id } => {
+                let op = static_unary(*operator)?;
                 let expr_id = *expr_id;
                 let child = self.compile_node(functions, ds, expr_id, names)?;
                 LiftNode::Unary { op, child }
             }
             AstNodeData::BinaryOp {
-                op_id,
+                operator,
                 left_id,
                 right_id,
             } => {
-                let op = static_binary(ds.resolve_ast_string(*op_id))?;
+                let op = static_binary(*operator)?;
                 let (left_id, right_id) = (*left_id, *right_id);
                 let left = self.compile_node(functions, ds, left_id, names)?;
                 let right = self.compile_node(functions, ds, right_id, names)?;
@@ -370,7 +368,7 @@ impl LiftProgram {
             AstNodeData::Function { name_id, .. } => {
                 // Only the built-in IF (an override keeps `family_kernel`
                 // `None`), with the arities its `eval` accepts.
-                let fun = functions.get_function("", ds.resolve_ast_string(*name_id))?;
+                let fun = functions.get(*name_id)?;
                 use crate::function::FamilyKernel as K;
                 let kernel = fun.family_kernel()?;
                 let args = ds.get_args(id)?;
@@ -456,19 +454,9 @@ where
         let raw = asheet
             .map(|a| a.get_cell_value(r0, c0))
             .filter(|v| !matches!(v, LiteralValue::Empty));
-        let value = match raw {
-            None => LiteralValue::Empty,
-            Some(raw) => {
-                let class = format.and_then(|id| self.format_registry.class(id));
-                Self::normalize_public_cell_read(Self::materialize_temporal_egress(
-                    raw,
-                    class,
-                    self.config.temporal_egress,
-                    self.config.date_system,
-                ))
-                .unwrap_or(LiteralValue::Empty)
-            }
-        };
+        // Formula evaluation consumes numeric serials plus a separate format
+        // annotation. Native temporal materialization belongs only at public egress.
+        let value = raw.unwrap_or(LiteralValue::Empty);
         (value, format)
     }
 
@@ -489,7 +477,8 @@ where
         let first =
             crate::reference::CellRef::new(run.sheet, Coord::new(run.row0, run.col, true, true));
         let interpreter =
-            crate::interpreter::Interpreter::new_with_cell(self, current_sheet, first);
+            crate::interpreter::Interpreter::new_with_cell(self, current_sheet, first)
+                .with_resolved_functions(&self.resolved_functions);
         // Each node is used once (the program is a tree): children's columns
         // are moved into their parent, and constants stay one value.
         let mut columns: Vec<Column> = Vec::with_capacity(program.nodes.len());
@@ -535,24 +524,24 @@ where
                     let apply = |operand: Lifted| {
                         let (value, format) = operand?;
                         interpreter
-                            .apply_unary_op(op, calc(value, format))
+                            .apply_unary_op(*op, calc(value, format))
                             .map(split)
                     };
                     match take(&mut columns, *child) {
                         Column::Const(v) => Column::Const(apply(v)),
-                        Column::Lane(lane) => Column::Lane(lane.unary(op, n, apply)),
+                        Column::Lane(lane) => Column::Lane(lane.unary(*op, n, apply)),
                     }
                 }
                 LiftNode::Binary { op, left, right } => {
                     let apply = |l: Lifted, r: Lifted| {
                         let (lv, lf) = l?;
                         let (rv, rf) = r?;
-                        interpreter.apply_binary_op(op, lv, lf, rv, rf).map(split)
+                        interpreter.apply_binary_op(*op, lv, lf, rv, rf).map(split)
                     };
                     let (l, r) = (take(&mut columns, *left), take(&mut columns, *right));
                     match (l, r) {
                         (Column::Const(l), Column::Const(r)) => Column::Const(apply(l, r)),
-                        (l, r) => Column::Lane(Lane::binary(op, l, r, n, apply)),
+                        (l, r) => Column::Lane(Lane::binary(*op, l, r, n, apply)),
                     }
                 }
                 // `IfFn::eval` through `dispatch` (SHORT_CIRCUIT: arity was
@@ -720,10 +709,12 @@ type Lifted = Result<(LiteralValue, Option<FormatId>), ExcelError>;
 /// above (`=A1+1` or `=C2+D1` filled down) evaluated member by member in
 /// row order through the compiled template, the member above coming from
 /// the previous result instead of a written cell. Only operators, literals
-/// and cell references; the one reference into the run's own column must
-/// be the cell directly above; a member result that is not a clean number
-/// (no format) stops the chain (the caller takes the per-cell path), so the
-/// carried value is exactly what reading the written cell would give.
+/// and cell references; a relative reference into the run's own column
+/// must be the cell directly above, and a fixed-row one must lie outside
+/// the run (it is read like any other cell); a member result that is not a
+/// clean number (no format) stops the chain (the caller takes the per-cell
+/// path), so the carried value is exactly what reading the written cell
+/// would give.
 impl<R> Engine<R>
 where
     R: EvaluationContext,
@@ -827,6 +818,14 @@ where
                     if !*row_abs {
                         shift_axis(*row, row_delta0 + n as i64 - 1, false).ok()?;
                     }
+                    // Every read outside the run, including a fixed cell in
+                    // the run's own column (`$B$4` above or below the run),
+                    // goes through the sheet's stored values.
+                    let asheet = self
+                        .arrow_sheets
+                        .sheets
+                        .iter()
+                        .position(|s| s.name.as_ref() == sheet_name);
                     if sheet_id == run.sheet && col == run.col + 1 {
                         if !*row_abs && first + 1 == first_row {
                             above = true;
@@ -834,7 +833,7 @@ where
                         } else if *row_abs && !(first_row..=last_row).contains(&first) {
                             Some(Source::Cell {
                                 sheet_id,
-                                asheet: None,
+                                asheet,
                                 row: first,
                                 row_abs: true,
                                 col,
@@ -844,11 +843,6 @@ where
                             return None;
                         }
                     } else {
-                        let asheet = self
-                            .arrow_sheets
-                            .sheets
-                            .iter()
-                            .position(|s| s.name.as_ref() == sheet_name);
                         Some(Source::Cell {
                             sheet_id,
                             asheet,
@@ -871,7 +865,8 @@ where
         let first =
             crate::reference::CellRef::new(run.sheet, Coord::new(run.row0, run.col, true, true));
         let interpreter =
-            crate::interpreter::Interpreter::new_with_cell(self, current_sheet, first);
+            crate::interpreter::Interpreter::new_with_cell(self, current_sheet, first)
+                .with_resolved_functions(&self.resolved_functions);
         let read = |sheet_id: SheetId, asheet: Option<usize>, row: u32, col: u32| -> Lifted {
             let asheet = asheet.and_then(|i| self.arrow_sheets.sheets.get(i));
             Ok(self.read_cell_formatted_in(sheet_id, asheet, row, col))
@@ -935,31 +930,38 @@ where
                     }
                     (LiftNode::Unary { op, child }, None) => {
                         let operand = std::mem::replace(&mut values[*child], V::Num(0.0));
-                        match (operand, op.as_bytes()) {
-                            (V::Num(x), [b @ (b'-' | b'%')]) => {
-                                match crate::interpreter::unary_f64(*b, x) {
+                        match (operand, *op) {
+                            (V::Num(x), op @ (UnaryOperator::Minus | UnaryOperator::Percent)) => {
+                                match crate::interpreter::unary_f64(
+                                    if op == UnaryOperator::Minus {
+                                        b'-'
+                                    } else {
+                                        b'%'
+                                    },
+                                    x,
+                                ) {
                                     Ok(v) => V::Num(v),
                                     Err(e) => V::Boxed(Err(e)),
                                 }
                             }
                             (operand, _) => typed(boxed(operand).and_then(|(v, f)| {
-                                interpreter.apply_unary_op(op, calc(v, f)).map(split)
+                                interpreter.apply_unary_op(*op, calc(v, f)).map(split)
                             })),
                         }
                     }
                     (LiftNode::Binary { op, left, right }, None) => {
                         let l = std::mem::replace(&mut values[*left], V::Num(0.0));
                         let r = std::mem::replace(&mut values[*right], V::Num(0.0));
-                        match (l, r, op.as_bytes()) {
-                            (V::Num(a), V::Num(b), [o @ (b'+' | b'-' | b'*' | b'/' | b'^')]) => {
-                                match crate::interpreter::arith_f64(*o, a, b) {
+                        match (l, r, arithmetic_byte(*op)) {
+                            (V::Num(a), V::Num(b), Some(o)) => {
+                                match crate::interpreter::arith_f64(o, a, b) {
                                     Ok(v) => V::Num(v),
                                     Err(e) => V::Boxed(Err(e)),
                                 }
                             }
                             (l, r, _) => typed(match (boxed(l), boxed(r)) {
                                 (Ok((lv, lf)), Ok((rv, rf))) => {
-                                    interpreter.apply_binary_op(op, lv, lf, rv, rf).map(split)
+                                    interpreter.apply_binary_op(*op, lv, lf, rv, rf).map(split)
                                 }
                                 (Err(e), _) | (_, Err(e)) => Err(e),
                             }),
@@ -1102,7 +1104,7 @@ impl Lane {
         }
     }
 
-    fn unary(self, op: &'static str, n: usize, apply: impl Fn(Lifted) -> Lifted) -> Lane {
+    fn unary(self, op: UnaryOperator, n: usize, apply: impl Fn(Lifted) -> Lifted) -> Lane {
         let column = Column::Lane(self);
         let mut out = Lane::with_len(LaneKind::Num, n);
         let mut cur = Cursor::new(&column);
@@ -1110,15 +1112,19 @@ impl Lane {
             match (cur.get(i), op) {
                 // `+` is a pass-through; `-` and `%` coerce (a number is
                 // itself) and sanitize, as `eval_unary_scalar`.
-                (Elem::Num(x), "+") => out.vals[i] = x,
-                (Elem::Num(x), "-") => match crate::interpreter::unary_f64(b'-', x) {
-                    Ok(v) => out.vals[i] = v,
-                    Err(e) => out.put(i, Ok((LiteralValue::Error(e), None))),
-                },
-                (Elem::Num(x), "%") => match crate::interpreter::unary_f64(b'%', x) {
-                    Ok(v) => out.vals[i] = v,
-                    Err(e) => out.put(i, Ok((LiteralValue::Error(e), None))),
-                },
+                (Elem::Num(x), UnaryOperator::Plus) => out.vals[i] = x,
+                (Elem::Num(x), UnaryOperator::Minus) => {
+                    match crate::interpreter::unary_f64(b'-', x) {
+                        Ok(v) => out.vals[i] = v,
+                        Err(e) => out.put(i, Ok((LiteralValue::Error(e), None))),
+                    }
+                }
+                (Elem::Num(x), UnaryOperator::Percent) => {
+                    match crate::interpreter::unary_f64(b'%', x) {
+                        Ok(v) => out.vals[i] = v,
+                        Err(e) => out.put(i, Ok((LiteralValue::Error(e), None))),
+                    }
+                }
                 (Elem::Walk, _) => out.walk.push(i as u32),
                 (e, _) => out.put(i, apply(e.lifted())),
             }
@@ -1130,21 +1136,29 @@ impl Lane {
     /// (`arith_f64`, `cmp_f64`, the scalar path's own functions); anything
     /// else goes through `apply` (the scalar operator).
     fn binary(
-        op: &'static str,
+        op: BinaryOperator,
         l: Column,
         r: Column,
         n: usize,
         apply: impl Fn(Lifted, Lifted) -> Lifted,
     ) -> Lane {
         let arith = match op {
-            "+" => Some(b'+'),
-            "-" => Some(b'-'),
-            "*" => Some(b'*'),
-            "/" => Some(b'/'),
-            "^" => Some(b'^'),
+            BinaryOperator::Add => Some(b'+'),
+            BinaryOperator::Subtract => Some(b'-'),
+            BinaryOperator::Multiply => Some(b'*'),
+            BinaryOperator::Divide => Some(b'/'),
+            BinaryOperator::Power => Some(b'^'),
             _ => None,
         };
-        let compare = matches!(op, "=" | "<>" | ">" | "<" | ">=" | "<=");
+        let compare = matches!(
+            op,
+            BinaryOperator::Equal
+                | BinaryOperator::NotEqual
+                | BinaryOperator::Greater
+                | BinaryOperator::Less
+                | BinaryOperator::GreaterEqual
+                | BinaryOperator::LessEqual
+        );
         let kind = if compare {
             LaneKind::Bool
         } else {
@@ -1412,18 +1426,19 @@ impl Lane {
                     }
                 }
                 // `YEAR`/`MONTH`/`DAY` of a clean number: the serial's
-                // date in the workbook's system, an integer result (boxed:
-                // the builtin returns `Int`); a serial off the calendar is
-                // left to the walk.
+                // displayed date in the workbook's system (serial 0 is
+                // January 0, 1900; 60 is February 29, 1900), an integer
+                // result (boxed: the builtin returns `Int`); a serial off
+                // the calendar is left to the walk.
                 K::Year | K::Month | K::Day => {
                     if let Some(x) = num(&elems[0])
-                        && let Ok(date) = formualizer_common::try_serial_to_date_for(date_system, x)
+                        && let Ok(date) =
+                            formualizer_common::try_serial_to_display_date_parts_for(date_system, x)
                     {
-                        use chrono::Datelike;
                         let part = match kernel {
-                            K::Year => i64::from(date.year()),
-                            K::Month => i64::from(date.month()),
-                            _ => i64::from(date.day()),
+                            K::Year => i64::from(date.year),
+                            K::Month => i64::from(date.month),
+                            _ => i64::from(date.day),
                         };
                         out.boxed
                             .push((i as u32, Ok((LiteralValue::Int(part), None))));

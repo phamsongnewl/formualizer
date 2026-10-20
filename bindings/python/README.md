@@ -20,7 +20,7 @@ Load Excel workbooks, change inputs, recalculate and read results—in-process, 
 - **Built for agents.** Inspect dependencies, track edits with undo/redo, inject a clock and random seed, and expose typed inputs and outputs through SheetPort.
 - **Portable.** Native wheels for Linux, macOS and Windows, plus a separate [Pyodide build](#using-in-pyodide-browser--webassembly). The same engine also ships for [Rust and JavaScript](https://github.com/psu3d0/formualizer#bindings).
 
-Need CLI or MCP tools for an agent rather than an embedded library? Use [agent-spreadsheet](https://github.com/PSU3D0/agent-spreadsheet), built on Formualizer.
+Need broader workbook editing CLI or MCP tools? Use [agent-spreadsheet](https://github.com/PSU3D0/agent-spreadsheet), built on Formualizer.
 
 ## Installation
 
@@ -30,10 +30,65 @@ pip install formualizer
 
 Prebuilt stable-ABI (`abi3`) wheels are published for Python 3.10 and newer on Linux (glibc and musl), macOS, and Windows. No Rust toolchain required.
 
+## Command line
+
+Native wheels include the `formualizer` command, which recalculates the cached formula values in an `.xlsx` after another tool has edited it:
+
+```bash
+uvx formualizer recalc book.xlsx                  # run without installing
+formualizer recalc book.xlsx --check --json       # after pip install formualizer
+python -m formualizer recalc book.xlsx --json     # same CLI through the module
+```
+
+The CLI updates formula caches in place (or writes `-o other.xlsx`), preserving formula text and the rest of the workbook. Exit codes: 0 done, 1 error, 2 refused (unsupported workbook, nothing written), 3 `--check` found stale caches, 64 usage error, 130 interrupted. See the [CLI reference](https://github.com/psu3d0/formualizer/blob/main/docs/cli.md). The CLI is not available in Pyodide; `recalculate_xlsx_bytes` is.
+
+The same recalculation is available in-process:
+
+```python
+import formualizer as fz
+
+result = fz.recalculate_xlsx_file("book.xlsx")  # in place
+result = fz.recalculate_xlsx_file("book.xlsx", output="calculated.xlsx")
+print(result["summary"]["status"], result["cache_cells_changed"])
+```
+
+A refusal raises `RuntimeError("Unsupported feature: ... in ...")` and writes nothing. The CLI's `--json` output carries the same refusal as structured `feature`/`context` fields, which is easier for agents to branch on.
+
+## For agents: edit with openpyxl, then recalc
+
+openpyxl writes formulas but does not calculate them, and saving drops the cached values that `data_only=True` readers (and pandas) see. Recalc after the last save:
+
+```python
+import json, subprocess, sys
+from openpyxl import load_workbook
+
+wb = load_workbook("book.xlsx")
+wb.active["A1"] = 100  # edit inputs or formulas
+wb.save("book.xlsx")
+
+p = subprocess.run(
+    [sys.executable, "-m", "formualizer", "recalc", "book.xlsx", "--json"],
+    capture_output=True,
+    text=True,
+)
+r = json.loads(p.stdout)
+if p.returncode == 2:
+    raise SystemExit(f"refused, do not retry: {r['refusal']}")
+if p.returncode != 0:
+    raise SystemExit(r["message"])
+print(r["status"], r["error_cells"], r["errors"])  # inspect formula errors
+
+# Read the result; do not save again, or the caches are lost.
+print(load_workbook("book.xlsx", data_only=True).active["B1"].value)
+```
+
+If `errors` lists unexpected cells, fix inputs or formulas, save and recalc again. Never save the `data_only=True` view: it would replace formulas with values. See the [agent workflow guide](https://github.com/psu3d0/formualizer/blob/main/docs/agents.md) and [portable skill](https://github.com/psu3d0/formualizer/blob/main/skills/formualizer-recalc/SKILL.md).
+
 ## Documentation
 
 Full documentation at **[formualizer.dev](https://www.formualizer.dev/docs)**:
 
+- [Recalc CLI](https://www.formualizer.dev/docs/recalc-cli) — recalculate `.xlsx` caches after openpyxl edits
 - [Python Quickstart](https://www.formualizer.dev/docs/quickstarts/python-quickstart)
 - [Python API Reference](https://www.formualizer.dev/docs/reference/python-api-map)
 - [Function Reference](https://www.formualizer.dev/docs/reference/functions) — 400+ built-in functions
@@ -91,7 +146,7 @@ print(wb.evaluate_cell("Summary", 1, 2))
 out = wb.to_xlsx_bytes()
 ```
 
-Native Python builds use `calamine` by default for both path-based and byte-oriented XLSX loading. Pyodide currently defaults to `umya`, which also remains available explicitly on native builds. XLSX byte export uses `umya` because Calamine is read-only.
+Native Python builds use `calamine` by default for both path-based and byte-oriented XLSX loading. Pyodide defaults to `umya` for byte loading and accepts `backend="calamine"` explicitly; `umya` also remains available explicitly on native builds. XLSX byte export uses `umya` because Calamine is read-only.
 
 ### Recalculate XLSX cached values (writeback)
 
@@ -120,11 +175,80 @@ print(result["summary"]["status"], result["cache_cells_changed"])
 
 # The file API snapshots input and atomically replaces the destination on success.
 result = fz.recalculate_xlsx_file("model.xlsx", output="model.recalc.xlsx")
+
+# Reproducible TODAY/NOW and RAND, as with the CLI's --now/--tz/--seed:
+from datetime import datetime, timezone
+
+result = fz.recalculate_xlsx_file(
+    "model.xlsx",
+    output="model.recalc.xlsx",
+    rng_seed=7,
+    deterministic_timestamp_utc=datetime(2026, 1, 31, 9, tzinfo=timezone.utc),
+    deterministic_timezone="+01:00",  # default UTC
+)
+print(result["clock"], result["seed"])  # what the run used, for replay
 ```
+
+`RAND` is reproducible by default. Without `deterministic_timestamp_utc`,
+`TODAY`/`NOW` use host local time; `result["clock"]["now"]` is the aware
+`datetime` they saw.
 
 These APIs use the shared cache-only Rust implementation, retaining formula text
 and unrelated package members. Safe core resource limits apply;
 `error_location_limit=` only caps retained error locations.
+
+Calls to functions the engine does not implement (add-ins such as `_xll.EURO`,
+VBA/macro functions) are written as `#NAME?`, not refused. The summary says why:
+
+```python
+name = result["summary"].get("error_summary", {}).get("#NAME?")
+if name:
+    for location, message in zip(name["locations"], name["messages"]):
+        print(location, message)  # Sheet1!C4 Unknown function: _xll.EURO
+print(result["summary"]["unknown_functions"])  # [{"name": "_xll.EURO", "cells": 1}]
+```
+
+`messages` is parallel to `locations` (`None` when a cell has no reason of its
+own, e.g. an inherited `#NAME?`); `unknown_functions` is complete regardless of
+`error_location_limit`. Numeric caches within one unit in the 15th significant
+digit of the computed value are left untouched.
+
+In Pyodide, `recalculate_xlsx_bytes` is available (not `recalculate_xlsx_file`
+or the CLI). Pyodide has no system clock, so workbooks using `TODAY`/`NOW` are
+refused unless `deterministic_timestamp_utc` is passed.
+
+Supported inputs include ordinary/shared scalar formulas, supported calculation
+names, new multi-cell spills from ordinary non-shared formulas, and existing
+XLDAPR dynamic-array anchors with validated `cm`/array-`ref` metadata. Spills can
+grow, shrink, collapse or become blocked; `A1#` and `_xlfn.ANCHORARRAY(A1)` read
+the current spill. Source-declared children are generated caches, not independent
+inputs: even externally edited child values are recalculated while their source
+ownership remains declared. Obsolete caches are cleared, keeping styled shells.
+
+`formula_cells` and `summary["evaluated"]` count source formulas/anchors, not
+children. `cache_cells_changed` counts physical caches inserted, replaced or
+cleared (including children), so it can exceed the formula count.
+`worksheet_parts_changed` counts worksheets only, not metadata/relationships.
+`external_links` (`{"links_used": n, "refreshed": False, "policy": "cached"}`)
+is present only when formulas read external workbook links; their values come
+from the cache Excel stored in the workbook and are never refreshed. Pass
+`external_links="refuse"` (default `"cached"`, like the CLI's `--external-links`)
+to raise `OSError` instead when any formula reads a link value; the policy is
+decided after calculation and nothing is written. Workbooks whose links nothing
+reads still recalculate. Other values raise `ValueError`.
+Deterministic unchanged outputs recalculate to byte-identical no-ops.
+
+Legacy fixed-extent (CSE) arrays, elementwise `IF`, Excel tables within a
+validated subset, volatile functions and external links (read from the values
+cached in the workbook, never refreshed) are recalculated too. Data tables,
+unservable external references, rich/unknown or malformed metadata, hidden-row `SUBTOTAL`/`AGGREGATE`
+ranges, circular references, shared-family multi-cell spills and spill
+publication across merges are refused. Configured ZIP/XML/cell/output bounds
+still apply. Fresh unmarked 1x1 results have no spill identity (`A1#` returns
+`#REF!`); this is not a claim of Excel equivalence and no Excel execution oracle
+was used. See [the precise eligibility and publication contract](https://github.com/psu3d0/formualizer/blob/main/docs/cache-only-xlsx.md).
+The file API preserves existing destination permissions and leaves it untouched
+on pre-publication failure; omitted `output` recalculates in place.
 
 ### Parse and analyze formulas
 
@@ -153,7 +277,7 @@ print(collect_function_names(ast))  # ['SUMIFS']
 | **Batch operations** | `set_values_batch` / `set_formulas_batch` for efficient bulk updates |
 | **Undo / redo** | Optional changelog with automatic action grouping — single edits are individually undoable |
 | **Evaluation planning** | Inspect the dependency graph and evaluation schedule before computing |
-| **SheetPort** | Treat spreadsheets as typed functions with YAML manifests, schema validation, and batch scenarios |
+| **SheetPort** | Treat spreadsheets as typed functions: manifests built in code or YAML, schema validation, and batch scenarios |
 | **Deterministic mode** | Inject clock, timezone, and RNG seed for reproducible evaluation |
 | **Visitor utilities** | `walk_ast`, `collect_references`, `collect_function_names` for ergonomic tree traversal |
 | **Rich errors** | Typed `TokenizerError` / `ParserError` / `ExcelEvaluationError` with position info |
@@ -269,44 +393,88 @@ wb.get_eval_plan([("Sheet1", 1, 2)], build_graph_if_needed=False)
 
 ## SheetPort: spreadsheets as typed APIs
 
-Define a YAML manifest to treat a spreadsheet as a typed function with validated inputs/outputs:
+SheetPort turns a workbook into a function. A manifest names its input and output cells with their types and constraints; a session writes validated inputs, recalculates and returns typed outputs. Build the manifest with `formualizer.sheetport`, pass a plain `dict` with the same structure, or load it from YAML.
 
+<!-- example: bindings/python/examples/sheetport_quickstart.py#readme -->
 ```python
-from formualizer import SheetPortSession, Workbook
+import formualizer as fz
+from formualizer.sheetport import Input, Manifest, Output
 
-manifest_yaml = """
-spec: fio
-spec_version: "0.3.0"
-manifest:
-  id: pricing-model
-  name: Pricing Model
-  workbook:
-    uri: memory://pricing.xlsx
-    locale: en-US
-    date_system: 1900
-ports:
-  - id: base_price
-    dir: in
-    shape: scalar
-    location: { a1: Inputs!A1 }
-    schema: { type: number }
-  - id: final_price
-    dir: out
-    shape: scalar
-    location: { a1: Outputs!A1 }
-    schema: { type: number }
-"""
+# The model: B4 computes the monthly payment from B1:B3.
+wb = fz.Workbook()  # or fz.load_workbook("loan.xlsx")
+wb.add_sheet("Calculator")
+wb.set_formula("Calculator", 4, 2, "=PMT(B2/12, B3, -B1)")
 
-wb = Workbook()
-wb.add_sheet("Inputs")
-wb.add_sheet("Outputs")
-wb.set_formula("Outputs", 1, 1, "=Inputs!A1*1.2")
+manifest = Manifest(
+    "loan-calculator",
+    name="Loan calculator",
+    ports=[
+        Input("principal", "Calculator!B1", type="number", constraints={"min": 0}),
+        Input("rate", "Calculator!B2", type="number"),
+        Input("term_months", "Calculator!B3", type="integer"),
+        Output("monthly_payment", "Calculator!B4", type="number"),
+    ],
+)
 
-session = SheetPortSession.from_manifest_yaml(manifest_yaml, wb)
-session.write_inputs({"base_price": 100.0})
-result = session.evaluate_once(freeze_volatile=True)
-print(result["final_price"])  # 120.0
+session = fz.SheetPortSession(wb, manifest)
+session.write_inputs({"principal": 250_000, "rate": 0.045, "term_months": 360})
+outputs = session.evaluate_once(freeze_volatile=True)
+print(outputs["monthly_payment"])  # 1266.71...
 ```
+
+A rejected update raises `SheetPortConstraintError` and writes nothing. `Input` and `Output` take the port id and a location: a string is an A1 reference, `name("Rate")` selects a defined name and `layout(...)` the rows under a header. `type=` declares a single cell; `schema=range_of(...)`, `record_of(...)` or `table_of(...)` declares a larger shape.
+
+A table port reads and writes a list of rows:
+
+<!-- example: bindings/python/examples/sheetport_orders.py#readme -->
+```python
+import formualizer as fz
+from formualizer.sheetport import Input, Manifest, Output, column, layout, table_of
+
+wb = fz.Workbook()
+wb.add_sheet("Orders")
+for col, header in enumerate(["sku", "quantity", "unit_price"], start=1):
+    wb.set_value("Orders", 1, col, header)
+wb.set_formula("Orders", 1, 6, "=SUMPRODUCT(B2:B1000, C2:C1000)")  # F1: order total
+
+manifest = Manifest(
+    "order-total",
+    ports=[
+        Input(
+            "lines",
+            # Rows below the header in A1, until the first blank row.
+            layout(
+                sheet="Orders",
+                header_row=1,
+                anchor_col="A",
+                terminate="first_blank_row",
+            ),
+            schema=table_of(
+                columns=[
+                    column("sku", "string"),
+                    column("quantity", "integer"),
+                    column("unit_price", "number"),
+                ],
+                keys=["sku"],
+            ),
+        ),
+        Output("total", "Orders!F1", type="number"),
+    ],
+)
+
+session = fz.SheetPortSession(wb, manifest)
+session.write_inputs(
+    {
+        "lines": [
+            {"sku": "A-100", "quantity": 3, "unit_price": 12.5},
+            {"sku": "B-200", "quantity": 1, "unit_price": 40.0},
+        ]
+    }
+)
+print(session.evaluate_once()["total"])  # 77.5
+```
+
+To ship the manifest as a file instead, write it once with `manifest.to_yaml()` and load it with `SheetPortSession.from_manifest_yaml(text, wb)`, or `SheetPortSession.from_manifest_path(manifest_path, workbook_path)` to open both files. The [manifest format](https://www.formualizer.dev/docs/sheetport/manifest-format) documents every field.
 
 ---
 
@@ -320,8 +488,8 @@ parse(formula: str, dialect: FormulaDialect = None) -> ASTNode
 load_workbook(path: str, strategy: str = None, *, path_source: XlsxPathSource | None = None, span_evaluation: bool | None = None) -> Workbook
 load_workbook_bytes(data: bytes, strategy: str = None, backend: str | None = None, *, span_evaluation: bool | None = None) -> Workbook
 recalculate_file(path: str, output: str | None = None) -> dict
-recalculate_xlsx_bytes(data: bytes, *, error_location_limit: int | None = None) -> dict
-recalculate_xlsx_file(path: str, output: str | None = None, *, error_location_limit: int | None = None) -> dict
+recalculate_xlsx_bytes(data: bytes, *, error_location_limit: int | None = None, rng_seed: int | None = None, deterministic_timestamp_utc: datetime | None = None, deterministic_timezone: str | int | None = None, external_links: str = "cached") -> dict
+recalculate_xlsx_file(path: str, output: str | None = None, *, error_location_limit: int | None = None, rng_seed: int | None = None, deterministic_timestamp_utc: datetime | None = None, deterministic_timezone: str | int | None = None, external_links: str = "cached") -> dict
 ```
 
 ### Core classes
@@ -332,7 +500,8 @@ recalculate_xlsx_file(path: str, output: str | None = None, *, error_location_li
 - **`Tokenizer`** — iterable token sequence with `.render()` and `.tokens`.
 - **`ASTNode`** — `.pretty()`, `.to_formula()`, `.fingerprint()`, `.children()`, `.walk_refs()`.
 - **`CellRef` / `RangeRef` / `TableRef` / `NamedRangeRef`** — typed references.
-- **`SheetPortSession`** — bind manifests to workbooks, read/write typed ports, evaluate.
+- **`SheetPortSession`** — `SheetPortSession(workbook, manifest)` binds a manifest to a workbook; read/write typed ports, evaluate. Also `from_manifest_yaml` and `from_manifest_path`.
+- **`formualizer.sheetport`** — `Manifest`, `Input`, `Output` and location/schema helpers for building manifests in code.
 - **`EvaluationConfig`** — tune parallel evaluation, warmup, range limits, date systems.
 
 ### Visitor helpers (`formualizer.visitor`)
@@ -350,7 +519,7 @@ Full type stubs are included in the package (`.pyi` files) for IDE autocompletio
 
 ## Building from source
 
-Requires Rust 1.93.0 (the pinned release toolchain; edition 2024) and [maturin](https://github.com/PyO3/maturin):
+Requires Rust 1.99.0 (the pinned release toolchain; edition 2024) and [maturin](https://github.com/PyO3/maturin):
 
 ```bash
 pip install maturin
@@ -379,11 +548,12 @@ wb.set_formula("Sheet1", 1, 2, "=SUM(A1:A2)")
 wb.evaluate_cell("Sheet1", 1, 2)  # -> 42.0
 ```
 
-**Tested Pyodide target:** CI and release smoke tests use Pyodide 0.29.3 and the wheel's derived ABI (currently `pyodide_2025_0`). Rebuild and smoke-test a wheel when targeting another runtime; no persistent public wheel URL is promised.
+**Tested Pyodide target:** CI and release smoke tests use Pyodide 314.0.7 (Python 3.14) and the wheel's derived platform tag (currently `pyemscripten_2026_0_wasm32`). Wheels for this ABI do not install in Pyodide 0.29.x (`pyodide_2025_0`). Rebuild and smoke-test a wheel when targeting another runtime; no persistent public wheel URL is promised.
 
 **Pyodide-specific behavior:**
 - `EvaluationConfig()` and `Workbook()` default `enable_parallel = False` on `sys.platform == "emscripten"` (Pyodide has no threads). You can still opt in, but it falls back to single-threaded execution.
-- Native XLSX byte loading (`Workbook.from_bytes`, `load_workbook_bytes`) defaults to `calamine`; Pyodide defaults to `umya`. XLSX byte export uses `umya` on all platforms.
+- Native XLSX byte loading (`Workbook.from_bytes`, `load_workbook_bytes`) defaults to `calamine`; Pyodide defaults to `umya` and accepts `backend="calamine"`. XLSX byte export uses `umya` on all platforms.
+- Source-preserving recalculation is available as `recalculate_xlsx_bytes` (the CLI and `recalculate_xlsx_file` are not). There is no system clock: workbooks using `TODAY`/`NOW` are refused unless `deterministic_timestamp_utc` is passed, and `result["clock"]["now"]` is `None` otherwise.
 - Python UDFs registered via `Workbook.register_function` work identically to native; single-cell refs arrive as scalars (Excel-native semantics).
 
 ### Building a Pyodide wheel from source
@@ -392,10 +562,10 @@ For local development or targeting a Pyodide version without a retained Actions 
 
 ```bash
 ./scripts/build-pyodide-wheel.sh
-./scripts/smoke-pyodide-wheel.sh dist/pyodide/*-pyodide_*_wasm32.whl
+./scripts/smoke-pyodide-wheel.sh dist/pyodide/*_wasm32.whl
 ```
 
-The build script defaults to xbuildenv Pyodide 0.29.3, derives Python, ABI, Emscripten, and Rust toolchain values from `pyodide config`, installs Pyodide's custom wasm-EH Rust sysroot over the stock rustup target, and retags the output wheel to the platform tag Pyodide's `micropip` expects. `pyodide-cli` and `pyodide-build` are resolved through `uvx` and are not pinned by the script.
+The build script defaults to xbuildenv Pyodide 314.0.7, derives Python, ABI, Emscripten, and Rust toolchain values from `pyodide config`, installs that Rust toolchain's `wasm32-unknown-emscripten` target (or, for an xbuildenv that names one, Pyodide's custom wasm-EH sysroot), and tags the output wheel with the platform tag Pyodide's `micropip` expects. `pyodide-cli` and `pyodide-build` are resolved through `uvx` and are not pinned by the script.
 
 ## Testing
 

@@ -1,4 +1,8 @@
 #[cfg(test)]
+#[expect(
+    clippy::string_slice,
+    reason = "tests slice formulas at spans the tokenizer produced"
+)]
 mod tests {
     use crate::FormulaDialect;
     use crate::tokenizer::{
@@ -2155,7 +2159,7 @@ mod tests {
             let ast = parse(formula).expect("intersection parse");
             assert!(matches!(
                 ast.node_type,
-                ASTNodeType::BinaryOp { ref op, .. } if op == " "
+                ASTNodeType::BinaryOp { ref op, .. } if op.as_str() == " "
             ));
         }
 

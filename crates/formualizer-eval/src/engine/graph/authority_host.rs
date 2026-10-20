@@ -392,7 +392,13 @@ impl DependencyGraph {
         if self.first_load_assume_new {
             return;
         }
+        // Every formula write, whatever the route, is in the touched
+        // journal: a formula that entered a committed spill blocks it.
+        let woken = self.note_spill_intrusions_of_touched();
         self.authority_sync_store();
+        if !woken.is_empty() {
+            self.mark_dirty_many(&woken);
+        }
         if !self.authority.pending_dirty.is_empty()
             || !self.authority.pending_dirty_rects.is_empty()
             || !self.authority.pending_direct_dirty.is_empty()
@@ -521,6 +527,8 @@ impl DependencyGraph {
     }
 
     fn authority_note_structural_inner(&mut self, op: bool) {
+        // Moved formulas may land in a committed spill.
+        self.note_structural_spill_intrusions();
         if self.authority.structural_pending {
             if !op {
                 return;
@@ -2189,6 +2197,7 @@ fn formula_texts_rendered(
                 original_id,
                 ref_type,
             } => {
+                let ref_type = ds.compact_ref(*ref_type);
                 let text = ds.resolve_ast_string(*original_id);
                 let ok = reference_text_rendered(ds, reg, text, ref_type, prefixes);
                 if !ok {
@@ -2239,6 +2248,7 @@ pub(crate) fn template_rendered_refs(
                 original_id,
                 ref_type,
             } => {
+                let ref_type = ds.compact_ref(*ref_type);
                 let text = ds.resolve_ast_string(*original_id);
                 let rendered = reference_text_rendered(ds, reg, text, ref_type, &mut prefixes);
                 debug_assert_eq!(
@@ -2324,10 +2334,12 @@ fn ast_equal_relocated(
                     ref_type: rb,
                 },
             ) => {
+                let rb = ds.compact_ref(*rb);
                 let Some(&rerender) = rendered.get(ref_index) else {
                     return false;
                 };
                 ref_index += 1;
+                let ra = ds.compact_ref(*ra);
                 if let R::NamedRange(_) = rb {
                     if ra != rb || oa != ob {
                         return false;
@@ -2365,11 +2377,11 @@ fn ast_equal_relocated(
             }
             (
                 N::UnaryOp {
-                    op_id: oa,
+                    operator: oa,
                     expr_id: ea,
                 },
                 N::UnaryOp {
-                    op_id: ob,
+                    operator: ob,
                     expr_id: eb,
                 },
             ) => {
@@ -2380,12 +2392,12 @@ fn ast_equal_relocated(
             }
             (
                 N::BinaryOp {
-                    op_id: oa,
+                    operator: oa,
                     left_id: la,
                     right_id: ra,
                 },
                 N::BinaryOp {
-                    op_id: ob,
+                    operator: ob,
                     left_id: lb,
                     right_id: rb,
                 },
@@ -2565,6 +2577,7 @@ pub(crate) fn parsed_equal_relocated<'a>(
                     ref_type: rb,
                 },
             ) => {
+                let rb = ds.compact_ref(*rb);
                 let Some(&rerender) = rendered.get(ref_index) else {
                     return false;
                 };
@@ -2629,6 +2642,20 @@ pub(crate) fn parsed_equal_relocated<'a>(
                 if relocate_compact_ref(rb, dr, dc) != Some(ra) {
                     return false;
                 }
+                // A copy whose range ends cross (`A25:A$24`) has no
+                // rectangle to place as a member; it stays a formula of
+                // its own.
+                if let R::Range {
+                    start_row,
+                    start_col,
+                    end_row,
+                    end_col,
+                    ..
+                } = &ra
+                    && (start_row > end_row || start_col > end_col)
+                {
+                    return false;
+                }
                 let own_text = original.as_str();
                 let text_ok = if rerender {
                     match (coords_rendering(rb), coords_rendering(&ra)) {
@@ -2650,8 +2677,8 @@ pub(crate) fn parsed_equal_relocated<'a>(
                     return false;
                 }
             }
-            (P::UnaryOp { op, expr }, N::UnaryOp { op_id, expr_id }) => {
-                if op.as_str() != ds.resolve_ast_string(*op_id) {
+            (P::UnaryOp { op, expr }, N::UnaryOp { operator, expr_id }) => {
+                if op != operator {
                     return false;
                 }
                 stack.push((expr, *expr_id));
@@ -2659,12 +2686,12 @@ pub(crate) fn parsed_equal_relocated<'a>(
             (
                 P::BinaryOp { op, left, right },
                 N::BinaryOp {
-                    op_id,
+                    operator,
                     left_id,
                     right_id,
                 },
             ) => {
-                if op.as_str() != ds.resolve_ast_string(*op_id) {
+                if op != operator {
                     return false;
                 }
                 stack.push((left, *left_id));
@@ -2727,6 +2754,61 @@ impl DependencyGraph {
             return Some(family.clone());
         }
         None
+    }
+
+    /// Whether `template` (anchored at 0-based `anchor`) certifies as a
+    /// relocation template: no structural rewrite, and every reference
+    /// text is its reference's rendering, so a member re-renders each one.
+    pub(crate) fn template_renders_all_refs(&self, template: AstNodeId) -> bool {
+        !self.data_store.ast_needs_structural_rewrite(template)
+            && template_rendered_refs(&self.data_store, &self.sheet_reg, template)
+                .iter()
+                .all(|r| *r)
+    }
+
+    /// The family oracle: whether the independently parsed `own` formula
+    /// of the cell at 0-based `(row0, col0)` is exactly `template` (valid
+    /// at `anchor`) instantiated there, by the comparator load-time
+    /// grouping uses and by instantiating the member and comparing the
+    /// interned trees.
+    pub(crate) fn relocated_member_oracle(
+        &self,
+        template: AstNodeId,
+        anchor: (u32, u32),
+        row0: u32,
+        col0: u32,
+        own: &formualizer_parse::parser::ASTNode,
+    ) -> bool {
+        if self.data_store.ast_needs_structural_rewrite(template) {
+            return false;
+        }
+        let rendered = template_rendered_refs(&self.data_store, &self.sheet_reg, template);
+        let dr = i64::from(row0) - i64::from(anchor.0);
+        let dc = i64::from(col0) - i64::from(anchor.1);
+        let mut stack = Vec::new();
+        if !parsed_equal_relocated(
+            &self.data_store,
+            &self.sheet_reg,
+            own,
+            template,
+            dr,
+            dc,
+            &rendered,
+            &mut stack,
+        ) {
+            return false;
+        }
+        let Some(tree) = self.data_store.retrieve_ast(template, &self.sheet_reg) else {
+            return false;
+        };
+        let Ok(member) = crate::engine::template::relocate::instantiate_member_ast(&tree, dr, dc)
+        else {
+            return false;
+        };
+        let mut ds = crate::engine::arena::DataStore::new();
+        let own_id = ds.store_ast(own, &self.sheet_reg);
+        let member_id = ds.store_ast(&member, &self.sheet_reg);
+        ds.retrieve_ast(own_id, &self.sheet_reg) == ds.retrieve_ast(member_id, &self.sheet_reg)
     }
 
     fn formula_member_of<'a>(

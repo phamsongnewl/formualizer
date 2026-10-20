@@ -111,9 +111,10 @@ pub struct XorFn;
 ///
 /// # Remarks
 /// - Booleans and numbers are accepted (`0` is FALSE, non-zero is TRUE).
-/// - Blank values are ignored.
-/// - Text and other non-coercible values produce `#VALUE!`.
-/// - If no coercion error occurs first, encountered formula errors are propagated.
+/// - Text and blank cells inside a reference or array are ignored.
+/// - A direct text argument produces `#VALUE!`.
+/// - The first error in argument order (ranges scanned row by row) is returned.
+/// - With no logical values at all, the result is `#VALUE!`.
 ///
 /// # Examples
 ///
@@ -167,87 +168,11 @@ impl Function for XorFn {
         args: &'c [ArgumentHandle<'a, 'b>],
         _ctx: &dyn FunctionContext<'b>,
     ) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
-        let mut true_count = 0usize;
-        let mut first_error: Option<LiteralValue> = None;
-        for a in args {
-            if let Ok(view) = a.range_view() {
-                let mut err: Option<LiteralValue> = None;
-                view.for_each_cell(&mut |val| {
-                    match val {
-                        LiteralValue::Boolean(b) => {
-                            if *b {
-                                true_count += 1;
-                            }
-                        }
-                        LiteralValue::Number(n) => {
-                            if *n != 0.0 {
-                                true_count += 1;
-                            }
-                        }
-                        LiteralValue::Int(i) => {
-                            if *i != 0 {
-                                true_count += 1;
-                            }
-                        }
-                        LiteralValue::Empty => {}
-                        LiteralValue::Error(_) => {
-                            if first_error.is_none() {
-                                err = Some(val.clone());
-                            }
-                        }
-                        _ => {
-                            if first_error.is_none() {
-                                err = Some(LiteralValue::Error(ExcelError::from_error_string(
-                                    "#VALUE!",
-                                )));
-                            }
-                        }
-                    }
-                    Ok(())
-                })?;
-                if first_error.is_none() {
-                    first_error = err;
-                }
-            } else {
-                let v = a.value()?.into_literal();
-                match v {
-                    LiteralValue::Boolean(b) => {
-                        if b {
-                            true_count += 1;
-                        }
-                    }
-                    LiteralValue::Number(n) => {
-                        if n != 0.0 {
-                            true_count += 1;
-                        }
-                    }
-                    LiteralValue::Int(i) => {
-                        if i != 0 {
-                            true_count += 1;
-                        }
-                    }
-                    LiteralValue::Empty => {}
-                    LiteralValue::Error(e) => {
-                        if first_error.is_none() {
-                            first_error = Some(LiteralValue::Error(e));
-                        }
-                    }
-                    _ => {
-                        if first_error.is_none() {
-                            first_error = Some(LiteralValue::Error(ExcelError::from_error_string(
-                                "#VALUE!",
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(err) = first_error {
-            return Ok(crate::traits::CalcValue::Scalar(err));
-        }
-        Ok(crate::traits::CalcValue::Scalar(LiteralValue::Boolean(
-            true_count % 2 == 1,
-        )))
+        let mut odd = false;
+        let outcome = super::logical::scan_logical_args(args, "XOR", |b| odd ^= b)?;
+        Ok(crate::traits::CalcValue::Scalar(
+            outcome.unwrap_or(LiteralValue::Boolean(odd)),
+        ))
     }
 }
 
@@ -504,9 +429,9 @@ impl ErrorGuard {
 }
 
 /// Failures that describe the evaluation request rather than a cell value.
-fn is_live_fault(error: &ExcelError) -> bool {
+pub(super) fn is_live_fault(error: &ExcelError) -> bool {
     error.kind == ExcelErrorKind::Cancelled
-        || matches!(error.extra, ExcelErrorExtra::Resource { .. })
+        || matches!(error.extra(), ExcelErrorExtra::Resource { .. })
 }
 
 fn error_guard<'a, 'b, 'c>(
@@ -593,6 +518,7 @@ fn error_guard<'a, 'b, 'c>(
         &fallback_grid,
         guard,
         &mut CancelPoll::new(&is_cancelled),
+        ctx.materialized_array_cells(),
     )? {
         Ok(rows) => Ok(CalcValue::Scalar(LiteralValue::Array(rows))),
         Err(error) => Ok(CalcValue::Scalar(LiteralValue::Error(error))),
@@ -655,6 +581,7 @@ fn select_elementwise(
     fallback: &Grid<'_>,
     guard: ErrorGuard,
     poll: &mut CancelPoll<'_>,
+    cell_budget: u64,
 ) -> Result<Result<Vec<Vec<LiteralValue>>, ExcelError>, ExcelError> {
     let value_shape = value.shape();
     let fallback_shape = fallback.shape();
@@ -662,7 +589,7 @@ fn select_elementwise(
         Ok(shape) => shape,
         Err(error) => return Ok(Err(error)),
     };
-    if let Some(error) = materialized_shape_too_large(shape) {
+    if let Some(error) = materialized_shape_too_large(shape, cell_budget) {
         return Ok(Err(error));
     }
     poll.advance(0)?;
@@ -1478,14 +1405,21 @@ mod error_guard_tests {
         LiteralValue::Error(ExcelError::new(kind))
     }
 
+    fn materialized_shape_too_large_default(shape: (usize, usize)) -> Option<ExcelError> {
+        materialized_shape_too_large(
+            shape,
+            crate::engine::resource_ledger::DEFAULT_MATERIALIZED_ARRAY_CELLS,
+        )
+    }
+
     #[test]
     fn shared_cap_applies_to_output_shape() {
-        assert!(materialized_shape_too_large((4096, 4096)).is_none());
-        assert!(materialized_shape_too_large((4096, 4097)).is_some());
-        assert!(materialized_shape_too_large((1_048_576, 1)).is_none());
-        assert!(materialized_shape_too_large((1_048_577, 1)).is_some());
-        assert!(materialized_shape_too_large((1, 16_385)).is_some());
-        assert!(materialized_shape_too_large((usize::MAX, usize::MAX)).is_some());
+        assert!(materialized_shape_too_large_default((4096, 4096)).is_none());
+        assert!(materialized_shape_too_large_default((4096, 4097)).is_some());
+        assert!(materialized_shape_too_large_default((1_048_576, 1)).is_none());
+        assert!(materialized_shape_too_large_default((1_048_577, 1)).is_some());
+        assert!(materialized_shape_too_large_default((1, 16_385)).is_some());
+        assert!(materialized_shape_too_large_default((usize::MAX, usize::MAX)).is_some());
     }
 
     #[test]
@@ -1504,6 +1438,7 @@ mod error_guard_tests {
             &fallback,
             ErrorGuard::AnyError,
             &mut CancelPoll::new(&is_cancelled),
+            crate::engine::resource_ledger::DEFAULT_MATERIALIZED_ARRAY_CELLS,
         )
         .unwrap();
         assert_eq!(result.unwrap_err().kind, ExcelErrorKind::Num);
@@ -1520,6 +1455,7 @@ mod error_guard_tests {
             &fallback,
             ErrorGuard::NaOnly,
             &mut CancelPoll::new(&is_cancelled),
+            crate::engine::resource_ledger::DEFAULT_MATERIALIZED_ARRAY_CELLS,
         )
         .unwrap();
         assert_eq!(result.unwrap_err().kind, ExcelErrorKind::Value);
@@ -1542,6 +1478,7 @@ mod error_guard_tests {
             &Grid::Scalar(num(0.0)),
             ErrorGuard::AnyError,
             &mut CancelPoll::new(&is_cancelled),
+            crate::engine::resource_ledger::DEFAULT_MATERIALIZED_ARRAY_CELLS,
         );
         assert_eq!(result.unwrap_err().kind, ExcelErrorKind::Cancelled);
         assert_eq!(polls.get(), 3);

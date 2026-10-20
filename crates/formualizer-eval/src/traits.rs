@@ -193,6 +193,8 @@ impl<'a> CalcValue<'a> {
                 RANGE_MATERIALIZED_CELLS.with(|count| count.set(count.get() + rows * cols));
                 if rows == 1 && cols == 1 {
                     rv.get_cell(0, 0)
+                } else if let Some(error) = rv.materialization_error() {
+                    LiteralValue::Error(error)
                 } else {
                     let mut data = Vec::with_capacity(rows);
                     for row_idx in 0..rows {
@@ -324,31 +326,59 @@ enum ArgumentExpr<'a> {
 pub struct ArgumentHandle<'a, 'b> {
     expr: ArgumentExpr<'a>,
     interp: &'a Interpreter<'b>,
+    caches: std::cell::OnceCell<Box<ArgumentCaches<'b>>>,
+    /// Validation and builtin evaluation both read arguments. Memoization keeps
+    /// nested calls linear instead of re-evaluating a leaf 2^depth times.
+    /// Handles are per-call/per-evaluation; value_with_env deliberately bypasses
+    /// this memo because its local environment may change.
+    /// Scalar results/errors are hot; AST/reference/resolution caches stay cold.
+    cached_value: std::cell::OnceCell<Result<MemoizedValue<'b>, ExcelError>>,
+}
+
+/// Keep the common scalar memo inline without paying for RangeView in every handle.
+enum MemoizedValue<'b> {
+    Scalar(LiteralValue, Option<crate::format::FormatId>),
+    Other(Box<CalcValue<'b>>),
+}
+
+impl<'b> MemoizedValue<'b> {
+    fn new(value: CalcValue<'b>) -> Self {
+        match value {
+            CalcValue::Scalar(value) => Self::Scalar(value, None),
+            CalcValue::AnnotatedScalar(value, format) => Self::Scalar(value, Some(format)),
+            other => Self::Other(Box::new(other)),
+        }
+    }
+
+    fn value(&self) -> CalcValue<'b> {
+        match self {
+            Self::Scalar(value, None) => CalcValue::Scalar(value.clone()),
+            Self::Scalar(value, Some(format)) => CalcValue::AnnotatedScalar(value.clone(), *format),
+            Self::Other(value) => (**value).clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ArgumentCaches<'b> {
     cached_ast: std::cell::OnceCell<ASTNode>,
     cached_ref: std::cell::OnceCell<ReferenceType>,
     cached_reference_or_value:
         std::cell::OnceCell<Result<crate::function::FunctionResolution<'b>, ExcelError>>,
     cached_resolved: std::cell::OnceCell<Result<ResolvedArgument<'b>, ExcelError>>,
-    /// Memoized result of [`Self::value`]. `Function::dispatch` evaluates
-    /// every argument once during schema validation and the function's `eval`
-    /// evaluates it again — without this cache that re-entry compounds to
-    /// 2^depth evaluations of the innermost node for nested non-short-circuit
-    /// calls (measured: depth 12 ⇒ 4096 evaluations). The handle is created
-    /// per call site and per evaluation, so the memo can never go stale
-    /// across recalcs. `value_with_env` is intentionally NOT memoized (the
-    /// local env changes the result).
-    cached_value: std::cell::OnceCell<Result<crate::traits::CalcValue<'b>, ExcelError>>,
 }
 
 impl<'a, 'b> ArgumentHandle<'a, 'b> {
+    fn caches(&self) -> &ArgumentCaches<'b> {
+        self.caches
+            .get_or_init(|| Box::new(ArgumentCaches::default()))
+    }
+
     pub(crate) fn new(node: &'a ASTNode, interp: &'a Interpreter<'b>) -> Self {
         Self {
             expr: ArgumentExpr::Ast(node),
             interp,
-            cached_ast: std::cell::OnceCell::new(),
-            cached_ref: std::cell::OnceCell::new(),
-            cached_reference_or_value: std::cell::OnceCell::new(),
-            cached_resolved: std::cell::OnceCell::new(),
+            caches: std::cell::OnceCell::new(),
             cached_value: std::cell::OnceCell::new(),
         }
     }
@@ -366,10 +396,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 sheet_registry,
             },
             interp,
-            cached_ast: std::cell::OnceCell::new(),
-            cached_ref: std::cell::OnceCell::new(),
-            cached_reference_or_value: std::cell::OnceCell::new(),
-            cached_resolved: std::cell::OnceCell::new(),
+            caches: std::cell::OnceCell::new(),
             cached_value: std::cell::OnceCell::new(),
         }
     }
@@ -422,6 +449,23 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         self.as_reference_or_eval().ok()
     }
 
+    /// The spill rectangle of the anchor this argument names, as `ANCHORARRAY`
+    /// takes it: the argument must be written as a reference (a single cell,
+    /// a name, or a LET/LAMBDA local bound to one), and is resolved through
+    /// the same context hook as the `#` operator. Anything else is `#REF!`.
+    pub(crate) fn spill_reference(&self) -> Result<ReferenceType, ExcelError> {
+        match &self.expr {
+            ArgumentExpr::Ast(node) => self.interp.ast_spill_reference(node),
+            ArgumentExpr::Arena {
+                id,
+                data_store,
+                sheet_registry,
+            } => self
+                .interp
+                .arena_spill_reference(*id, data_store, sheet_registry),
+        }
+    }
+
     /// Returns whether this argument resolves as a spreadsheet reference rather than a value.
     ///
     /// This uses the interpreter's reference-resolution path, so reference-returning functions
@@ -447,16 +491,17 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     }
                     _ => true,
                 },
-                ASTNodeType::BinaryOp { op, .. } => op == ":",
+                ASTNodeType::BinaryOp { op, .. } => *op == formualizer_parse::BinaryOperator::Range,
+                ASTNodeType::UnaryOp { op, .. } => *op == formualizer_parse::UnaryOperator::Spill,
                 ASTNodeType::Function { name, .. } => self
                     .interp
-                    .context
-                    .function_capabilities("", name)
+                    .ast_function_capabilities(name)
                     .is_some_and(|caps| caps.contains(crate::function::FnCaps::RETURNS_REFERENCE)),
                 _ => false,
             },
             ArgumentExpr::Arena { id, data_store, .. } => match data_store.get_node(*id) {
                 Some(crate::engine::arena::AstNodeData::Reference { ref_type, .. }) => {
+                    let ref_type = data_store.compact_ref(*ref_type);
                     match ref_type {
                         // Same rule as the AST branch above.
                         crate::engine::arena::CompactRefType::NamedRange(name_id)
@@ -474,13 +519,15 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                         _ => true,
                     }
                 }
-                Some(crate::engine::arena::AstNodeData::BinaryOp { op_id, .. }) => {
-                    data_store.resolve_ast_string(*op_id) == ":"
+                Some(crate::engine::arena::AstNodeData::BinaryOp { operator, .. }) => {
+                    *operator == formualizer_parse::BinaryOperator::Range
+                }
+                Some(crate::engine::arena::AstNodeData::UnaryOp { operator, .. }) => {
+                    *operator == formualizer_parse::UnaryOperator::Spill
                 }
                 Some(crate::engine::arena::AstNodeData::Function { name_id, .. }) => self
                     .interp
-                    .context
-                    .function_capabilities("", data_store.resolve_ast_string(*name_id))
+                    .arena_function_capabilities(*name_id, data_store)
                     .is_some_and(|caps| caps.contains(crate::function::FnCaps::RETURNS_REFERENCE)),
                 _ => false,
             },
@@ -489,8 +536,10 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
 
     pub fn value(&self) -> Result<crate::traits::CalcValue<'b>, ExcelError> {
         self.cached_value
-            .get_or_init(|| self.compute_value())
-            .clone()
+            .get_or_init(|| self.compute_value().map(MemoizedValue::new))
+            .as_ref()
+            .map(MemoizedValue::value)
+            .map_err(Clone::clone)
     }
 
     /// Resolves a scalar that is about to be coerced to text.
@@ -608,11 +657,22 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     }
                     self.interp.reference_for_current_offset(reference).ok()
                 }
-                ASTNodeType::BinaryOp { op, .. } if op == ":" => self
-                    .interp
-                    .with_local_env(env.clone())
-                    .evaluate_ast_as_reference(node)
-                    .ok(),
+                ASTNodeType::BinaryOp { op, .. }
+                    if *op == formualizer_parse::BinaryOperator::Range =>
+                {
+                    self.interp
+                        .with_local_env(env.clone())
+                        .evaluate_ast_as_reference(node)
+                        .ok()
+                }
+                ASTNodeType::UnaryOp { op, expr }
+                    if *op == formualizer_parse::UnaryOperator::Spill =>
+                {
+                    self.interp
+                        .with_local_env(env.clone())
+                        .ast_spill_reference(expr)
+                        .ok()
+                }
                 _ => None,
             },
             ArgumentExpr::Arena {
@@ -621,6 +681,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 sheet_registry,
             } => match data_store.get_node(*id) {
                 Some(crate::engine::arena::AstNodeData::Reference { ref_type, .. }) => {
+                    let ref_type = data_store.compact_ref(*ref_type);
                     if let crate::engine::arena::CompactRefType::NamedRange(name_id) = ref_type
                         && let Some(binding) = env.lookup(data_store.resolve_ast_string(*name_id))
                     {
@@ -636,12 +697,20 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                         data_store.reconstruct_reference_type_for_eval(ref_type, sheet_registry);
                     self.interp.reference_for_current_offset(&reference).ok()
                 }
-                Some(crate::engine::arena::AstNodeData::BinaryOp { op_id, .. })
-                    if data_store.resolve_ast_string(*op_id) == ":" =>
+                Some(crate::engine::arena::AstNodeData::BinaryOp { operator, .. })
+                    if *operator == formualizer_parse::BinaryOperator::Range =>
                 {
                     self.interp
                         .with_local_env(env.clone())
                         .evaluate_arena_ast_as_reference(*id, data_store, sheet_registry)
+                        .ok()
+                }
+                Some(crate::engine::arena::AstNodeData::UnaryOp { operator, expr_id })
+                    if *operator == formualizer_parse::UnaryOperator::Spill =>
+                {
+                    self.interp
+                        .with_local_env(env.clone())
+                        .arena_spill_reference(*expr_id, data_store, sheet_registry)
                         .ok()
                 }
                 _ => None,
@@ -728,6 +797,11 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 ASTNodeType::Function { .. } | ASTNodeType::BinaryOp { .. } => {
                     self.interp.evaluate_ast_as_reference(node)
                 }
+                ASTNodeType::UnaryOp { op, expr }
+                    if *op == formualizer_parse::UnaryOperator::Spill =>
+                {
+                    self.interp.ast_spill_reference(expr)
+                }
                 _ => Err(ExcelError::new(ExcelErrorKind::Ref)
                     .with_message("Expected a reference (by-ref argument)")),
             },
@@ -741,6 +815,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 })?;
                 match node {
                     crate::engine::arena::AstNodeData::Reference { ref_type, .. } => {
+                        let ref_type = data_store.compact_ref(*ref_type);
                         // Same local-shadowing rule as the AST branch above.
                         if let crate::engine::arena::CompactRefType::NamedRange(name_id) = ref_type
                             && let Some(local) =
@@ -756,6 +831,12 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     | crate::engine::arena::AstNodeData::BinaryOp { .. } => self
                         .interp
                         .evaluate_arena_ast_as_reference(*id, data_store, sheet_registry),
+                    crate::engine::arena::AstNodeData::UnaryOp { operator, expr_id }
+                        if *operator == formualizer_parse::UnaryOperator::Spill =>
+                    {
+                        self.interp
+                            .arena_spill_reference(*expr_id, data_store, sheet_registry)
+                    }
                     _ => Err(ExcelError::new(ExcelErrorKind::Ref)
                         .with_message("Expected a reference (by-ref argument)")),
                 }
@@ -773,8 +854,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 };
                 if !self
                     .interp
-                    .context
-                    .function_capabilities("", name)
+                    .ast_function_capabilities(name)
                     .is_some_and(|caps| caps.contains(crate::function::FnCaps::RETURNS_REFERENCE))
                 {
                     return None;
@@ -816,8 +896,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 let name = data_store.resolve_ast_string(*name_id);
                 if !self
                     .interp
-                    .context
-                    .function_capabilities("", name)
+                    .ast_function_capabilities(name)
                     .is_some_and(|caps| caps.contains(crate::function::FnCaps::RETURNS_REFERENCE))
                 {
                     return None;
@@ -868,14 +947,20 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     }
                     Some(self.interp.reference_for_current_offset(reference))
                 }
-                ASTNodeType::BinaryOp { op, .. } if op == ":" => {
+                ASTNodeType::BinaryOp { op, .. }
+                    if *op == formualizer_parse::BinaryOperator::Range =>
+                {
                     Some(self.interp.evaluate_ast_as_reference(node))
+                }
+                ASTNodeType::UnaryOp { op, expr }
+                    if *op == formualizer_parse::UnaryOperator::Spill =>
+                {
+                    Some(self.interp.ast_spill_reference(expr))
                 }
                 ASTNodeType::Function { name, .. }
                     if self
                         .interp
-                        .context
-                        .function_capabilities("", name)
+                        .ast_function_capabilities(name)
                         .is_some_and(|caps| {
                             caps.contains(crate::function::FnCaps::RETURNS_REFERENCE)
                         }) =>
@@ -899,6 +984,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 };
                 match node {
                     crate::engine::arena::AstNodeData::Reference { ref_type, .. } => {
+                        let ref_type = data_store.compact_ref(*ref_type);
                         // Same local-shadowing rule as the AST branch above.
                         if let crate::engine::arena::CompactRefType::NamedRange(name_id) = ref_type
                         {
@@ -911,8 +997,8 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                             .reconstruct_reference_type_for_eval(ref_type, sheet_registry);
                         Some(self.interp.reference_for_current_offset(&reference))
                     }
-                    crate::engine::arena::AstNodeData::BinaryOp { op_id, .. }
-                        if data_store.resolve_ast_string(*op_id) == ":" =>
+                    crate::engine::arena::AstNodeData::BinaryOp { operator, .. }
+                        if *operator == formualizer_parse::BinaryOperator::Range =>
                     {
                         Some(self.interp.evaluate_arena_ast_as_reference(
                             *id,
@@ -920,12 +1006,19 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                             sheet_registry,
                         ))
                     }
+                    crate::engine::arena::AstNodeData::UnaryOp { operator, expr_id }
+                        if *operator == formualizer_parse::UnaryOperator::Spill =>
+                    {
+                        Some(self.interp.arena_spill_reference(
+                            *expr_id,
+                            data_store,
+                            sheet_registry,
+                        ))
+                    }
                     crate::engine::arena::AstNodeData::Function { name_id, .. } => {
-                        let name = data_store.resolve_ast_string(*name_id);
                         if self
                             .interp
-                            .context
-                            .function_capabilities("", name)
+                            .arena_function_capabilities(*name_id, data_store)
                             .is_some_and(|caps| {
                                 caps.contains(crate::function::FnCaps::RETURNS_REFERENCE)
                             })
@@ -949,11 +1042,12 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         &self,
     ) -> Result<crate::function::FunctionResolution<'b>, ExcelError> {
         let resolved = self
+            .caches()
             .cached_reference_or_value
             .get_or_init(|| self.compute_reference_or_value())
             .clone();
         if let Ok(crate::function::FunctionResolution::Value(value)) = &resolved {
-            let _ = self.cached_value.set(Ok(value.clone()));
+            let _ = self.cached_value.set(Ok(MemoizedValue::new(value.clone())));
         }
         resolved
     }
@@ -979,12 +1073,15 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     /// with `RETURNS_REFERENCE` first attempt reference evaluation, but fall back
     /// to their cached value when `eval_reference` returns `None`.
     pub(crate) fn resolve_once(&self) -> Result<ResolvedArgument<'b>, ExcelError> {
-        self.cached_resolved
+        self.caches()
+            .cached_resolved
             .get_or_init(|| self.compute_resolved_argument())
             .clone()
     }
 
+    /// Attaches the context's cancellation token and materialisation budget.
     pub(crate) fn with_context_cancel_token(&self, view: RangeView<'b>) -> RangeView<'b> {
+        let view = view.with_cell_budget(self.interp.context.materialized_array_cells());
         match self.interp.context.cancellation_token() {
             Some(token) => view.with_cancel_token(Some(token)),
             None => view,
@@ -992,6 +1089,17 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
     }
 
     fn compute_resolved_argument(&self) -> Result<ResolvedArgument<'b>, ExcelError> {
+        if let ArgumentExpr::Arena { id, data_store, .. } = &self.expr
+            && let Some(result) = self.interp.resolve_arena_argument_range(*id, data_store)
+        {
+            return match result {
+                Ok(view) => Ok(ResolvedArgument::Range(
+                    self.with_context_cancel_token(view),
+                )),
+                Err(error) if error.kind == ExcelErrorKind::Cancelled => Err(error),
+                Err(error) => Ok(ResolvedArgument::ReferenceError(error)),
+            };
+        }
         let value = match self.resolve_reference_or_value()? {
             crate::function::FunctionResolution::Reference(reference) => {
                 return match self
@@ -1033,6 +1141,19 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
         }
     }
 
+    /// `#NUM!` when a `rows x cols` copy exceeds the context's materialisation
+    /// budget.
+    fn check_materialized_cells(&self, rows: usize, cols: usize) -> Result<(), ExcelError> {
+        match crate::engine::resource_ledger::materialized_cells_exceed(
+            rows,
+            cols,
+            self.interp.context.materialized_array_cells(),
+        ) {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     pub fn range(&self) -> Result<Box<dyn Range>, ExcelError> {
         match &self.expr {
             ArgumentExpr::Ast(node) => match &node.node_type {
@@ -1044,6 +1165,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                         .context
                         .resolve_range_view(&reference, self.interp.current_sheet())?;
                     let (rows, cols) = view.dims();
+                    self.check_materialized_cells(rows, cols)?;
                     let mut out: Vec<Vec<LiteralValue>> = Vec::with_capacity(rows);
                     view.for_each_row(&mut |row| {
                         let row_data: Vec<LiteralValue> = (0..cols)
@@ -1061,6 +1183,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                         .context
                         .resolve_range_view(&reference, self.interp.current_sheet())?;
                     let (rows, cols) = view.dims();
+                    self.check_materialized_cells(rows, cols)?;
                     let mut out: Vec<Vec<LiteralValue>> = Vec::with_capacity(rows);
                     view.for_each_row(&mut |row| {
                         let row_data: Vec<LiteralValue> = (0..cols)
@@ -1100,6 +1223,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                             .context
                             .resolve_range_view(&reference, self.interp.current_sheet())?;
                         let (rows, cols) = view.dims();
+                        self.check_materialized_cells(rows, cols)?;
                         let mut out: Vec<Vec<LiteralValue>> = Vec::with_capacity(rows);
                         view.for_each_row(&mut |row| {
                             let row_data: Vec<LiteralValue> = (0..cols)
@@ -1395,7 +1519,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 id,
                 data_store,
                 sheet_registry,
-            } => self.cached_ast.get_or_init(|| {
+            } => self.caches().cached_ast.get_or_init(|| {
                 data_store
                     .retrieve_ast(*id, sheet_registry)
                     .unwrap_or_else(|| ASTNode {
@@ -1421,7 +1545,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                         && let Some(local) = self.local_named_reference(name)
                     {
                         let bound = local?;
-                        return Ok(self.cached_ref.get_or_init(|| bound));
+                        return Ok(self.caches().cached_ref.get_or_init(|| bound));
                     }
                     Ok(reference)
                 }
@@ -1430,7 +1554,7 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
             },
             ArgumentExpr::Arena { .. } => {
                 let reference = self.reference_for_eval()?;
-                Ok(self.cached_ref.get_or_init(|| reference))
+                Ok(self.caches().cached_ref.get_or_init(|| reference))
             }
         }
     }
@@ -1452,6 +1576,11 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                 ASTNodeType::Function { .. } | ASTNodeType::BinaryOp { .. } => {
                     self.interp.evaluate_ast_as_reference(node)
                 }
+                ASTNodeType::UnaryOp { op, expr }
+                    if *op == formualizer_parse::UnaryOperator::Spill =>
+                {
+                    self.interp.ast_spill_reference(expr)
+                }
                 _ => Err(ExcelError::new(ExcelErrorKind::Ref)
                     .with_message("Argument is not a reference")),
             },
@@ -1472,6 +1601,12 @@ impl<'a, 'b> ArgumentHandle<'a, 'b> {
                     | crate::engine::arena::AstNodeData::BinaryOp { .. } => self
                         .interp
                         .evaluate_arena_ast_as_reference(*id, data_store, sheet_registry),
+                    crate::engine::arena::AstNodeData::UnaryOp { operator, expr_id }
+                        if *operator == formualizer_parse::UnaryOperator::Spill =>
+                    {
+                        self.interp
+                            .arena_spill_reference(*expr_id, data_store, sheet_registry)
+                    }
                     _ => Err(ExcelError::new(ExcelErrorKind::Ref)
                         .with_message("Argument is not a reference")),
                 }
@@ -1857,6 +1992,13 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
         None
     }
 
+    /// Most cells a range or array value may have when it is materialised as
+    /// a dense array (`evaluation_budgets.scratch.materialized_array_cells`);
+    /// larger arrays evaluate to `#NUM!`. The default is 2^24 cells.
+    fn materialized_array_cells(&self) -> u64 {
+        crate::engine::resource_ledger::DEFAULT_MATERIALIZED_ARRAY_CELLS
+    }
+
     /// Resolve a reference into a `RangeView` with clear bounds.
     /// Implementations should resolve un/partially bounded references using used-region.
     fn resolve_range_view<'c>(
@@ -1970,6 +2112,27 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
     /// Retrieve formula text for a concrete cell, if that cell stores a formula.
     fn formula_text_at_cell(&self, _cell: CellRef) -> Result<Option<String>, ExcelError> {
         Ok(None)
+    }
+
+    /// Resolve a spill-range reference (`A1#`, `ANCHORARRAY(A1)`) to the
+    /// anchor's current committed spill rectangle.
+    ///
+    /// `anchor` is the operand as written, relocated for the current cell:
+    /// a single-cell [`ReferenceType::Cell`] or a [`ReferenceType::NamedRange`]
+    /// that must name one cell. The result is a real sheet reference, so
+    /// callers read it through the ordinary reference path.
+    ///
+    /// Policy: `#REF!` for any other operand and for an anchor without a
+    /// current spill (a value, an empty cell, a scalar result, or a blocked or
+    /// oversized spill). The default, for contexts without a spill registry,
+    /// is `#REF!`.
+    fn resolve_spill_reference(
+        &self,
+        _anchor: &ReferenceType,
+        _current_sheet: &str,
+    ) -> Result<ReferenceType, ExcelError> {
+        Err(ExcelError::new(ExcelErrorKind::Ref)
+            .with_message("Spill references are not available in this context"))
     }
 
     /// Clock provider for volatile date/time builtins.
@@ -2101,6 +2264,20 @@ pub trait EvaluationContext: Resolver + FunctionProvider + SourceResolver {
     ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
         None
     }
+
+    /// Optional: the cells of a sheet-backed `view` whose formulas call
+    /// SUBTOTAL (and AGGREGATE when `include_aggregate`), as sorted,
+    /// disjoint `(column, first_row, last_row)` offset intervals within the
+    /// view (rows inclusive). SUBTOTAL and AGGREGATE skip
+    /// these cells (Excel ignores nested subtotals). `None` when the context
+    /// does not track formulas.
+    fn nested_subtotal_cells(
+        &self,
+        _view: &RangeView<'_>,
+        _include_aggregate: bool,
+    ) -> Option<Vec<(usize, usize, usize)>> {
+        None
+    }
 }
 
 /// Minimal backend capability descriptor for planning and adapters.
@@ -2143,6 +2320,13 @@ pub trait FunctionContext<'ctx> {
     /// the handle shares the same signal without allocating.
     fn cancellation_token(&self) -> Option<crate::engine::CancelToken>;
     fn chunk_hint(&self) -> Option<usize>;
+
+    /// Most cells a range or array value may have when it is materialised as
+    /// a dense array; larger arrays evaluate to `#NUM!`. See
+    /// [`EvaluationContext::materialized_array_cells`].
+    fn materialized_array_cells(&self) -> u64 {
+        crate::engine::resource_ledger::DEFAULT_MATERIALIZED_ARRAY_CELLS
+    }
 
     /// Current formula sheet name.
     fn current_sheet(&self) -> &str;
@@ -2234,6 +2418,17 @@ pub trait FunctionContext<'ctx> {
     ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
         None
     }
+
+    /// Optional: cells of `view` holding nested SUBTOTAL (and AGGREGATE when
+    /// `include_aggregate`) formulas; see
+    /// [`EvaluationContext::nested_subtotal_cells`].
+    fn get_nested_subtotal_cells(
+        &self,
+        _view: &RangeView<'_>,
+        _include_aggregate: bool,
+    ) -> Option<Vec<(usize, usize, usize)>> {
+        None
+    }
 }
 
 /// Default adapter that wraps an EvaluationContext and provides the narrow FunctionContext.
@@ -2313,6 +2508,9 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
     fn chunk_hint(&self) -> Option<usize> {
         self.base.chunk_hint()
     }
+    fn materialized_array_cells(&self) -> u64 {
+        self.base.materialized_array_cells()
+    }
 
     fn volatile_level(&self) -> VolatileLevel {
         self.base.volatile_level()
@@ -2332,7 +2530,9 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
         reference: &ReferenceType,
         current_sheet: &str,
     ) -> Result<RangeView<'a>, ExcelError> {
-        self.base.resolve_range_view(reference, current_sheet)
+        self.base
+            .resolve_range_view(reference, current_sheet)
+            .map(|view| view.with_cell_budget(self.base.materialized_array_cells()))
     }
 
     // Flats removed
@@ -2364,5 +2564,45 @@ impl<'a> FunctionContext<'a> for DefaultFunctionContext<'a> {
         mode: VisibilityMaskMode,
     ) -> Option<std::sync::Arc<arrow_array::BooleanArray>> {
         self.base.build_row_visibility_mask(view, mode)
+    }
+
+    fn get_nested_subtotal_cells(
+        &self,
+        view: &RangeView<'_>,
+        include_aggregate: bool,
+    ) -> Option<Vec<(usize, usize, usize)>> {
+        self.base.nested_subtotal_cells(view, include_aggregate)
+    }
+}
+
+#[cfg(test)]
+mod argument_handle_size_tests {
+    use super::*;
+    #[expect(dead_code, reason = "layout-only regression fixture")]
+    struct LegacyArgumentHandle<'a, 'b> {
+        expr: ArgumentExpr<'a>,
+        interp: &'a Interpreter<'b>,
+        cached_ast: std::cell::OnceCell<ASTNode>,
+        cached_ref: std::cell::OnceCell<ReferenceType>,
+        cached_reference_or_value:
+            std::cell::OnceCell<Result<crate::function::FunctionResolution<'b>, ExcelError>>,
+        cached_resolved: std::cell::OnceCell<Result<ResolvedArgument<'b>, ExcelError>>,
+        /// Memoized result of [`Self::value`]. `Function::dispatch` evaluates
+        /// every argument once during schema validation and the function's `eval`
+        /// evaluates it again — without this cache that re-entry compounds to
+        /// 2^depth evaluations of the innermost node for nested non-short-circuit
+        /// calls (measured: depth 12 ⇒ 4096 evaluations). The handle is created
+        /// per call site and per evaluation, so the memo can never go stale
+        /// across recalcs. `value_with_env` is intentionally NOT memoized (the
+        /// local env changes the result).
+        cached_value: std::cell::OnceCell<Result<crate::traits::CalcValue<'b>, ExcelError>>,
+    }
+
+    #[test]
+    fn argument_handle_fits_inline_call_storage() {
+        let before = std::mem::size_of::<LegacyArgumentHandle<'_, '_>>();
+        let after = std::mem::size_of::<ArgumentHandle<'_, '_>>();
+        assert_eq!(after, 80, "ArgumentHandle layout changed");
+        assert!(after < before / 4, "cold caches must stay out of line");
     }
 }

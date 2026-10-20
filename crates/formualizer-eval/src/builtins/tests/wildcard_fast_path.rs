@@ -6,6 +6,39 @@ use formualizer_common::LiteralValue;
 mod tests {
     use super::*;
 
+    #[test]
+    fn sql_like_punctuation_is_literal_in_scalar_criteria() {
+        let data = [
+            "a%b", "axxxb", "a_b", "aQb", "1_0", "1x0", "a%xyz", "ab", r"a\b", r"a\xyz", "a*b",
+            "a?b", "a~b", "A%B",
+        ];
+        let cases: &[(&str, &[usize])] = &[
+            ("a%b", &[0, 13]),
+            ("1_0", &[4]),
+            ("a_b", &[2]),
+            ("<>a%b", &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]),
+            ("a%*", &[0, 6, 13]),
+            ("a_?", &[2]),
+            (r"a\b", &[8]),
+            (r"a\*", &[8, 9]),
+            ("a~*b", &[10]),
+            ("a~?b", &[11]),
+            ("a~~b", &[12]),
+            ("a?b", &[0, 2, 3, 8, 10, 11, 12, 13]),
+            ("<>a%*", &[1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12]),
+        ];
+        for &(criterion, matches) in cases {
+            let pred = crate::args::parse_criteria(&LiteralValue::Text(criterion.into())).unwrap();
+            for (index, text) in data.iter().enumerate() {
+                assert_eq!(
+                    criteria_match(&pred, &LiteralValue::Text((*text).into())),
+                    matches.contains(&index),
+                    "{criterion:?} against {text:?}"
+                );
+            }
+        }
+    }
+
     fn create_text_like(pattern: &str) -> CriteriaPredicate {
         CriteriaPredicate::TextLike {
             pattern: pattern.to_string(),
@@ -164,15 +197,22 @@ mod tests {
     }
 
     #[test]
-    fn test_numeric_coercion() {
+    fn test_wildcards_match_text_only() {
+        // Excel: wildcard criteria match text cells only; numbers never match,
+        // even when their digits fit the pattern.
         let pred = create_text_like("123*");
 
-        assert!(criteria_match(&pred, &LiteralValue::Number(123.0)));
-        assert!(criteria_match(&pred, &LiteralValue::Number(123.456)));
-        assert!(criteria_match(&pred, &LiteralValue::Int(123)));
+        assert!(!criteria_match(&pred, &LiteralValue::Number(123.0)));
+        assert!(!criteria_match(&pred, &LiteralValue::Number(123.456)));
+        assert!(!criteria_match(&pred, &LiteralValue::Int(123)));
+        assert!(!criteria_match(&pred, &LiteralValue::Boolean(true)));
+        assert!(criteria_match(&pred, &LiteralValue::Text("123".into())));
+        assert!(criteria_match(&pred, &LiteralValue::Text("1234".into())));
+        assert!(!criteria_match(&pred, &LiteralValue::Text("12.3".into())));
 
-        assert!(!criteria_match(&pred, &LiteralValue::Number(12.3)));
-        assert!(!criteria_match(&pred, &LiteralValue::Int(12)));
+        let four = create_text_like("????");
+        assert!(!criteria_match(&four, &LiteralValue::Number(2025.0)));
+        assert!(criteria_match(&four, &LiteralValue::Text("2025".into())));
     }
 
     #[test]
@@ -180,7 +220,8 @@ mod tests {
         let pred_empty = create_text_like("*");
         let pred_something = create_text_like("some*");
 
-        assert!(criteria_match(&pred_empty, &LiteralValue::Empty));
+        // `*` matches any text, including empty text, but not a blank cell.
+        assert!(!criteria_match(&pred_empty, &LiteralValue::Empty));
         assert!(criteria_match(&pred_empty, &LiteralValue::Text("".into())));
 
         assert!(!criteria_match(&pred_something, &LiteralValue::Empty));

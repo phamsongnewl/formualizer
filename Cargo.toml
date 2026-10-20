@@ -7,6 +7,7 @@ members = [
   "crates/formualizer-eval",
   "crates/formualizer-macros",
   "crates/formualizer-workbook",
+  "crates/formualizer-cli",
   "crates/formualizer-cffi",
   "bindings/python",
   "bindings/wasm",
@@ -27,11 +28,11 @@ documentation = "https://docs.rs/formualizer"
 
 [workspace.dependencies]
 
-formualizer-common = { version = "3.1.4", path = "crates/formualizer-common" }
-formualizer-macros = { version = "0.10.1", path = "crates/formualizer-macros" }
-formualizer-parse = { version = "3.1.4", path = "crates/formualizer-parse" }
-formualizer-eval = { version = "0.10.1", path = "crates/formualizer-eval" }
-formualizer-workbook = { version = "0.10.1", path = "crates/formualizer-workbook" }
+formualizer-common = { version = "4.0.0", path = "crates/formualizer-common" }
+formualizer-macros = { version = "0.12.0", path = "crates/formualizer-macros" }
+formualizer-parse = { version = "4.0.0", path = "crates/formualizer-parse" }
+formualizer-eval = { version = "0.12.0", path = "crates/formualizer-eval" }
+formualizer-workbook = { version = "0.12.0", path = "crates/formualizer-workbook" }
 
 chrono = { version = "0.4.41", default-features = false, features = ["std"] }
 serde = "1.0.228"
@@ -54,6 +55,23 @@ wasm-bindgen-futures = "0.4.45"
 js-sys = "0.3.72"
 web-sys = "0.3.72"
 syn = "2.0"
+
+# Panic-free lint policy. Crates opt in with `[lints] workspace = true` once
+# their library code is clean; exceptions are `#[expect(.., reason = "..")]`.
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+string_slice = "deny"
+get_unwrap = "deny"
+unwrap_in_result = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+allow_attributes_without_reason = "deny"
+allow_attributes = "deny"
 
 [profile.release]
 codegen-units = 1
