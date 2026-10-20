@@ -7,7 +7,9 @@
 //! matches when every mask is non-null true. For the predicates taken here
 //! that mask is a pure function of one row's merged lanes:
 //! - numeric (`>` `>=` `<` `<=`, `=`/`<>` a number): Arrow `cmp` of the
-//!   row's number lane against the operand; a non-number row is null;
+//!   row's number lane against the operand; a non-number row is null (no
+//!   match), except for `<>` a number, where it matches (a column with
+//!   numeric text, which `=`/`<>` a number compare by value, declines);
 //! - `=`/`<>` a non-empty text: Arrow `ilike`/`nilike` of the row's
 //!   lowered-text lane against the lowered operand; a non-text row is null
 //!   for `=` and true for `<>`.
@@ -17,7 +19,7 @@
 //! kernel, so every row gets the mask's own verdict. It then walks the
 //! matching rows of its most selective criterion in row order, checks the
 //! others by class, and reduces as the builtin does: a count, or per driver
-//! row chunk the Arrow sum (`exact::sum_f64`) of the filtered target lane,
+//! row chunk sequential addition into the same running accumulator,
 //! with the non-null count for averages.
 //!
 //! Whole columns (`$F:$F`) and open-ended columns (`$F$2:$F`) are views of
@@ -31,7 +33,7 @@
 //! evaluation fails, and `COUNTIF` whose criterion matches an empty cell
 //! (it counts logical cells past the data).
 
-use super::exact::{LaneSlice, sum_f64};
+use super::exact::{LaneSlice, add_f64};
 use super::*;
 use crate::args::CriteriaPredicate as P;
 use crate::engine::arena::{AstNodeData, CompactRefType, DataStore};
@@ -59,7 +61,7 @@ pub(super) struct CriteriaPlan {
 /// two rows) or open (`$F:$F`, `$F$2:$F`: its view is the used extent, the
 /// same for every member).
 fn invariant_column(ds: &DataStore, arg: AstNodeId) -> bool {
-    match ds.get_node(arg) {
+    match ds.expanded_node(arg).as_ref() {
         Some(AstNodeData::Reference {
             ref_type:
                 CompactRefType::Range {
@@ -85,14 +87,14 @@ fn invariant_column(ds: &DataStore, arg: AstNodeId) -> bool {
 
 impl CriteriaPlan {
     pub(super) fn plan(
-        functions: &dyn crate::traits::FunctionProvider,
+        functions: &crate::interpreter::ResolvedFunctions,
         ds: &DataStore,
         template: AstNodeId,
     ) -> Option<Self> {
         let AstNodeData::Function { name_id, .. } = ds.get_node(template)? else {
             return None;
         };
-        let fun = functions.get_function("", ds.resolve_ast_string(*name_id))?;
+        let fun = functions.get(*name_id)?;
         if fun.family_kernel() != Some(FamilyKernel::CriteriaAggregate) {
             return None;
         }
@@ -128,7 +130,7 @@ impl CriteriaPlan {
             }
             // A criterion that is itself a range is not one value.
             if matches!(
-                ds.get_node(pair[1]),
+                ds.expanded_node(pair[1]).as_ref(),
                 Some(AstNodeData::Reference {
                     ref_type: CompactRefType::Range { .. },
                     ..
@@ -182,6 +184,10 @@ struct ColumnIndex {
     range: AstNodeId,
     numbers: std::sync::OnceLock<Option<Classes<f64>>>,
     texts: std::sync::OnceLock<Option<Classes<String>>>,
+    /// Whether any text in the column reads as a number (`"5"`), on first
+    /// use: `=n`/`<>n` then match text rows by value, which the number
+    /// classes cannot express.
+    numeric_text: std::sync::OnceLock<Option<bool>>,
 }
 
 impl ColumnIndex {
@@ -207,6 +213,25 @@ impl ColumnIndex {
         self.texts
             .get_or_init(|| index_texts(&engine.criteria_view(ds, self.range, sheet)?, rows))
             .as_ref()
+    }
+
+    fn has_numeric_text<R: EvaluationContext>(
+        &self,
+        engine: &Engine<R>,
+        ds: &DataStore,
+        sheet: &str,
+        rows: usize,
+    ) -> Option<bool> {
+        *self.numeric_text.get_or_init(|| {
+            let texts = self.texts(engine, ds, sheet, rows)?;
+            let locale = crate::locale::Locale::invariant();
+            Some(
+                texts
+                    .values
+                    .iter()
+                    .any(|t| locale.parse_number_invariant(t).is_some()),
+            )
+        })
     }
 }
 
@@ -258,6 +283,7 @@ where
         let AstNodeData::Reference { ref_type, .. } = ds.get_node(arg)? else {
             return None;
         };
+        let ref_type = ds.compact_ref(*ref_type);
         let reference = ds.reconstruct_reference_type_for_eval(ref_type, self.graph.sheet_reg());
         self.resolve_range_view(&reference, current_sheet).ok()
     }
@@ -317,6 +343,7 @@ where
                 range,
                 numbers: std::sync::OnceLock::new(),
                 texts: std::sync::OnceLock::new(),
+                numeric_text: std::sync::OnceLock::new(),
             })
             .collect();
         Some(CriteriaIndex {
@@ -465,11 +492,20 @@ where
                 P::Gt(n) | P::Ge(n) | P::Lt(n) | P::Le(n) => {
                     number_verdicts(column.numbers(self, ds, sheet, rows)?, &pred, *n)?
                 }
-                P::Eq(LiteralValue::Number(x)) | P::Ne(LiteralValue::Number(x)) => {
-                    number_verdicts(column.numbers(self, ds, sheet, rows)?, &pred, *x)?
-                }
-                P::Eq(LiteralValue::Int(i)) | P::Ne(LiteralValue::Int(i)) => {
-                    number_verdicts(column.numbers(self, ds, sheet, rows)?, &pred, *i as f64)?
+                // `=n` matches numeric text by value and `<>n` matches every
+                // non-number row but such text: decline when the column has
+                // numeric text, else the null class is all-unequal.
+                P::Eq(LiteralValue::Number(_) | LiteralValue::Int(_))
+                | P::Ne(LiteralValue::Number(_) | LiteralValue::Int(_)) => {
+                    if column.has_numeric_text(self, ds, sheet, rows)? {
+                        return None;
+                    }
+                    let x = match &pred {
+                        P::Eq(LiteralValue::Number(x)) | P::Ne(LiteralValue::Number(x)) => *x,
+                        P::Eq(LiteralValue::Int(i)) | P::Ne(LiteralValue::Int(i)) => *i as f64,
+                        _ => unreachable!(),
+                    };
+                    number_verdicts(column.numbers(self, ds, sheet, rows)?, &pred, x)?
                 }
                 P::Eq(LiteralValue::Text(t)) | P::Ne(LiteralValue::Text(t)) if !t.is_empty() => {
                     text_verdicts(
@@ -653,9 +689,7 @@ where
                         values: &buf,
                         validity: (nulls > 0).then_some((&bits[..], 0)),
                     };
-                    if let Some(s) = sum_f64(slice) {
-                        total_sum += s;
-                    }
+                    add_f64(&mut total_sum, slice);
                     total_count += (buf.len() - nulls) as i64;
                 }
                 debug_assert!(it.next().is_none(), "matched rows past the last chunk");
@@ -767,7 +801,8 @@ fn number_verdicts(classes: &Classes<f64>, pred: &P, n: f64) -> Option<(Vec<bool
         _ => return None,
     }
     .ok()?;
-    Some((mask_bools(&mask), false, false))
+    // A non-number row (blank, text, boolean, error) never equals a number.
+    Some((mask_bools(&mask), matches!(pred, P::Ne(_)), false))
 }
 
 /// A text `=`/`<>` verdict per lowered-text class with Arrow's

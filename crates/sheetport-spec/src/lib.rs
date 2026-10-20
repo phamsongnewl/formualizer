@@ -1,4 +1,3 @@
-#![cfg_attr(target_os = "emscripten", feature(let_chains))]
 // See formualizer-common/lib.rs for rationale.
 #![allow(clippy::collapsible_if)]
 
@@ -9,6 +8,7 @@
 //! validation helpers for authoring manifests that treat spreadsheets as pure
 //! input/output functions.
 
+mod builders;
 mod manifest;
 mod validation;
 

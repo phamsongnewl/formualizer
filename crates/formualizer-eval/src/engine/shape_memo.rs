@@ -151,7 +151,7 @@ impl Specialization {
             .iter()
             .map(|value| match value {
                 LiteralValue::Text(text) => text.len(),
-                LiteralValue::Error(error) => error.message.as_ref().map_or(0, String::len) + 64,
+                LiteralValue::Error(error) => error.message().map_or(0, str::len) + 64,
                 _ => 0,
             })
             .sum();
@@ -561,6 +561,7 @@ fn walk(
             original_id,
             ref_type,
         } => {
+            let ref_type = *data_store.compact_ref(ref_type);
             // Spill references carry the per-placement original text into
             // canonical diagnostics.
             if data_store
@@ -652,18 +653,18 @@ fn walk(
             }
             refs.push(ref_type);
         }
-        AstNodeData::UnaryOp { op_id, expr_id } => {
-            if !emit(tokens, [T_UNARY, u64::from(op_id.as_u32())]) {
+        AstNodeData::UnaryOp { operator, expr_id } => {
+            if !emit(tokens, [T_UNARY, u64::from(operator as u32)]) {
                 return false;
             }
             return walk(data_store, expr_id, anchor_row, anchor_col, tokens, refs);
         }
         AstNodeData::BinaryOp {
-            op_id,
+            operator,
             left_id,
             right_id,
         } => {
-            if !emit(tokens, [T_BINARY, u64::from(op_id.as_u32())]) {
+            if !emit(tokens, [T_BINARY, u64::from(operator as u32)]) {
                 return false;
             }
             return walk(data_store, left_id, anchor_row, anchor_col, tokens, refs)

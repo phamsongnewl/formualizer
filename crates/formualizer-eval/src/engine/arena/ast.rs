@@ -1,8 +1,9 @@
-/// AST arena with structural sharing and deduplication
-/// Stores formula AST nodes efficiently with content-addressable storage
 use super::string_interner::{StringId, StringInterner};
 use super::value_ref::ValueRef;
 use formualizer_parse::parser::{ExternalRefKind, TableSpecifier};
+/// AST arena with structural sharing and deduplication
+/// Stores formula AST nodes efficiently with content-addressable storage
+use formualizer_parse::{BinaryOperator, UnaryOperator};
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
@@ -47,7 +48,7 @@ pub(crate) const CALL_NODE_NAME: &str = "#CALL";
 
 /// Compact representation of AST nodes in the arena
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum AstNodeData {
+pub enum AstNodeData<R = CompactRefType> {
     /// Literal value
     Literal(ValueRef),
 
@@ -56,16 +57,19 @@ pub enum AstNodeData {
 
     /// Cell or range reference
     Reference {
-        original_id: StringId,    // Original reference string
-        ref_type: CompactRefType, // Compact reference representation
+        original_id: StringId, // Original reference string
+        ref_type: R,           // Reference payload, or its arena side-table identity
     },
 
     /// Unary operation
-    UnaryOp { op_id: StringId, expr_id: AstNodeId },
+    UnaryOp {
+        operator: UnaryOperator,
+        expr_id: AstNodeId,
+    },
 
     /// Binary operation
     BinaryOp {
-        op_id: StringId,
+        operator: BinaryOperator,
         left_id: AstNodeId,
         right_id: AstNodeId,
     },
@@ -84,6 +88,54 @@ pub enum AstNodeData {
         elements_offset: u32, // Index into elements array
     },
 }
+
+impl<R> AstNodeData<R> {
+    fn map_reference<S>(self, map: impl FnOnce(R) -> S) -> AstNodeData<S> {
+        match self {
+            Self::Literal(v) => AstNodeData::Literal(v),
+            Self::Omitted => AstNodeData::Omitted,
+            Self::Reference {
+                original_id,
+                ref_type,
+            } => AstNodeData::Reference {
+                original_id,
+                ref_type: map(ref_type),
+            },
+            Self::UnaryOp { operator, expr_id } => AstNodeData::UnaryOp { operator, expr_id },
+            Self::BinaryOp {
+                operator,
+                left_id,
+                right_id,
+            } => AstNodeData::BinaryOp {
+                operator,
+                left_id,
+                right_id,
+            },
+            Self::Function {
+                name_id,
+                args_offset,
+                args_count,
+            } => AstNodeData::Function {
+                name_id,
+                args_offset,
+                args_count,
+            },
+            Self::Array {
+                rows,
+                cols,
+                elements_offset,
+            } => AstNodeData::Array {
+                rows,
+                cols,
+                elements_offset,
+            },
+        }
+    }
+}
+
+/// Identity of a compact reference payload in an AST arena.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RefId(u32);
 
 /// Identifies a sheet either by stable registry id or by unresolved name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -148,15 +200,38 @@ pub enum CompactRefType {
     },
 }
 
-/// Arena entry containing structural node data plus canonical metadata.
-///
-/// Phase 1 keeps metadata at its default value for existing raw interning
-/// paths. Future canonical interning paths populate `meta` via the arena
-/// canonicalization helpers.
+/// Hot arena entry. Reference payloads and optional canonical metadata live
+/// in side tables, while subtotal call bits remain local to the node.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct AstNodeEntry {
-    pub(crate) data: AstNodeData,
-    pub(crate) meta: AstNodeMetadata,
+    pub(crate) data: AstNodeData<RefId>,
+    /// Which of SUBTOTAL ([`SUBTOTAL_CALL`]) and AGGREGATE
+    /// ([`AGGREGATE_CALL`]) the subtree calls: a cell whose formula calls
+    /// them is skipped by an enclosing SUBTOTAL/AGGREGATE (Excel's "nested
+    /// subtotals are ignored"). Derived from the node's data and its
+    /// children's bits, so dedup and compaction carry it unchanged.
+    pub(crate) subtotal_calls: u8,
+}
+
+/// [`AstNodeEntry::subtotal_calls`] bit: the subtree calls SUBTOTAL.
+pub(crate) const SUBTOTAL_CALL: u8 = 1;
+/// [`AstNodeEntry::subtotal_calls`] bit: the subtree calls AGGREGATE.
+pub(crate) const AGGREGATE_CALL: u8 = 2;
+
+/// The [`AstNodeEntry::subtotal_calls`] bit of a function name
+/// (case-insensitive, with or without the `_xlfn.` prefix).
+pub(crate) fn subtotal_call_bit(name: &str) -> u8 {
+    let name = match name.get(..6) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("_xlfn.") => &name[6..],
+        _ => name,
+    };
+    if name.eq_ignore_ascii_case("SUBTOTAL") {
+        SUBTOTAL_CALL
+    } else if name.eq_ignore_ascii_case("AGGREGATE") {
+        AGGREGATE_CALL
+    } else {
+        0
+    }
 }
 
 /// Canonical metadata associated with an arena AST node.
@@ -245,8 +320,15 @@ impl CanonicalLabels {
 
 /// Arena for storing AST nodes with deduplication
 pub struct AstArena {
+    function_names: rustc_hash::FxHashSet<StringId>,
+    sheet_names: rustc_hash::FxHashSet<StringId>,
+    revision: u64,
     /// Node storage
     nodes: Vec<AstNodeEntry>,
+
+    /// Canonical metadata is absent for raw interning, the common path.
+    metadata: FxHashMap<AstNodeId, AstNodeMetadata>,
+    references: Vec<CompactRefType>,
 
     /// Hash -> node index for deduplication
     dedup_map: FxHashMap<u64, AstNodeId>,
@@ -272,6 +354,8 @@ impl AstArena {
     pub fn new() -> Self {
         Self {
             nodes: Vec::new(),
+            metadata: FxHashMap::default(),
+            references: Vec::new(),
             dedup_map: FxHashMap::default(),
             function_args: Vec::new(),
             array_elements: Vec::new(),
@@ -279,12 +363,17 @@ impl AstArena {
             table_specs: Vec::new(),
             table_spec_dedup: FxHashMap::default(),
             dedup_hits: 0,
+            function_names: Default::default(),
+            sheet_names: Default::default(),
+            revision: 0,
         }
     }
 
     pub fn with_capacity(node_cap: usize) -> Self {
         Self {
             nodes: Vec::with_capacity(node_cap),
+            metadata: FxHashMap::default(),
+            references: Vec::new(),
             dedup_map: FxHashMap::with_capacity_and_hasher(node_cap, Default::default()),
             function_args: Vec::with_capacity(node_cap * 2), // Assume avg 2 args
             array_elements: Vec::with_capacity(node_cap),
@@ -292,6 +381,9 @@ impl AstArena {
             table_specs: Vec::new(),
             table_spec_dedup: FxHashMap::default(),
             dedup_hits: 0,
+            function_names: Default::default(),
+            sheet_names: Default::default(),
+            revision: 0,
         }
     }
 
@@ -319,13 +411,31 @@ impl AstArena {
     }
 
     fn insert_entry(&mut self, node: AstNodeData, meta: AstNodeMetadata) -> AstNodeId {
+        if let AstNodeData::Function { name_id, .. } = &node {
+            self.function_names.insert(*name_id);
+        }
+        if let AstNodeData::Reference {
+            ref_type:
+                CompactRefType::Cell {
+                    sheet: Some(SheetKey::Name(id)),
+                    ..
+                }
+                | CompactRefType::Range {
+                    sheet: Some(SheetKey::Name(id)),
+                    ..
+                },
+            ..
+        } = &node
+        {
+            self.sheet_names.insert(*id);
+        }
         // Compute structural hash. Metadata is deliberately excluded.
         let hash = self.hash_node(&node);
 
         // Check for existing node
         if let Some(&id) = self.dedup_map.get(&hash) {
             // Verify it's actually the same (handle hash collisions)
-            if self.nodes[id.0 as usize].data == node {
+            if self.expand_node(&self.nodes[id.0 as usize].data) == node {
                 self.dedup_hits += 1;
                 return id;
             }
@@ -333,7 +443,19 @@ impl AstArena {
 
         // Add new node
         let id = AstNodeId(self.nodes.len() as u32);
-        self.nodes.push(AstNodeEntry { data: node, meta });
+        let subtotal_calls = self.node_subtotal_calls(&node);
+        let data = node.map_reference(|reference| {
+            let id = RefId(self.references.len() as u32);
+            self.references.push(reference);
+            id
+        });
+        self.nodes.push(AstNodeEntry {
+            data,
+            subtotal_calls,
+        });
+        if meta != AstNodeMetadata::default() {
+            self.metadata.insert(id, meta);
+        }
         self.dedup_map.insert(hash, id);
         id
     }
@@ -358,19 +480,24 @@ impl AstArena {
     }
 
     /// Insert a unary operation node
-    pub fn insert_unary_op(&mut self, op: &str, expr: AstNodeId) -> AstNodeId {
-        let op_id = self.strings.intern(op);
+    pub fn insert_unary_op(&mut self, op: UnaryOperator, expr: AstNodeId) -> AstNodeId {
+        let operator = op;
         self.insert(AstNodeData::UnaryOp {
-            op_id,
+            operator,
             expr_id: expr,
         })
     }
 
     /// Insert a binary operation node
-    pub fn insert_binary_op(&mut self, op: &str, left: AstNodeId, right: AstNodeId) -> AstNodeId {
-        let op_id = self.strings.intern(op);
+    pub fn insert_binary_op(
+        &mut self,
+        op: BinaryOperator,
+        left: AstNodeId,
+        right: AstNodeId,
+    ) -> AstNodeId {
+        let operator = op;
         self.insert(AstNodeData::BinaryOp {
-            op_id,
+            operator,
             left_id: left,
             right_id: right,
         })
@@ -410,7 +537,7 @@ impl AstArena {
     }
 
     /// Get a node by ID
-    pub fn get(&self, id: AstNodeId) -> Option<&AstNodeData> {
+    pub fn get(&self, id: AstNodeId) -> Option<&AstNodeData<RefId>> {
         self.nodes.get(id.0 as usize).map(|entry| &entry.data)
     }
 
@@ -423,7 +550,49 @@ impl AstArena {
     /// Get canonical metadata for a node by ID.
     #[allow(dead_code)]
     pub(crate) fn metadata(&self, id: AstNodeId) -> Option<AstNodeMetadata> {
-        self.entry(id).map(|entry| entry.meta)
+        self.entry(id)
+            .map(|_| self.metadata.get(&id).copied().unwrap_or_default())
+    }
+
+    /// The SUBTOTAL/AGGREGATE call bits of the subtree rooted at `id`
+    /// (precomputed at insertion; O(1)).
+    pub(crate) fn subtotal_calls(&self, id: AstNodeId) -> u8 {
+        self.nodes
+            .get(id.0 as usize)
+            .map_or(0, |entry| entry.subtotal_calls)
+    }
+
+    /// `subtotal_calls` of a node about to be inserted: its own function
+    /// name's bit and its children's (children are inserted first).
+    fn node_subtotal_calls<R>(&self, node: &AstNodeData<R>) -> u8 {
+        let children = |ids: &[AstNodeId]| {
+            ids.iter()
+                .fold(0, |bits, id| bits | self.subtotal_calls(*id))
+        };
+        match node {
+            AstNodeData::Function {
+                name_id,
+                args_offset,
+                args_count,
+            } => {
+                let start = *args_offset as usize;
+                subtotal_call_bit(self.strings.resolve(*name_id))
+                    | children(&self.function_args[start..start + *args_count as usize])
+            }
+            AstNodeData::UnaryOp { expr_id, .. } => self.subtotal_calls(*expr_id),
+            AstNodeData::BinaryOp {
+                left_id, right_id, ..
+            } => self.subtotal_calls(*left_id) | self.subtotal_calls(*right_id),
+            AstNodeData::Array {
+                rows,
+                cols,
+                elements_offset,
+            } => {
+                let start = *elements_offset as usize;
+                children(&self.array_elements[start..start + (*rows as usize) * (*cols as usize)])
+            }
+            AstNodeData::Literal(_) | AstNodeData::Omitted | AstNodeData::Reference { .. } => 0,
+        }
     }
 
     /// Get function arguments for a function node
@@ -475,6 +644,18 @@ impl AstArena {
     }
 
     /// Get the string interner (for external use)
+    pub(crate) fn sheet_names(&self) -> impl Iterator<Item = StringId> + '_ {
+        self.sheet_names.iter().copied()
+    }
+
+    pub(crate) fn function_names(&self) -> impl Iterator<Item = StringId> + '_ {
+        self.function_names.iter().copied()
+    }
+
+    pub(crate) fn resolution_revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn strings(&self) -> &StringInterner {
         &self.strings
     }
@@ -510,7 +691,26 @@ impl AstArena {
         self.table_specs.get(id.0 as usize)
     }
 
-    /// Compute hash for a node
+    /// The reference payload behind `id`, or `None` when `id` does not come
+    /// from this arena's current contents (another arena, or one held across
+    /// `clear`/`compact`).
+    pub fn get_compact_ref(&self, id: RefId) -> Option<&CompactRefType> {
+        self.references.get(id.0 as usize)
+    }
+
+    /// Resolve a reference identity read from one of this arena's nodes.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "engine callers take RefIds only from nodes of this arena's current contents, which clear and compact replace together with the payloads"
+    )]
+    pub(crate) fn compact_ref(&self, id: RefId) -> &CompactRefType {
+        &self.references[id.0 as usize]
+    }
+
+    pub(crate) fn expand_node(&self, node: &AstNodeData<RefId>) -> AstNodeData {
+        node.clone().map_reference(|id| *self.compact_ref(id))
+    }
+
     fn hash_node(&self, node: &AstNodeData) -> u64 {
         let mut hasher = DefaultHasher::new();
         node.hash(&mut hasher);
@@ -530,6 +730,8 @@ impl AstArena {
         let old_len = self.nodes.len();
         let mut remap = vec![u32::MAX; old_len];
         let mut nodes: Vec<AstNodeEntry> = Vec::new();
+        let mut metadata = FxHashMap::default();
+        let mut references = Vec::new();
         let mut dedup_map: FxHashMap<u64, AstNodeId> = FxHashMap::default();
         let mut function_args: Vec<AstNodeId> = Vec::new();
         let mut array_elements: Vec<AstNodeId> = Vec::new();
@@ -588,16 +790,16 @@ impl AstArena {
                 }
                 let m = |c: AstNodeId| AstNodeId(remap[c.0 as usize]);
                 let data = match &entry.data {
-                    AstNodeData::UnaryOp { op_id, expr_id } => AstNodeData::UnaryOp {
-                        op_id: *op_id,
+                    AstNodeData::UnaryOp { operator, expr_id } => AstNodeData::UnaryOp {
+                        operator: *operator,
                         expr_id: m(*expr_id),
                     },
                     AstNodeData::BinaryOp {
-                        op_id,
+                        operator,
                         left_id,
                         right_id,
                     } => AstNodeData::BinaryOp {
-                        op_id: *op_id,
+                        operator: *operator,
                         left_id: m(*left_id),
                         right_id: m(*right_id),
                     },
@@ -625,13 +827,35 @@ impl AstArena {
                     }
                     other => other.clone(),
                 };
-                let meta = entry.meta;
-                let hash = self.hash_node(&data);
+                let meta = self.metadata.get(&AstNodeId(id)).copied();
+                let subtotal_calls = entry.subtotal_calls;
+                let expanded = self.expand_node(&data);
+                let hash = self.hash_node(&expanded);
                 let new_id = match dedup_map.get(&hash) {
-                    Some(&existing) if nodes[existing.0 as usize].data == data => existing,
+                    Some(&existing)
+                        if nodes[existing.0 as usize]
+                            .data
+                            .clone()
+                            .map_reference(|id| references[id.0 as usize])
+                            == expanded =>
+                    {
+                        existing
+                    }
                     _ => {
                         let new_id = AstNodeId(nodes.len() as u32);
-                        nodes.push(AstNodeEntry { data, meta });
+                        let data = data.map_reference(|id| {
+                            let reference = *self.compact_ref(id);
+                            let new_id = RefId(references.len() as u32);
+                            references.push(reference);
+                            new_id
+                        });
+                        nodes.push(AstNodeEntry {
+                            data,
+                            subtotal_calls,
+                        });
+                        if let Some(meta) = meta {
+                            metadata.insert(new_id, meta);
+                        }
                         dedup_map.insert(hash, new_id);
                         new_id
                     }
@@ -655,7 +879,7 @@ impl AstArena {
                     ref_type,
                 } => {
                     mark(*original_id);
-                    match ref_type {
+                    match &references[ref_type.0 as usize] {
                         CompactRefType::Cell { sheet, .. }
                         | CompactRefType::Range { sheet, .. } => {
                             if let Some(SheetKey::Name(id)) = sheet {
@@ -689,9 +913,7 @@ impl AstArena {
                         }
                     }
                 }
-                AstNodeData::UnaryOp { op_id, .. } | AstNodeData::BinaryOp { op_id, .. } => {
-                    mark(*op_id)
-                }
+                AstNodeData::UnaryOp { .. } | AstNodeData::BinaryOp { .. } => {}
                 AstNodeData::Function { name_id, .. } => mark(*name_id),
                 AstNodeData::Literal(_) | AstNodeData::Omitted | AstNodeData::Array { .. } => {}
             }
@@ -701,7 +923,35 @@ impl AstArena {
         function_args.shrink_to_fit();
         array_elements.shrink_to_fit();
         dedup_map.shrink_to_fit();
+        self.function_names = nodes
+            .iter()
+            .filter_map(|entry| match &entry.data {
+                AstNodeData::Function { name_id, .. } => Some(*name_id),
+                _ => None,
+            })
+            .collect();
+        self.sheet_names = nodes
+            .iter()
+            .filter_map(|entry| match &entry.data {
+                AstNodeData::Reference { ref_type, .. } => match references[ref_type.0 as usize] {
+                    CompactRefType::Cell {
+                        sheet: Some(SheetKey::Name(id)),
+                        ..
+                    }
+                    | CompactRefType::Range {
+                        sheet: Some(SheetKey::Name(id)),
+                        ..
+                    } => Some(id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        self.revision = self.revision.wrapping_add(1);
         self.nodes = nodes;
+        self.metadata = metadata;
+        references.shrink_to_fit();
+        self.references = references;
         self.dedup_map = dedup_map;
         self.function_args = function_args;
         self.array_elements = array_elements;
@@ -728,6 +978,9 @@ impl AstArena {
     /// Returns memory usage in bytes (approximate)
     pub fn memory_usage(&self) -> usize {
         self.nodes.capacity() * std::mem::size_of::<AstNodeEntry>()
+            + self.references.capacity() * std::mem::size_of::<CompactRefType>()
+            + self.metadata.capacity()
+                * (std::mem::size_of::<AstNodeId>() + std::mem::size_of::<AstNodeMetadata>())
             + self.dedup_map.capacity() * (8 + 4) // hash + id
             + self.function_args.capacity() * 4
             + self.array_elements.capacity() * 4
@@ -738,7 +991,12 @@ impl AstArena {
 
     /// Clear all nodes from the arena
     pub fn clear(&mut self) {
+        self.function_names.clear();
+        self.sheet_names.clear();
+        self.revision = self.revision.wrapping_add(1);
         self.nodes.clear();
+        self.metadata.clear();
+        self.references.clear();
         self.dedup_map.clear();
         self.function_args.clear();
         self.array_elements.clear();
@@ -781,6 +1039,93 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compact_ref_lookup_rejects_stale_ids() {
+        let mut arena = AstArena::new();
+        let name = arena.strings_mut().intern("N");
+        let node = arena.insert_reference("N", CompactRefType::NamedRange(name));
+        let Some(AstNodeData::Reference { ref_type, .. }) = arena.get(node).cloned() else {
+            panic!("reference node");
+        };
+        assert!(arena.get_compact_ref(ref_type).is_some());
+        arena.clear();
+        assert!(arena.get_compact_ref(ref_type).is_none());
+    }
+
+    #[test]
+    fn sparse_metadata_survives_compaction_and_clear() {
+        let mut arena = AstArena::new();
+        let _garbage = arena.insert_omitted();
+        let data = AstNodeData::Literal(ValueRef::boolean(true));
+        let meta = AstNodeMetadata {
+            canonical_hash: 123,
+            ..Default::default()
+        };
+        let root = arena.insert_with_meta(data.clone(), meta);
+        assert_eq!(arena.insert(data), root);
+        assert_eq!(arena.metadata(root), Some(meta));
+        assert_eq!(arena.metadata.len(), 1);
+        let (remap, _) = arena.compact([root]);
+        let mapped = remap
+            .get(root.as_u32() as usize)
+            .copied()
+            .map(AstNodeId::from_u32);
+        assert_eq!(mapped.and_then(|id| arena.metadata(id)), Some(meta));
+        arena.clear();
+        assert!(arena.metadata.is_empty());
+        let raw = arena.insert_omitted();
+        assert_eq!(arena.metadata(raw), Some(AstNodeMetadata::default()));
+        assert!(arena.metadata.is_empty());
+    }
+
+    #[test]
+    fn reference_compaction_preserves_payload_and_structural_hash() {
+        let mut arena = AstArena::new();
+        let dead = arena.strings.intern("Dead");
+        arena.insert_reference("Dead", CompactRefType::NamedRange(dead));
+        let sheet = arena.strings.intern("Other");
+        let reference = CompactRefType::Range {
+            sheet: Some(SheetKey::Name(sheet)),
+            start_row: 1,
+            start_col: 2,
+            end_row: 4,
+            end_col: 3,
+            start_row_abs: false,
+            start_col_abs: true,
+            end_row_abs: true,
+            end_col_abs: false,
+        };
+        let root = arena.insert_reference("Other!$B1:C$4", reference);
+        let expanded = arena.get(root).map(|node| arena.expand_node(node));
+        let hash = expanded.as_ref().map(|node| arena.hash_node(node));
+        let duplicate = arena.insert_reference("Other!$B1:C$4", reference);
+        assert_eq!(duplicate, root);
+        assert_eq!(arena.references.len(), 2);
+        let (remap, _) = arena.compact([root]);
+        let mapped = remap
+            .get(root.as_u32() as usize)
+            .copied()
+            .map(AstNodeId::from_u32);
+        let compacted = mapped
+            .and_then(|id| arena.get(id))
+            .map(|node| arena.expand_node(node));
+        assert_eq!(compacted, expanded);
+        assert_eq!(compacted.as_ref().map(|node| arena.hash_node(node)), hash);
+        assert_eq!(arena.references.len(), 1);
+        assert_eq!(
+            Some(arena.insert_reference("Other!$B1:C$4", reference)),
+            mapped
+        );
+        assert_eq!(arena.resolve_string(sheet), "Other");
+    }
+
+    #[test]
+    fn arena_entry_layout_without_inline_metadata() {
+        assert_eq!(std::mem::size_of::<AstNodeData>(), 52);
+        assert_eq!(std::mem::size_of::<AstNodeData<RefId>>(), 12);
+        assert_eq!(std::mem::size_of::<AstNodeEntry>(), 16);
+    }
+
+    #[test]
     fn test_ast_arena_literal() {
         let mut arena = AstArena::new();
 
@@ -815,15 +1160,15 @@ mod tests {
 
         let left = arena.insert_literal(ValueRef::small_int(1).unwrap());
         let right = arena.insert_literal(ValueRef::small_int(2).unwrap());
-        let add = arena.insert_binary_op("+", left, right);
+        let add = arena.insert_binary_op(BinaryOperator::Add, left, right);
 
         match arena.get(add) {
             Some(AstNodeData::BinaryOp {
-                op_id,
+                operator,
                 left_id,
                 right_id,
             }) => {
-                assert_eq!(arena.resolve_string(*op_id), "+");
+                assert_eq!(*operator, BinaryOperator::Add);
                 assert_eq!(*left_id, left);
                 assert_eq!(*right_id, right);
             }
@@ -875,11 +1220,11 @@ mod tests {
 
         // Create "A1 + 1"
         let one = arena.insert_literal(ValueRef::small_int(1).unwrap());
-        let expr1 = arena.insert_binary_op("+", a1_ref, one);
+        let expr1 = arena.insert_binary_op(BinaryOperator::Add, a1_ref, one);
 
         // Create "A1 * 2"
         let two = arena.insert_literal(ValueRef::small_int(2).unwrap());
-        let expr2 = arena.insert_binary_op("*", a1_ref, two);
+        let expr2 = arena.insert_binary_op(BinaryOperator::try_from("*").unwrap(), a1_ref, two);
 
         // A1 reference should be shared
         assert_eq!(arena.stats().node_count, 5); // A1, 1, +expr, 2, *expr
@@ -964,7 +1309,7 @@ mod tests {
         let zero = arena.insert_literal(ValueRef::small_int(0).unwrap());
 
         // B1 > 0
-        let condition = arena.insert_binary_op(">", b1, zero);
+        let condition = arena.insert_binary_op(BinaryOperator::try_from(">").unwrap(), b1, zero);
 
         // C1 and D1 references
         let c1 = arena.insert_reference(
@@ -992,7 +1337,7 @@ mod tests {
         let if_expr = arena.insert_function("IF", vec![condition, c1, d1]);
 
         // Final: SUM(...) + IF(...)
-        let final_expr = arena.insert_binary_op("+", sum, if_expr);
+        let final_expr = arena.insert_binary_op(BinaryOperator::Add, sum, if_expr);
 
         // Verify structure
         assert!(arena.get(final_expr).is_some());
@@ -1011,12 +1356,12 @@ mod tests {
         let two = arena.insert_literal(ValueRef::small_int(2).unwrap());
         let three = arena.insert_literal(ValueRef::small_int(3).unwrap());
 
-        let add1 = arena.insert_binary_op("+", one, two);
-        let add2 = arena.insert_binary_op("+", two, three);
-        let add3 = arena.insert_binary_op("+", one, three);
+        let add1 = arena.insert_binary_op(BinaryOperator::Add, one, two);
+        let add2 = arena.insert_binary_op(BinaryOperator::Add, two, three);
+        let add3 = arena.insert_binary_op(BinaryOperator::Add, one, three);
 
-        // "+" should be interned only once
-        assert_eq!(arena.strings().len(), 1);
+        // Operators are stored directly, not interned as strings.
+        assert_eq!(arena.strings().len(), 0);
     }
 
     #[test]
@@ -1027,7 +1372,7 @@ mod tests {
         arena.insert_literal(ValueRef::small_int(2).unwrap());
         let left = arena.insert_literal(ValueRef::small_int(3).unwrap());
         let right = arena.insert_literal(ValueRef::small_int(4).unwrap());
-        arena.insert_binary_op("+", left, right);
+        arena.insert_binary_op(BinaryOperator::Add, left, right);
 
         assert_eq!(arena.stats().node_count, 5);
 

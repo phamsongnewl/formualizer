@@ -1,10 +1,12 @@
-#![cfg_attr(target_os = "emscripten", feature(let_chains, unsigned_is_multiple_of))]
-
 pub mod backends;
 pub mod builtins;
 #[cfg(feature = "xlsx-recalc")]
 pub mod cache_recalculate;
+#[cfg(feature = "calamine")]
+mod cached_external_links;
 pub mod calc_pr;
+#[cfg(feature = "calamine")]
+pub use cached_external_links::CachedExternalLinkValues;
 pub mod error;
 #[cfg(any(
     feature = "calamine",
@@ -13,6 +15,7 @@ pub mod error;
     feature = "umya3"
 ))]
 pub(crate) mod load_limits;
+mod panic_guard;
 #[cfg(any(feature = "umya", feature = "xlsx-recalc"))]
 pub mod recalculate;
 pub mod resolver;
@@ -23,8 +26,12 @@ pub mod transaction;
 mod wasm_runtime_wasmtime;
 pub mod workbook;
 pub mod worksheet;
+#[cfg(feature = "calamine")]
+mod xlsx_cache_options;
 #[cfg(any(feature = "umya3", feature = "xlsx-recalc"))]
 pub(crate) mod xlsx_path;
+#[cfg(feature = "calamine")]
+mod xlsx_xml;
 
 #[cfg(feature = "csv")]
 pub use backends::CsvAdapter;
@@ -47,7 +54,8 @@ pub use builtins::{ensure_builtins_loaded, register_function_dynamic, try_load_b
 pub use cache_recalculate::recalculate_xlsx_file;
 #[cfg(feature = "xlsx-recalc")]
 pub use cache_recalculate::{
-    XlsxRecalculateLimits, XlsxRecalculateOptions, XlsxRecalculateResult, recalculate_xlsx_bytes,
+    ExternalLinkPolicy, XlsxRecalculateLimits, XlsxRecalculateOptions, XlsxRecalculateResult,
+    recalculate_xlsx_bytes,
 };
 pub use error::{IoError, with_cell_context};
 #[cfg(any(feature = "umya", feature = "xlsx-recalc"))]

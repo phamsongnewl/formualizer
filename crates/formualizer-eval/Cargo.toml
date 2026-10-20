@@ -1,6 +1,6 @@
 [package]
 name = "formualizer-eval"
-version = "0.10.1"
+version = "0.12.0"
 edition = "2024"
 description = "High-performance Arrow-backed Excel formula engine with dependency graph and incremental recalculation"
 homepage.workspace = true
@@ -95,6 +95,11 @@ required-features = ["test-support"]
 [[test]]
 name = "fp8_ingest_pipeline_parity"
 path = "tests/fp8_ingest_pipeline_parity.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "temporal_consumers"
+path = "tests/temporal_consumers.rs"
 required-features = ["test-support"]
 
 [[test]]

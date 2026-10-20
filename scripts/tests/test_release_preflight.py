@@ -397,7 +397,7 @@ class ReleasePreflightTests(unittest.TestCase):
             ),
             (
                 "bindings/python/Cargo.toml",
-                '[target.\'cfg(target_os = "emscripten")\'.dependencies]\nformualizer = { path = "../../crates/formualizer", default-features = false, features = ["eval", "workbook", "sheetport", "parse", "umya"] }',
+                '[target.\'cfg(target_os = "emscripten")\'.dependencies]\nformualizer = { path = "../../crates/formualizer", default-features = false, features = ["eval", "workbook", "sheetport", "parse", "calamine", "umya", "xlsx-recalc"] }',
                 "",
             ),
         )
@@ -541,8 +541,8 @@ class ReleasePreflightTests(unittest.TestCase):
             r"python-pyodide.*stale opt-out",
             (
                 "bindings/python/Cargo.toml",
-                'features = ["eval", "workbook", "sheetport", "parse", "umya"]',
-                'features = ["eval", "workbook", "sheetport", "parse", "umya", "system-clock"]',
+                'features = ["eval", "workbook", "sheetport", "parse", "calamine", "umya", "xlsx-recalc"] }\n\n#',
+                'features = ["eval", "workbook", "sheetport", "parse", "calamine", "umya", "xlsx-recalc", "system-clock"] }\n\n#',
             ),
         )
 
@@ -638,13 +638,16 @@ class ReleasePreflightTests(unittest.TestCase):
                 record("features"),
             ),
             mock.patch.object(
+                release_preflight, "validate_no_prerelease_wording", record("wording")
+            ),
+            mock.patch.object(
                 release_preflight, "validate_parser_track_lockstep", record("parser")
             ),
             mock.patch("builtins.print"),
             self.assertRaisesRegex(RuntimeError, "stop before registry lookup"),
         ):
             release_preflight.preflight("product", False)
-        self.assertEqual(calls, ["package", "features", "parser"])
+        self.assertEqual(calls, ["package", "features", "wording", "parser"])
 
     def test_parser_track_versions_are_in_lockstep_in_tree(self) -> None:
         self.assertEqual(
@@ -713,9 +716,183 @@ class ReleasePreflightTests(unittest.TestCase):
                 "formualizer-workbook",
                 "formualizer-sheetport",
                 "formualizer",
+                "formualizer-cli",
             ],
         )
 
 
+class CliReleaseWorkflowTests(unittest.TestCase):
+    """Keep the native CLI release wiring aligned with preflight and safe."""
+
+    workflows = release_preflight.ROOT / ".github" / "workflows"
+
+    def job_block(self, text: str, job: str) -> str:
+        start = text.index(f"\n  {job}:\n")
+        lines = text[start + 1 :].splitlines()
+        block = [lines[0]]
+        for line in lines[1:]:
+            # The next two-space-indented key starts the next job.
+            if line.startswith("  ") and not line.startswith("   ") and line.strip():
+                break
+            block.append(line)
+        return "\n".join(block)
+
+    def test_product_crate_publication_follows_preflight_order(self) -> None:
+        text = (self.workflows / "release.yml").read_text(encoding="utf-8")
+        published = [
+            line.split()[1]
+            for line in self.job_block(text, "publish-product-crates").splitlines()
+            if line.strip().startswith("publish_with_retry ")
+        ]
+        product = [package.name for package in release_preflight.TRACKS["product"]]
+        self.assertEqual(published, [name for name in product if name in published])
+        self.assertEqual(published[-2:], ["formualizer", "formualizer-cli"])
+
+    def test_cli_build_workflow_cannot_publish(self) -> None:
+        text = (self.workflows / "cli-build.yml").read_text(encoding="utf-8")
+        for forbidden in (
+            "secrets.",
+            "npm publish",
+            "cargo publish",
+            "id-token",
+            "contents: write",
+            "action-gh-release",
+            "gh release",
+        ):
+            self.assertNotIn(forbidden, text)
+        self.assertIn("permissions:\n  contents: read\n", text)
+
+    def test_cli_publish_jobs_only_run_for_product_tags(self) -> None:
+        text = (self.workflows / "release.yml").read_text(encoding="utf-8")
+        push = "github.event_name == 'push' && startsWith(github.ref_name, 'v')"
+        build = self.job_block(text, "build-cli")
+        self.assertIn(push + " && needs.verify-product.result == 'success'", build)
+        self.assertIn(
+            "github.event_name == 'workflow_dispatch' && startsWith(inputs.resume_cli_tag, 'v')",
+            build,
+        )
+        publish = self.job_block(text, "publish-npm-cli")
+        self.assertIn("needs.build-cli.result == 'success'", publish)
+        self.assertIn(push + " && needs.publish-product-crates.result == 'success'", publish)
+        # A resume dispatch never reaches the crate or wheel jobs.
+        for job in ("publish-product-crates", "publish-pypi", "publish-npm", "verify-product"):
+            self.assertNotIn("workflow_dispatch", self.job_block(text, job))
+        self.assertIn('"./npm-tarballs/${file}"', publish)
+        self.assertIn("--provenance", publish)
+        self.assertIn("files: cli-dist/*", self.job_block(text, "github-release"))
+
+    def test_binstall_metadata_matches_release_archive_names(self) -> None:
+        manifest = tomllib.loads(
+            (release_preflight.ROOT / "crates/formualizer-cli/Cargo.toml").read_text(encoding="utf-8")
+        )
+        binstall = manifest["package"]["metadata"]["binstall"]
+        stem = "formualizer-cli-v{ version }-{ target }"
+        self.assertTrue(binstall["pkg-url"].endswith(f"/releases/download/v{{ version }}/{stem}.tar.gz"))
+        self.assertEqual(binstall["bin-dir"], f"{stem}/{{ bin }}{{ binary-ext }}")
+        windows = binstall["overrides"]["x86_64-pc-windows-msvc"]
+        self.assertTrue(windows["pkg-url"].endswith(f"{stem}.zip"))
+        workflow = (self.workflows / "cli-build.yml").read_text(encoding="utf-8")
+        self.assertIn('name="formualizer-cli-v${version}-${target}"', workflow)
+        self.assertIn('"release-assets/${name}.tar.gz"', workflow)
+        self.assertIn('"../release-assets/${name}.zip"', workflow)
+
+
+class PrereleaseWordingTests(unittest.TestCase):
+    NOTICE = "> **Not yet published:** these install channels go live soon.\n"
+
+    def write(self, root: Path, relative: str, text: str) -> None:
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def test_clean_shipped_docs_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.write(root, "README.md", "# Formualizer\n\nInstall with pip.\n")
+            self.write(root, "docs/cli.md", "Planned work lives elsewhere.\n")
+            release_preflight.validate_no_prerelease_wording(root)
+
+    def test_every_shipped_location_is_reported(self) -> None:
+        shipped = (
+            "README.md",
+            "CHANGELOG.md",
+            "bindings/python/README.md",
+            "crates/formualizer-cli/README.md",
+            "npm/formualizer-cli/README.md",
+            "docs/agents.md",
+            "docs/nested/page.md",
+            "skills/formualizer-recalc/SKILL.md",
+            "docs-site/content/docs/recalc-cli/index.mdx",
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            for relative in shipped:
+                self.write(root, relative, "intro\n" + self.NOTICE)
+            hits = release_preflight.find_prerelease_wording(root)
+        self.assertEqual(
+            sorted(hit.split(":", 1)[0] for hit in hits), sorted(shipped)
+        )
+        self.assertTrue(all(":2: > **Not yet published:**" in hit for hit in hits))
+
+    def test_all_phrasings_and_mdx_callouts_are_caught(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.write(
+                root,
+                "docs-site/content/docs/a.mdx",
+                '<Callout type="warn" title="Not yet published">soon</Callout>\n'
+                "Channels are planned (publication pending).\n"
+                "Download the archive once published.\n",
+            )
+            hits = release_preflight.find_prerelease_wording(root)
+        self.assertEqual([hit.split(":")[1] for hit in hits], ["1", "2", "3"])
+
+    def test_unshipped_files_are_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.write(root, "docs-site/node_modules/pkg/README.md", self.NOTICE)
+            self.write(root, "scripts/notes.md", self.NOTICE)
+            self.write(root, "crates/formualizer-cli/src/lib.rs", "// not yet published\n")
+            self.assertEqual(release_preflight.find_prerelease_wording(root), [])
+
+    def test_validation_lists_each_location(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            self.write(root, "docs/cli.md", "x\n" + self.NOTICE)
+            with self.assertRaisesRegex(RuntimeError, r"docs/cli\.md:2: > \*\*Not yet published"):
+                release_preflight.validate_no_prerelease_wording(root)
+
+    def test_cli_flag_runs_only_the_wording_check(self) -> None:
+        with (
+            mock.patch.object(sys, "argv", ["release-preflight.py", "--check-prerelease-wording"]),
+            mock.patch.object(release_preflight, "validate_no_prerelease_wording") as check,
+            mock.patch.object(release_preflight, "preflight") as preflight,
+            mock.patch("builtins.print"),
+        ):
+            self.assertEqual(release_preflight.main(), 0)
+        check.assert_called_once_with()
+        preflight.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class CrateLicenseFileTests(unittest.TestCase):
+    # Already published without the texts; they are added with its next
+    # version, since a same-version source change fails the drift check.
+    PENDING = {"sheetport-spec"}
+
+    def test_published_crates_carry_the_canonical_license_texts(self) -> None:
+        root = release_preflight.ROOT
+        missing = []
+        for manifest_path in sorted((root / "crates").glob("*/Cargo.toml")):
+            manifest = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+            package = manifest["package"]
+            if package.get("publish") is False or package["name"] in self.PENDING:
+                continue
+            for name in ("LICENSE-MIT", "LICENSE-APACHE"):
+                copy = manifest_path.parent / name
+                if not copy.is_file() or copy.read_bytes() != (root / name).read_bytes():
+                    missing.append(f"{package['name']}/{name}")
+        self.assertEqual(missing, [])

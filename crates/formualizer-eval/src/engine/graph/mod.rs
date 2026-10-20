@@ -60,6 +60,24 @@ use crate::engine::topo::{
 use crate::reference::{CellRef, Coord, SharedRangeRef, SharedRef, SharedSheetLocator};
 use formualizer_common::Coord as AbsCoord;
 use formula_dirty::FormulaDirtyState;
+
+/// Whether a parsed formula calls SUBTOTAL or AGGREGATE anywhere.
+fn ast_calls_subtotal(ast: &ASTNode) -> bool {
+    match &ast.node_type {
+        ASTNodeType::Function { name, args } => {
+            super::arena::ast::subtotal_call_bit(name) != 0 || args.iter().any(ast_calls_subtotal)
+        }
+        ASTNodeType::BinaryOp { left, right, .. } => {
+            ast_calls_subtotal(left) || ast_calls_subtotal(right)
+        }
+        ASTNodeType::UnaryOp { expr, .. } => ast_calls_subtotal(expr),
+        ASTNodeType::Array(rows) => rows.iter().flatten().any(ast_calls_subtotal),
+        ASTNodeType::Call { callee, args } => {
+            ast_calls_subtotal(callee) || args.iter().any(ast_calls_subtotal)
+        }
+        _ => false,
+    }
+}
 // topo::pk wiring will be integrated behind config.use_dynamic_topo in a follow-up step
 
 struct RegistryFunctionProvider;
@@ -405,6 +423,12 @@ impl FormulaMap {
         self.touched.push(vertex);
     }
 
+    /// Vertices whose formula was written since the last
+    /// [`Self::take_touched`].
+    pub(crate) fn touched(&self) -> &[VertexId] {
+        &self.touched
+    }
+
     pub(crate) fn has_touched(&self) -> bool {
         !self.touched.is_empty()
     }
@@ -475,6 +499,12 @@ pub struct DependencyGraph {
     // and set representation behind this single authority.
     formula_dirty: FormulaDirtyState,
     volatile_vertices: FxHashSet<VertexId>,
+    /// Whether the next row-visibility change must scan for and dirty the
+    /// formulas that read row visibility (see
+    /// [`Self::mark_row_visibility_readers_dirty`]). Cleared by that scan
+    /// and set again whenever a formula vertex is marked clean, so while it
+    /// is clear every such reader is still dirty and later changes skip it.
+    row_visibility_scan_armed: bool,
 
     /// Monotonic count of vertices processed by dirty-propagation BFS loops
     /// (`mark_dirty_many` / `mark_dirty_many_value_cells`). Cheap plain
@@ -633,8 +663,29 @@ pub struct DependencyGraph {
     // `spill_cell_to_anchor` is keyed by `CellRef` and uses the tuned hasher
     // for the same reason as `cell_to_vertex`.
     spill_anchor_to_cells: FxHashMap<VertexId, Vec<CellRef>>,
+    /// Single-cell fixed arrays have no spill role or registry entry.
+    pub(crate) fixed_single_arrays: FxHashSet<VertexId>,
+    pub(crate) fixed_array_shapes: FxHashMap<VertexId, (u32, u32)>,
     spill_cell_to_anchor: std::collections::HashMap<CellRef, VertexId, CoordBuildHasher>,
     spill_cells_by_sheet: FxHashMap<SheetId, std::collections::BTreeMap<(u32, u32), VertexId>>,
+    /// Anchors whose committed spill may hold a formula placed after the
+    /// spill was committed (or moved there by a structural edit). A spill
+    /// child is a value cell, so only these anchors probe their own cells
+    /// for formulas when they re-plan, commit or clear; every other anchor
+    /// re-spills over its cells without a per-cell lookup (see
+    /// [`Self::spill_may_be_intruded`]). Filled when the authority syncs
+    /// the formula map's touched journal, which every formula write reaches
+    /// whatever its route ([`Self::note_spill_intrusions_of_touched`]), and
+    /// by structural edits. An anchor leaves it when it commits a spill
+    /// free of foreign formulas or its spill is cleared.
+    spill_intruded_anchors: FxHashSet<VertexId>,
+
+    /// Declared dynamic-array anchors (imported source spill identity, for
+    /// example XLSX XLDAPR cell metadata): formula vertex -> the cell it was
+    /// declared at. Empty unless a caller declares one, so workbooks without
+    /// declarations pay only an `is_empty` check on the forget paths. See
+    /// [`Self::is_current_declared_dynamic_anchor`].
+    declared_dynamic_anchors: FxHashMap<VertexId, CellRef>,
 
     /// Request-scoped admission budgets used by graph-owned mutation paths.
     admission_budget_override: Option<crate::engine::EvaluationBudgets>,
@@ -676,6 +727,7 @@ impl DependencyGraph {
     pub(crate) fn clear_formula_vertex_dirty(&mut self, vertex_id: VertexId) {
         self.store.set_dirty(vertex_id, false);
         self.formula_dirty.legacy_remove(&vertex_id);
+        self.row_visibility_scan_armed = true;
     }
 
     /// Return read-only baseline counters for FormulaPlane/dispatch benchmarking.
@@ -899,9 +951,7 @@ impl DependencyGraph {
                 match self.config.sheet_index_mode {
                     crate::engine::SheetIndexMode::Eager
                     | crate::engine::SheetIndexMode::FastBatch => {
-                        for ((input_idx, packed), vid) in
-                            missing_items.into_iter().zip(vids.into_iter())
-                        {
+                        for ((input_idx, packed), vid) in missing_items.into_iter().zip(vids) {
                             let pc = AbsCoord::new(packed.row0(), packed.col0());
                             ordered[input_idx] = Some(vid);
                             add_batch.push((VertexAddr::grid(GridAddr::from_coord(pc)), vid.0));
@@ -934,9 +984,7 @@ impl DependencyGraph {
                         }
                     }
                     crate::engine::SheetIndexMode::Lazy => {
-                        for ((input_idx, packed), vid) in
-                            missing_items.into_iter().zip(vids.into_iter())
-                        {
+                        for ((input_idx, packed), vid) in missing_items.into_iter().zip(vids) {
                             let pc = AbsCoord::new(packed.row0(), packed.col0());
                             ordered[input_idx] = Some(vid);
                             add_batch.push((VertexAddr::grid(GridAddr::from_coord(pc)), vid.0));
@@ -1033,7 +1081,7 @@ impl DependencyGraph {
                     t_alloc_us += ta0.elapsed().as_micros();
                 }
 
-                for ((input_idx, packed), vid) in items.into_iter().zip(vids.into_iter()) {
+                for ((input_idx, packed), vid) in items.into_iter().zip(vids) {
                     let pc = AbsCoord::new(packed.row0(), packed.col0());
                     ordered[input_idx] = Some(vid);
                     add_batch.push((VertexAddr::grid(GridAddr::from_coord(pc)), vid.0));
@@ -1275,6 +1323,7 @@ impl DependencyGraph {
         dynamic: bool,
     ) {
         self.materialize_vertex(vid);
+        self.forget_declared_dynamic_anchor(vid);
         if self.vertex_formulas.contains_key(&vid) {
             self.remove_dependent_edges(vid);
         }
@@ -1315,6 +1364,7 @@ impl DependencyGraph {
             !self.vertex_formulas.contains_key(&vid),
             "load-fast formula assignment expects fresh/non-formula vertices"
         );
+        self.forget_declared_dynamic_anchor(vid);
         self.store
             .set_kind(vid, crate::engine::vertex::VertexKind::FormulaScalar);
         self.vertex_values.remove(&vid);
@@ -1875,6 +1925,7 @@ impl DependencyGraph {
             extent_dropped: Vec::new(),
             extent_undone: Vec::new(),
             volatile_vertices: FxHashSet::default(),
+            row_visibility_scan_armed: true,
             ref_error_vertices: FxHashSet::default(),
             #[cfg(any(test, feature = "legacy_oracle"))]
             formula_to_range_deps: FxHashMap::default(),
@@ -1914,8 +1965,12 @@ impl DependencyGraph {
             #[cfg(any(test, feature = "legacy_oracle"))]
             pk_order: None,
             spill_anchor_to_cells: FxHashMap::default(),
+            fixed_single_arrays: FxHashSet::default(),
+            fixed_array_shapes: FxHashMap::default(),
             spill_cell_to_anchor: std::collections::HashMap::with_hasher(CoordBuildHasher),
             spill_cells_by_sheet: FxHashMap::default(),
+            spill_intruded_anchors: FxHashSet::default(),
+            declared_dynamic_anchors: FxHashMap::default(),
             admission_budget_override: None,
             first_load_assume_new: false,
             ensure_touched_sheets: FxHashSet::default(),
@@ -2492,6 +2547,53 @@ impl DependencyGraph {
         })
     }
 
+    /// Formula cells of `sheet_id` in the rectangle whose formula template
+    /// satisfies `matches`, as `(col, first_row, last_row)` intervals
+    /// (0-based, inclusive). A virtual member run is tested once by its
+    /// shared template and yields at most one clipped interval, so a long
+    /// filled-down family costs one check instead of one per member;
+    /// materialized vertices come from the sheet index's smaller axis,
+    /// filtered by template and then by position, one single-row interval
+    /// each.
+    pub(crate) fn formula_intervals_in_region(
+        &self,
+        sheet_id: SheetId,
+        start_row0: u32,
+        end_row0: u32,
+        start_col0: u32,
+        end_col0: u32,
+        mut matches: impl FnMut(AstNodeId) -> bool,
+    ) -> Vec<(u32, u32, u32)> {
+        let mut out = Vec::new();
+        if let Some(index) = self.sheet_indexes.get(&sheet_id) {
+            for v in index.rect_candidates(start_row0, end_row0, start_col0, end_col0) {
+                if !self.formula_view(v).is_some_and(|f| matches(f.template)) {
+                    continue;
+                }
+                if let Some(cell) = self.get_cell_ref(v) {
+                    let (row, col) = (cell.coord.row(), cell.coord.col());
+                    if (start_row0..=end_row0).contains(&row)
+                        && (start_col0..=end_col0).contains(&col)
+                    {
+                        out.push((col, row, row));
+                    }
+                }
+            }
+        }
+        for r in self
+            .vertex_formulas
+            .virtual_members()
+            .runs_in_cols(sheet_id, start_col0, end_col0)
+        {
+            let lo = r.row0.max(start_row0);
+            let hi = (r.row0 + r.len - 1).min(end_row0);
+            if lo <= hi && matches(r.template) {
+                out.push((r.col, lo, hi));
+            }
+        }
+        out
+    }
+
     pub(crate) fn vertices_in_region(
         &self,
         sheet_id: SheetId,
@@ -2831,6 +2933,7 @@ impl DependencyGraph {
         }
 
         // Remove old dependencies first
+        self.forget_declared_dynamic_anchor(addr_vertex_id);
         self.remove_dependent_edges(addr_vertex_id);
         self.detach_vertex_from_names(addr_vertex_id);
         self.clear_pending_name_references(addr_vertex_id);
@@ -3368,6 +3471,9 @@ impl DependencyGraph {
 
     /// Clear dirty flags after successful evaluation
     pub fn clear_dirty_flags(&mut self, vertices: &[VertexId]) {
+        if !vertices.is_empty() {
+            self.row_visibility_scan_armed = true;
+        }
         for &vertex_id in vertices {
             self.store.set_dirty(vertex_id, false);
             self.formula_dirty.legacy_remove(&vertex_id);
@@ -3379,6 +3485,46 @@ impl DependencyGraph {
     /// 🔮 Scalability Hook: Clear volatile vertices after evaluation cycle
     pub fn clear_volatile_flags(&mut self) {
         self.volatile_vertices.clear();
+    }
+
+    /// Dirties every formula that reads row visibility, and its dependents,
+    /// after hidden rows changed. A reader is a formula or named formula that
+    /// calls SUBTOTAL or AGGREGATE; those functions are not volatile, so
+    /// value edits reach them through ordinary dependencies and only
+    /// visibility changes come through here. The scan runs once per change
+    /// burst: until a formula vertex is marked clean again, every reader is
+    /// still dirty and further changes return immediately.
+    pub(crate) fn mark_row_visibility_readers_dirty(&mut self) {
+        if !self.row_visibility_scan_armed {
+            return;
+        }
+        self.row_visibility_scan_armed = false;
+        let ds = &self.data_store;
+        let mut by_template: FxHashMap<AstNodeId, bool> = FxHashMap::default();
+        let mut readers: Vec<VertexId> = self
+            .vertex_formulas
+            .keys()
+            .filter(|&v| {
+                self.formula_view(v).is_some_and(|f| {
+                    *by_template
+                        .entry(f.template)
+                        .or_insert_with(|| ds.ast_subtotal_calls(f.template) != 0)
+                })
+            })
+            .collect();
+        readers.extend(
+            self.named_ranges
+                .values()
+                .chain(self.sheet_named_ranges.values())
+                .filter(|named| match &named.definition {
+                    NamedDefinition::Formula { ast, .. } => ast_calls_subtotal(ast),
+                    _ => false,
+                })
+                .map(|named| named.vertex),
+        );
+        if !readers.is_empty() {
+            self.mark_dirty_many(&readers);
+        }
     }
 
     /// Re-marks all volatile vertices as dirty for the next evaluation cycle.
@@ -3449,6 +3595,7 @@ impl DependencyGraph {
         self.remove_dependent_edges(v);
         self.detach_vertex_from_names(v);
         self.clear_pending_name_references(v);
+        self.forget_declared_dynamic_anchor(v);
         self.vertex_formulas.remove(&v);
         self.vertex_values.remove(&v);
         self.ref_error_vertices.remove(&v);
@@ -4302,6 +4449,7 @@ impl DependencyGraph {
         }
 
         for (i, &tvid) in target_vids.iter().enumerate() {
+            self.forget_declared_dynamic_anchor(tvid);
             if self.vertex_formulas.contains_key(&tvid) {
                 self.remove_dependent_edges(tvid);
             }
@@ -4383,7 +4531,32 @@ impl DependencyGraph {
         #[cfg(any(test, feature = "legacy_oracle"))]
         self.edges.end_batch();
 
-        Ok(planned.len())
+        // Readers of the written cells hold values computed from the old
+        // contents. The targets are already dirty; dirty their transitive
+        // readers once, as `set_cell_formula` does per cell. The cells are
+        // coalesced into vertical runs so a copied-down batch is a handful of
+        // rectangles for one closure query (or one queued flush inside a
+        // deferred-dirty scope), not a query per target. The plans are
+        // dropped first: the closure query syncs the dependency authority,
+        // and holding every plan across that sync raises peak memory.
+        let written = planned.len();
+        let mut cells: Vec<(u32, u32)> = planned
+            .iter()
+            .map(|(row, col, _, _)| (col.saturating_sub(1), row.saturating_sub(1)))
+            .collect();
+        drop(planned);
+        cells.sort_unstable();
+        cells.dedup();
+        let mut runs: Vec<(SheetId, u32, u32, u32, u32)> = Vec::new();
+        for (col, row) in cells {
+            match runs.last_mut() {
+                Some((_, _, r1, c0, _)) if *c0 == col && *r1 + 1 == row => *r1 = row,
+                _ => runs.push((sheet_id, row, row, col, col)),
+            }
+        }
+        self.mark_dirty_rects(&runs);
+
+        Ok(written)
     }
 
     #[cfg(any(test, feature = "legacy_oracle"))]
@@ -4611,25 +4784,37 @@ impl DependencyGraph {
         self.vertex_values.insert(vertex_id, value_ref);
     }
 
-    /// Plan a spill region for an anchor; returns #SPILL! if blocked
+    /// Plan a spill region for an anchor; returns #SPILL! if blocked.
+    ///
+    /// A target cell blocks the spill when it is owned by another anchor's
+    /// spill, holds another formula (scalar or array), or holds a non-empty
+    /// value. Evaluation turns a blocked plan into a `#SPILL!` anchor value.
     pub fn plan_spill_region(
         &self,
         anchor: VertexId,
         target_cells: &[CellRef],
     ) -> Result<(), ExcelError> {
-        self.plan_spill_region_allowing_formula_overwrite(anchor, target_cells, None)
+        self.plan_spill_region_yielding(anchor, target_cells, &[])
+            .map_err(|(error, _)| error)
     }
 
-    /// Plan a spill region, optionally allowing specific formula vertices to be overwritten.
-    ///
-    /// This is used by parallel evaluation to allow spill anchors to take precedence over
-    /// other formula vertices that are being evaluated in the same layer.
-    pub(crate) fn plan_spill_region_allowing_formula_overwrite(
+    /// [`Self::plan_spill_region`], also returning the first blocking cell.
+    pub(crate) fn plan_spill_region_with_blocker(
         &self,
         anchor: VertexId,
         target_cells: &[CellRef],
-        overwritable_formulas: Option<&rustc_hash::FxHashSet<VertexId>>,
-    ) -> Result<(), ExcelError> {
+    ) -> Result<(), (ExcelError, CellRef)> {
+        self.plan_spill_region_yielding(anchor, target_cells, &[])
+    }
+
+    /// [`Self::plan_spill_region`] with the spills of `yielding` anchors
+    /// treated as already cleared.
+    fn plan_spill_region_yielding(
+        &self,
+        anchor: VertexId,
+        target_cells: &[CellRef],
+        yielding: &[VertexId],
+    ) -> Result<(), (ExcelError, CellRef)> {
         use formualizer_common::{ExcelErrorExtra, ExcelErrorKind};
         // Compute expected spill shape from the target rectangle for better diagnostics
         let (expected_rows, expected_cols) = if target_cells.is_empty() {
@@ -4660,56 +4845,67 @@ impl DependencyGraph {
                 max_c.saturating_sub(min_c).saturating_add(1),
             )
         };
+        // Only an anchor a formula may have entered probes its own cells.
+        let probe_owned = self.spill_may_be_intruded(anchor);
         // Allow overlapping with previously owned spill cells by this anchor
         for cell in target_cells {
             // If cell is already owned by this anchor's previous spill, it's allowed.
             let owned_by_anchor = match self.spill_cell_to_anchor.get(cell) {
                 Some(&existing_anchor) if existing_anchor == anchor => true,
+                Some(other) if yielding.contains(other) => false,
                 Some(_other) => {
-                    return Err(ExcelError::new(ExcelErrorKind::Spill)
-                        .with_message("BlockedBySpill")
-                        .with_extra(ExcelErrorExtra::Spill {
-                            expected_rows,
-                            expected_cols,
-                        }));
+                    return Err((
+                        ExcelError::new(ExcelErrorKind::Spill)
+                            .with_message("BlockedBySpill")
+                            .with_extra(ExcelErrorExtra::Spill {
+                                expected_rows,
+                                expected_cols,
+                            }),
+                        *cell,
+                    ));
                 }
                 None => false,
             };
 
-            if owned_by_anchor {
+            // A spill child is a value cell, so a formula there was entered
+            // after this anchor last spilled: it blocks the next spill like
+            // any other formula. (Values keep the previous behavior.) Such
+            // an anchor was recorded as intruded; no other anchor probes.
+            if owned_by_anchor && !(probe_owned && self.is_foreign_formula_cell(cell, anchor)) {
                 continue;
             }
 
-            // If cell is occupied by another formula anchor, block unless explicitly allowed.
+            // If cell is occupied by another formula, block.
             if let Some(vid) = self.cell_vertex(cell)
                 && vid != anchor
             {
                 // Prevent clobbering formulas (array or scalar) in the target area
                 match self.store.kind(vid) {
                     VertexKind::FormulaScalar | VertexKind::FormulaArray => {
-                        if let Some(allow) = overwritable_formulas
-                            && allow.contains(&vid)
-                        {
-                            continue;
-                        }
-                        return Err(ExcelError::new(ExcelErrorKind::Spill)
-                            .with_message("BlockedByFormula")
-                            .with_extra(ExcelErrorExtra::Spill {
-                                expected_rows,
-                                expected_cols,
-                            }));
+                        return Err((
+                            ExcelError::new(ExcelErrorKind::Spill)
+                                .with_message("BlockedByFormula")
+                                .with_extra(ExcelErrorExtra::Spill {
+                                    expected_rows,
+                                    expected_cols,
+                                }),
+                            *cell,
+                        ));
                     }
                     _ => {
                         // If a non-empty value exists (and not this anchor), block
                         if let Some(vref) = self.vertex_values.get(&vid) {
                             let v = self.data_store.retrieve_value(*vref);
                             if !matches!(v, LiteralValue::Empty) {
-                                return Err(ExcelError::new(ExcelErrorKind::Spill)
-                                    .with_message("BlockedByValue")
-                                    .with_extra(ExcelErrorExtra::Spill {
-                                        expected_rows,
-                                        expected_cols,
-                                    }));
+                                return Err((
+                                    ExcelError::new(ExcelErrorKind::Spill)
+                                        .with_message("BlockedByValue")
+                                        .with_extra(ExcelErrorExtra::Spill {
+                                            expected_rows,
+                                            expected_cols,
+                                        }),
+                                    *cell,
+                                ));
                             }
                         }
                     }
@@ -4725,6 +4921,12 @@ impl DependencyGraph {
     /// Commit a spill atomically with an internal shadow buffer and optional fault injection.
     /// If a fault is injected partway through, all changes are rolled back to the pre-commit state.
     /// This does not change behavior under normal operation; it's primarily for Phase 3 guarantees and tests.
+    ///
+    /// Precondition: `target_cells` is the full spill rectangle in row-major
+    /// order, starting at the anchor cell. The registry stores the vector
+    /// verbatim, and [`Self::spill_extent_for_anchor`] reads the rectangle
+    /// from its first and last cells in O(1) (returning `None` for a vector
+    /// that fails its shape check, such as a truncated snapshot).
     pub fn commit_spill_region_atomic_with_fault(
         &mut self,
         anchor: VertexId,
@@ -4773,9 +4975,12 @@ impl DependencyGraph {
         }
         let mut ops: Vec<Op> = Vec::new();
 
-        // Clears for cells no longer used
+        // Clears for cells no longer used; a formula entered into the spill
+        // stays.
+        let probe_owned = self.spill_may_be_intruded(anchor);
+        let entered = |cell: &CellRef| probe_owned && self.is_foreign_formula_cell(cell, anchor);
         for cell in prev_cells.iter() {
-            if !new_set.contains(cell) {
+            if !new_set.contains(cell) && !entered(cell) {
                 let sheet = self.sheet_name(cell.sheet_id).to_string();
                 ops.push(Op {
                     sheet,
@@ -4877,6 +5082,17 @@ impl DependencyGraph {
                 .or_default()
                 .insert((cell.coord.row(), cell.coord.col()), anchor);
         }
+        // The committed spill holds no foreign formula (the planner refused
+        // one) unless a caller committed without planning: stay recorded
+        // then.
+        if !self.spill_intruded_anchors.is_empty()
+            && self.spill_intruded_anchors.contains(&anchor)
+            && !target_cells
+                .iter()
+                .any(|cell| self.is_foreign_formula_cell(cell, anchor))
+        {
+            self.spill_intruded_anchors.remove(&anchor);
+        }
         self.spill_anchor_to_cells.insert(anchor, target_cells);
         Ok(())
     }
@@ -4885,6 +5101,33 @@ impl DependencyGraph {
         self.spill_anchor_to_cells
             .get(&anchor)
             .map(|v| v.as_slice())
+    }
+
+    /// The committed spill rectangle of `anchor` as its (top-left,
+    /// bottom-right) corners, in O(1).
+    ///
+    /// Spill targets are registered row-major over a rectangle whose first
+    /// cell is the anchor, so the first and last targets are its corners;
+    /// no member cell is scanned. A registry entry that is not such a
+    /// rectangle (for example a truncated snapshot restored by undo or
+    /// replay) is detected by the O(1) shape check and yields `None`, so a
+    /// spill reference to it is `#REF!` rather than a partial range.
+    pub(crate) fn spill_extent_for_anchor(&self, anchor: VertexId) -> Option<(CellRef, CellRef)> {
+        let cells = self.spill_anchor_to_cells.get(&anchor)?;
+        let first = *cells.first()?;
+        let last = *cells.last()?;
+        if last.sheet_id != first.sheet_id
+            || last.coord.row() < first.coord.row()
+            || last.coord.col() < first.coord.col()
+        {
+            return None;
+        }
+        let rows = (last.coord.row() - first.coord.row()) as usize + 1;
+        let cols = (last.coord.col() - first.coord.col()) as usize + 1;
+        if rows.checked_mul(cols) != Some(cells.len()) {
+            return None;
+        }
+        Some((first, last))
     }
 
     pub(crate) fn spill_registry_has_anchor(&self, anchor: VertexId) -> bool {
@@ -4900,6 +5143,188 @@ impl DependencyGraph {
             self.spill_anchor_to_cells.len(),
             self.spill_cell_to_anchor.len(),
         )
+    }
+
+    /// Record `anchor`, a formula vertex at `cell`, as a declared dynamic
+    /// array anchor. Returns whether it was newly declared.
+    pub(crate) fn declare_dynamic_anchor(&mut self, anchor: VertexId, cell: CellRef) -> bool {
+        let cell = CellRef::new(
+            cell.sheet_id,
+            Coord::new(cell.coord.row(), cell.coord.col(), true, true),
+        );
+        self.declared_dynamic_anchors.insert(anchor, cell) != Some(cell)
+    }
+
+    /// Drop a declaration because its formula vertex was replaced, removed or
+    /// moved. Free when nothing is declared.
+    #[inline]
+    pub(crate) fn forget_declared_dynamic_anchor(&mut self, vertex: VertexId) {
+        if !self.fixed_single_arrays.is_empty() {
+            self.fixed_single_arrays.remove(&vertex);
+        }
+        if !self.fixed_array_shapes.is_empty() {
+            self.fixed_array_shapes.remove(&vertex);
+        }
+        if !self.declared_dynamic_anchors.is_empty() {
+            self.declared_dynamic_anchors.remove(&vertex);
+        }
+    }
+
+    /// Whether `vertex` is a declared dynamic-array anchor that still holds
+    /// a formula at the cell it was declared at. The position check is a
+    /// backstop for edit paths that move a vertex without passing through
+    /// [`Self::set_grid_addr`]; such a declaration is ignored, not revived.
+    pub(crate) fn is_current_declared_dynamic_anchor(&self, vertex: VertexId) -> bool {
+        if self.declared_dynamic_anchors.is_empty() {
+            return false;
+        }
+        self.declared_dynamic_anchors
+            .get(&vertex)
+            .is_some_and(|declared| {
+                self.vertex_has_formula(vertex)
+                    && self.get_cell_ref(vertex).is_some_and(|at| {
+                        at.sheet_id == declared.sheet_id
+                            && at.coord.row() == declared.coord.row()
+                            && at.coord.col() == declared.coord.col()
+                    })
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn declared_dynamic_anchor_count(&self) -> usize {
+        self.declared_dynamic_anchors.len()
+    }
+
+    /// Spills that must yield to `anchor` when its planned rectangle
+    /// `target_cells` (row-major) collides with them; `None` when `anchor`
+    /// is blocked instead.
+    ///
+    /// Engine policy for colliding spill extents, independent of evaluation
+    /// and edit order: when neither anchor lies inside the other's rectangle,
+    /// the anchor first in (sheet, column, row) order spills and the other
+    /// gets `#SPILL!`. That is the order in which a schedule layer commits
+    /// its cells, so a fresh evaluation already resolves this way; a later
+    /// edit or a different layer order reaches the same result by making the
+    /// later anchor yield. An anchor inside the other's rectangle is a formula
+    /// blocker and is handled by the formula rule, not here. Every blocker
+    /// must yield for the anchor to spill.
+    pub(crate) fn spills_yielding_to(
+        &self,
+        anchor: VertexId,
+        target_cells: &[CellRef],
+    ) -> Option<Vec<VertexId>> {
+        let anchor_cell = self.get_cell_ref(anchor)?;
+        let (first, last) = (*target_cells.first()?, *target_cells.last()?);
+        let inside = |cell: CellRef, first: CellRef, last: CellRef| {
+            cell.sheet_id == first.sheet_id
+                && (first.coord.row()..=last.coord.row()).contains(&cell.coord.row())
+                && (first.coord.col()..=last.coord.col()).contains(&cell.coord.col())
+        };
+        let key = |cell: CellRef| (cell.sheet_id, cell.coord.col(), cell.coord.row());
+        let mut yielding: Vec<VertexId> = Vec::new();
+        for cell in target_cells {
+            let Some(&owner) = self.spill_cell_to_anchor.get(cell) else {
+                continue;
+            };
+            if owner == anchor || yielding.contains(&owner) {
+                continue;
+            }
+            let owner_cell = self.get_cell_ref(owner)?;
+            let (owner_first, owner_last) = self.spill_extent_for_anchor(owner)?;
+            if inside(owner_cell, first, last)
+                || inside(anchor_cell, owner_first, owner_last)
+                || key(owner_cell) <= key(anchor_cell)
+            {
+                return None;
+            }
+            yielding.push(owner);
+        }
+        if yielding.is_empty() {
+            return None;
+        }
+        self.plan_spill_region_yielding(anchor, target_cells, &yielding)
+            .ok()
+            .map(|()| yielding)
+    }
+
+    /// The anchor's registered spill cells that clearing the spill empties:
+    /// every cell except a formula entered into the spill after it was
+    /// committed, which keeps its own value.
+    pub(crate) fn spill_cells_to_clear(&self, anchor: VertexId) -> Vec<CellRef> {
+        let Some(cells) = self.spill_cells_for_anchor(anchor) else {
+            return Vec::new();
+        };
+        if !self.spill_may_be_intruded(anchor) {
+            return cells.to_vec();
+        }
+        cells
+            .iter()
+            .copied()
+            .filter(|cell| !self.is_foreign_formula_cell(cell, anchor))
+            .collect()
+    }
+
+    /// Whether `anchor`'s committed spill may hold a foreign formula: it is
+    /// recorded in `spill_intruded_anchors`, or a formula write has not
+    /// been synced into that record yet (inside a deferred-dirty batch,
+    /// say). O(1).
+    #[inline]
+    pub(crate) fn spill_may_be_intruded(&self, anchor: VertexId) -> bool {
+        self.vertex_formulas.has_touched()
+            || (!self.spill_intruded_anchors.is_empty()
+                && self.spill_intruded_anchors.contains(&anchor))
+    }
+
+    /// Record the anchors whose committed spill holds a formula written
+    /// since the last authority sync (the formula map's touched journal),
+    /// and return those not recorded before: the caller wakes them so their
+    /// next recalc re-plans and reports `#SPILL!`. O(touched) lookups, and
+    /// nothing at all without a committed spill.
+    pub(crate) fn note_spill_intrusions_of_touched(&mut self) -> Vec<VertexId> {
+        if self.spill_cell_to_anchor.is_empty() {
+            return Vec::new();
+        }
+        let owners: Vec<VertexId> = self
+            .vertex_formulas
+            .touched()
+            .iter()
+            .filter_map(|&vertex| {
+                let cell = self.get_cell_ref(vertex)?;
+                let &owner = self.spill_cell_to_anchor.get(&cell)?;
+                (owner != vertex && self.is_foreign_formula_cell(&cell, owner)).then_some(owner)
+            })
+            .collect();
+        owners
+            .into_iter()
+            .filter(|&owner| self.spill_intruded_anchors.insert(owner))
+            .collect()
+    }
+
+    /// A structural edit is about to move cells: any committed spill may
+    /// end up holding a moved formula, so every anchor probes its cells
+    /// once more. O(anchors).
+    pub(crate) fn note_structural_spill_intrusions(&mut self) {
+        if self.spill_anchor_to_cells.is_empty() {
+            return;
+        }
+        let anchors: Vec<VertexId> = self.spill_anchor_to_cells.keys().copied().collect();
+        self.spill_intruded_anchors.extend(anchors);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spill_intruded_anchor_count(&self) -> usize {
+        self.spill_intruded_anchors.len()
+    }
+
+    /// Whether `cell` holds a formula vertex other than `anchor`.
+    pub(crate) fn is_foreign_formula_cell(&self, cell: &CellRef, anchor: VertexId) -> bool {
+        self.cell_vertex(cell).is_some_and(|vid| {
+            vid != anchor
+                && matches!(
+                    self.store.kind(vid),
+                    VertexKind::FormulaScalar | VertexKind::FormulaArray
+                )
+        })
     }
 
     /// Clear an existing spill region for an anchor (set cells to Empty and forget ownership)
@@ -4920,6 +5345,10 @@ impl DependencyGraph {
         let Some(cells) = self.spill_anchor_to_cells.remove(&anchor) else {
             return Vec::new();
         };
+        let probe_owned = self.spill_may_be_intruded(anchor);
+        if !self.spill_intruded_anchors.is_empty() {
+            self.spill_intruded_anchors.remove(&anchor);
+        }
 
         // Remove ownership for all cells first.
         for cell in cells.iter() {
@@ -4941,7 +5370,9 @@ impl DependencyGraph {
         let mut changed: Vec<crate::engine::authority::geom::Cell> = Vec::new();
         for cell in cells.iter().copied() {
             let is_anchor = anchor_cell.map(|a| a == cell).unwrap_or(false);
-            if is_anchor {
+            // A formula entered into the spill after it was committed is the
+            // user's cell, not a child: it stays.
+            if is_anchor || (probe_owned && self.is_foreign_formula_cell(&cell, anchor)) {
                 continue;
             }
             self.vacate_cell(&cell);
@@ -5152,7 +5583,10 @@ impl DependencyGraph {
         Some((ast_id, self.is_volatile(vertex_id)))
     }
 
-    pub fn get_formula_node(&self, vertex_id: VertexId) -> Option<&super::arena::AstNodeData> {
+    pub fn get_formula_node(
+        &self,
+        vertex_id: VertexId,
+    ) -> Option<&super::arena::AstNodeData<super::arena::RefId>> {
         let ast_id = self.get_formula_id(vertex_id)?;
         self.data_store.get_node(ast_id)
     }
@@ -5160,7 +5594,7 @@ impl DependencyGraph {
     pub fn get_formula_node_and_volatile(
         &self,
         vertex_id: VertexId,
-    ) -> Option<(&super::arena::AstNodeData, bool)> {
+    ) -> Option<(&super::arena::AstNodeData<super::arena::RefId>, bool)> {
         let (ast_id, vol) = self.get_formula_id_and_volatile(vertex_id)?;
         let node = self.data_store.get_node(ast_id)?;
         Some((node, vol))
@@ -5461,7 +5895,26 @@ impl DependencyGraph {
     #[doc(hidden)]
     pub fn set_grid_addr(&mut self, id: VertexId, coord: GridAddr) {
         self.materialize_vertex(id);
+        // A declared dynamic-array anchor's identity does not follow a moved
+        // vertex (FORM211): the declaration is cleared.
+        if (!self.declared_dynamic_anchors.is_empty()
+            || !self.fixed_single_arrays.is_empty()
+            || !self.fixed_array_shapes.is_empty())
+            && self.store.grid_addr(id) != Some(coord)
+        {
+            self.forget_declared_dynamic_anchor(id);
+        }
+        let old = self.store.grid_addr(id);
         self.store.set_addr(id, VertexAddr::grid(coord));
+        // Keep an indexed vertex at its new position: range and nested
+        // subtotal queries read the index, then check the vertex's address.
+        if let Some(old) = old
+            && old != coord
+            && let Some(index) = self.sheet_indexes.get_mut(&self.store.sheet_id(id))
+            && index.remove_indexed_vertex(old, id)
+        {
+            index.add_vertex(coord, id);
+        }
     }
 
     /// Update edge cache coordinate
@@ -5498,6 +5951,7 @@ impl DependencyGraph {
             self.formula_dirty.legacy_insert(id);
         } else {
             self.formula_dirty.legacy_remove(&id);
+            self.row_visibility_scan_armed = true;
         }
     }
 

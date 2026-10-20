@@ -13,9 +13,12 @@ fn coerce_to_int(arg: &ArgumentHandle) -> Result<i32, ExcelError> {
     match v {
         LiteralValue::Int(i) => Ok(i as i32),
         LiteralValue::Number(f) => Ok(f.trunc() as i32),
-        LiteralValue::Text(s) => s.parse::<f64>().map(|f| f.trunc() as i32).map_err(|_| {
-            ExcelError::new_value().with_message("DATE/TIME argument is not a valid number")
-        }),
+        LiteralValue::Text(s) => crate::locale::Locale::invariant()
+            .parse_number_invariant(&s)
+            .map(|f| f.trunc() as i32)
+            .ok_or_else(|| {
+                ExcelError::new_value().with_message("DATE/TIME argument is not a valid number")
+            }),
         LiteralValue::Boolean(b) => Ok(if b { 1 } else { 0 }),
         LiteralValue::Empty => Ok(0),
         LiteralValue::Error(e) => Err(e),
@@ -208,8 +211,17 @@ impl Function for TimeFn {
         let minute = coerce_to_int(&args[1])?;
         let second = coerce_to_int(&args[2])?;
 
+        // Excel accepts each component up to 32767 and returns #NUM! above
+        // it. The sum is in i64, so no i32 input can overflow it.
+        const MAX_TIME_COMPONENT: i32 = 32767;
+        if hour > MAX_TIME_COMPONENT || minute > MAX_TIME_COMPONENT || second > MAX_TIME_COMPONENT {
+            return Ok(crate::traits::CalcValue::Scalar(LiteralValue::Error(
+                ExcelError::new_num(),
+            )));
+        }
+
         // Excel normalizes time values
-        let total_seconds = hour * 3600 + minute * 60 + second;
+        let total_seconds = i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
 
         // Handle negative time by wrapping
         let normalized_seconds = if total_seconds < 0 {

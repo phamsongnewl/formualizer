@@ -23,7 +23,7 @@ Use [`formualizer-eval`](https://crates.io/crates/formualizer-eval) instead if y
 
 The default-enabled `xlsx-recalc` feature provides `recalculate_xlsx_bytes`; minimal builds can omit it with `default-features = false`. It uses Calamine and the existing evaluator, then surgically patches formula caches and the corresponding ZIP32 metadata without importing an Umya document. Untouched XML, metadata and compressed payloads are retained; a cache no-op returns the original bytes exactly. Native `recalculate_xlsx_file` adds bounded snapshots and same-directory atomic replacement, not source compare-and-swap.
 
-This is a strict opt-in subset: tables, array/data-table metadata, multi-cell spills, unsupported ZIP/XML representations and nonrepresentable results fail without publishing partial output. Source epochs, typed caches, cooperative cancellation and configurable bounds are covered by the shared core. See [cache-only XLSX](../../docs/cache-only-xlsx.md) for exact eligibility, defaults and error policy.
+This is a strict opt-in subset: tables, legacy array/data-table formulas, rich or unknown metadata, unsupported spill shapes, unsupported ZIP/XML representations and nonrepresentable results fail without publishing partial output. Dynamic arrays are supported within a documented subset. Source epochs, typed caches, cooperative cancellation and configurable bounds are covered by the shared core. See [cache-only XLSX](../../docs/cache-only-xlsx.md) for exact eligibility, defaults and error policy.
 
 ## Quick start
 
@@ -104,6 +104,14 @@ cargo run -p formualizer-workbook --features wasm_runtime_wasmtime --example was
   - `csv` — CSV/TSV import/export
 - **Batch transactions** — atomic multi-cell operations with rollback.
 - **Evaluation planning** — inspect the dependency schedule before computing.
+
+## Ordinary Calamine loading and non-calculating sheets
+
+Ordinary Calamine loads omit chartsheets, dialogsheets and module sheets with an empty `r:id`. They are not engine sheets: direct cell/range reads and `INDIRECT` reads resolve as unknown sheets (`#REF!`), including formulas added after loading. `Workbook::sheet_import_diagnostics` (Python: `sheet_import_diagnostics`) reports each omitted sheet's name and kind. Defined names retain the original `localSheetId` ordering across all source sheet entries; names scoped to omitted sheets are dropped with a name-import diagnostic.
+
+This is intentionally not a preservation-oriented document model. `SHEET()`/`SHEETS()` do not count omitted sheets. Positional functions such as `ROW(Chart1!A5)` behave as for any unknown sheet (returning 5); a 3-D span with an omitted endpoint also behaves as for an unknown sheet. `add_sheet("Chart1")` can create a new ordinary, editable worksheet under an omitted sheet's name.
+
+`to_xlsx_bytes` constructs a fresh workbook without the omitted sheets or their opaque chart/dialog/module parts. This convenience writer already does not serialize defined names and does not preserve arbitrary original package parts; it is not a round-trip editor. Cache-only recalculation has a separate preservation policy; see [cache-only XLSX](../../docs/cache-only-xlsx.md).
 
 ## Retaining a rich Umya document after ingestion
 

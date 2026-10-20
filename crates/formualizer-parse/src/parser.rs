@@ -1,3 +1,4 @@
+use crate::ParserLimits;
 use crate::structured_ref;
 use crate::tokenizer::{
     Associativity, Token, TokenSpan, TokenStream, TokenSubType, TokenType, TokenizerError,
@@ -17,6 +18,7 @@ use formualizer_common::{
 };
 use once_cell::sync::Lazy;
 use smallvec::SmallVec;
+use std::borrow::Cow;
 use std::error::Error;
 use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};
@@ -202,9 +204,10 @@ impl ExternalRefKind {
         }
     }
 
-    // Constructor-style helper mirroring the enum fields.
-    // Keeping the signature explicit makes callers easier to read.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor mirroring the enum fields; an explicit signature keeps callers readable"
+    )]
     pub fn range_with_abs(
         start_row: Option<u32>,
         start_col: Option<u32>,
@@ -425,9 +428,10 @@ impl ReferenceType {
     }
 
     /// Build a range reference with explicit anchors.
-    // Constructor-style helper mirroring the enum fields.
-    // Keeping the signature explicit makes callers easier to read.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "constructor mirroring the enum fields; an explicit signature keeps callers readable"
+    )]
     pub fn range_with_abs(
         sheet: Option<String>,
         start_row: Option<u32>,
@@ -552,15 +556,14 @@ impl ReferenceType {
 
     fn parse_excel_sheet_ref(reference: &str) -> Result<SheetRef<'static>, ParsingError> {
         let (spec, ref_part) = Self::extract_sheet_spec(reference);
-        if matches!(spec, SheetSpec::Range { .. }) {
-            return Err(ParsingError::InvalidReference(
-                "3D references are not supported for SheetRef".to_string(),
-            ));
-        }
         let sheet = match spec {
             SheetSpec::None => None,
             SheetSpec::Single(name) => Some(name),
-            SheetSpec::Range { .. } => unreachable!(),
+            SheetSpec::Range { .. } => {
+                return Err(ParsingError::InvalidReference(
+                    "3D references are not supported for SheetRef".to_string(),
+                ));
+            }
         };
 
         if ref_part.contains('[') {
@@ -574,13 +577,7 @@ impl ReferenceType {
             None => SheetLocator::Current,
         };
 
-        if ref_part.contains(':') {
-            let mut parts = ref_part.splitn(2, ':');
-            let start = parts.next().unwrap();
-            let end = parts.next().ok_or_else(|| {
-                ParsingError::InvalidReference(format!("Invalid range: {ref_part}"))
-            })?;
-
+        if let Some((start, end)) = ref_part.split_once(':') {
             let (start_col, start_row) = Self::parse_range_part_with_abs(start)?;
             let (end_col, end_row) = Self::parse_range_part_with_abs(end)?;
 
@@ -596,6 +593,10 @@ impl ReferenceType {
         } else {
             let (row, col, row_abs, col_abs) = parse_a1_1based(&ref_part)
                 .map_err(|err| ParsingError::InvalidReference(err.to_string()))?;
+            #[expect(
+                clippy::arithmetic_side_effects,
+                reason = "parse_a1_1based returns row >= 1 and col >= 1"
+            )]
             let coord = RelativeCoord::new(row - 1, col - 1, row_abs, col_abs);
             Ok(SheetRef::Cell(SheetCellRef::new(sheet_loc, coord)))
         }
@@ -616,6 +617,11 @@ impl ReferenceType {
         }
     }
 
+    #[expect(
+        clippy::arithmetic_side_effects,
+        clippy::string_slice,
+        reason = "cursor bounded by slice length; the column and row runs are sliced at ASCII positions found by the scan"
+    )]
     fn parse_range_part_with_abs(part: &str) -> Result<RangePartWithAbs, ParsingError> {
         if let Ok((row, col, row_abs, col_abs)) = parse_a1_1based(part) {
             return Ok((Some((col, col_abs)), Some((row, row_abs))));
@@ -628,13 +634,13 @@ impl ReferenceType {
         let mut col_abs = false;
         let mut row_abs = false;
 
-        if i < len && bytes[i] == b'$' {
+        if bytes.get(i) == Some(&b'$') {
             col_abs = true;
             i += 1;
         }
 
         let col_start = i;
-        while i < len && bytes[i].is_ascii_alphabetic() {
+        while bytes.get(i).is_some_and(u8::is_ascii_alphabetic) {
             i += 1;
         }
 
@@ -646,7 +652,7 @@ impl ReferenceType {
                 return Ok((Some((col1, col_abs)), None));
             }
 
-            if i < len && bytes[i] == b'$' {
+            if bytes.get(i) == Some(&b'$') {
                 row_abs = true;
                 i += 1;
             }
@@ -658,7 +664,7 @@ impl ReferenceType {
             }
 
             let row_start = i;
-            while i < len && bytes[i].is_ascii_digit() {
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
                 i += 1;
             }
 
@@ -682,13 +688,13 @@ impl ReferenceType {
         }
 
         i = 0;
-        if i < len && bytes[i] == b'$' {
+        if bytes.get(i) == Some(&b'$') {
             row_abs = true;
             i += 1;
         }
 
         let row_start = i;
-        while i < len && bytes[i].is_ascii_digit() {
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
             i += 1;
         }
 
@@ -729,12 +735,7 @@ impl ReferenceType {
             )));
         }
 
-        if ref_part.contains(':') {
-            let mut parts = ref_part.splitn(2, ':');
-            let start = parts.next().unwrap();
-            let end = parts.next().ok_or_else(|| {
-                ParsingError::InvalidReference(format!("Invalid range: {ref_part}"))
-            })?;
+        if let Some((start, end)) = ref_part.split_once(':') {
             let (start_col, start_row) = Self::parse_range_part_with_abs(start)?;
             let (end_col, end_row) = Self::parse_range_part_with_abs(end)?;
 
@@ -777,7 +778,70 @@ impl ReferenceType {
         }
     }
 
+    /// Strip every leading workbook-index-0 qualifier.
+    ///
+    /// Workbook index 0 is the workbook the formula lives in (external
+    /// workbooks are numbered from 1), as Excel stores it in OOXML:
+    /// `[0]!Name` is the workbook-scoped `Name`, `[0]Sheet1!A1` is
+    /// `Sheet1!A1` and `'[0]Sheet 1'!A1` is `'Sheet 1'!A1`. A prefix is
+    /// stripped only while a `!` follows it. This is a loop rather than
+    /// recursion so the number of prefixes cannot exhaust the stack, and the
+    /// quoted form allocates its result once.
+    #[inline]
+    fn strip_workbook_zero_prefixes(reference: &str) -> Cow<'_, str> {
+        // Almost no reference starts with a workbook-0 qualifier; test the
+        // prefix before scanning for `!`.
+        if !reference.starts_with("[0]") && !reference.starts_with("'[0]") {
+            return Cow::Borrowed(reference);
+        }
+        Self::strip_workbook_zero_prefixes_slow(reference)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn strip_workbook_zero_prefixes_slow(reference: &str) -> Cow<'_, str> {
+        // `tail` is always a suffix of `reference`, so it contains a `!`
+        // exactly when it is longer than the text after the last `!`.
+        let Some(after_last_bang) = reference.rsplit_once('!').map(|(_, after)| after.len()) else {
+            return Cow::Borrowed(reference);
+        };
+        let has_bang = |tail: &str| tail.len() > after_last_bang;
+
+        let mut tail = reference;
+        // Whether a leading `'` was taken off `tail` (the quoted form).
+        let mut quoted = false;
+        loop {
+            if !quoted
+                && let Some(rest) = tail.strip_prefix("[0]")
+                && has_bang(rest)
+            {
+                tail = rest.strip_prefix('!').unwrap_or(rest);
+            } else if !quoted
+                && let Some(rest) = tail.strip_prefix("'[0]")
+                && has_bang(rest)
+            {
+                quoted = true;
+                tail = rest;
+            } else if quoted
+                && let Some(rest) = tail.strip_prefix("[0]")
+                && has_bang(rest)
+            {
+                tail = rest;
+            } else {
+                break;
+            }
+        }
+        if quoted {
+            Cow::Owned(format!("'{tail}"))
+        } else {
+            Cow::Borrowed(tail)
+        }
+    }
+
     fn parse_excel_reference(reference: &str) -> Result<Self, ParsingError> {
+        let reference = Self::strip_workbook_zero_prefixes(reference);
+        let reference = reference.as_ref();
+
         // Excel structured reference shorthands that appear as a single bracketed token.
         //
         // We use these forms to avoid ambiguity with cell refs / named ranges:
@@ -791,17 +855,14 @@ impl ReferenceType {
         // Extract sheet specification (none / single / 3D range) if present.
         let (sheet_spec, ref_part) = Self::extract_sheet_spec(reference);
 
-        // 3D references (`Sheet1:Sheet3!A1` / `Sheet1:Sheet3!A1:B2`) take a
-        // dedicated path because they cannot reuse the 2D Cell/Range carriers.
-        if let SheetSpec::Range { first, last, .. } = &sheet_spec {
-            return Self::parse_3d_reference(first, last, &ref_part);
-        }
-
         let sheet = match sheet_spec {
             SheetSpec::None => None,
             SheetSpec::Single(name) => Some(name),
-            // Already handled above.
-            SheetSpec::Range { .. } => unreachable!(),
+            // 3D references (`Sheet1:Sheet3!A1` / `Sheet1:Sheet3!A1:B2`) take a
+            // dedicated path because they cannot reuse the 2D Cell/Range carriers.
+            SheetSpec::Range { first, last } => {
+                return Self::parse_3d_reference(&first, &last, &ref_part);
+            }
         };
 
         // Table references live in the ref_part (e.g., "Table1[Column]").
@@ -825,14 +886,10 @@ impl ReferenceType {
             // Use the last '[' to allow paths/URIs that may contain earlier brackets, then
             // take the first ']' after it to avoid being confused by ']' in the sheet name.
             let lb = s.rfind('[')?;
-            let rb_rel = s[lb..].find(']')?;
-            let rb = lb + rb_rel;
-            if lb >= rb {
-                return None;
-            }
-
-            let token = &s[..=rb];
-            let sheet_name = &s[rb + 1..];
+            let (_, sheet_name) = s.get(lb..)?.split_once(']')?;
+            // `sheet_name` is a suffix of `s`; what precedes it is the book
+            // token through its `]`.
+            let token = s.strip_suffix(sheet_name)?;
             if sheet_name.is_empty() {
                 None
             } else {
@@ -840,13 +897,8 @@ impl ReferenceType {
             }
         });
 
-        if ref_part.contains(':') {
+        if let Some((start, end)) = ref_part.split_once(':') {
             // Range reference
-            let mut parts = ref_part.splitn(2, ':');
-            let start = parts.next().unwrap();
-            let end = parts.next().ok_or_else(|| {
-                ParsingError::InvalidReference(format!("Invalid range: {ref_part}"))
-            })?;
             let (start_col, start_row) = Self::parse_range_part_with_abs(start)?;
             let (end_col, end_row) = Self::parse_range_part_with_abs(end)?;
 
@@ -943,8 +995,11 @@ impl ReferenceType {
             return String::new();
         }
         // Use lookup table for common columns (1-702 covers A-ZZ)
-        if num > 0 && num <= 702 {
-            return COLUMN_LOOKUP[(num - 1) as usize].clone();
+        if let Some(letters) = num
+            .checked_sub(1)
+            .and_then(|index| COLUMN_LOOKUP.get(index as usize))
+        {
+            return letters.clone();
         }
 
         col_letters_from_1based(num).unwrap_or_default()
@@ -1114,19 +1169,16 @@ impl Display for ReferenceType {
     }
 }
 
-/// Render the `Sheet1:SheetN` portion of a 3D reference. Either side may
-/// require quoting independently; quoting one side does not force the other
-/// to be quoted, matching Excel's behaviour.
+/// Render the `Sheet1:SheetN` portion of a 3D reference. When either name
+/// needs quoting, Excel quotes the whole span as one segment
+/// (`'Jan 24:Mar 24'!B5`), never each name on its own.
 fn format_3d_sheet_prefix(first: &str, last: &str) -> String {
-    let format_one = |name: &str| -> String {
-        if sheet_name_needs_quoting(name) {
-            let escaped = name.replace('\'', "''");
-            format!("'{escaped}'")
-        } else {
-            name.to_string()
-        }
-    };
-    format!("{}:{}", format_one(first), format_one(last))
+    if sheet_name_needs_quoting(first) || sheet_name_needs_quoting(last) {
+        let escaped = format!("{first}:{last}").replace('\'', "''");
+        format!("'{escaped}'")
+    } else {
+        format!("{first}:{last}")
+    }
 }
 
 impl TryFrom<&str> for ReferenceType {
@@ -1155,19 +1207,22 @@ impl ReferenceType {
     /// (unescaped) name, the byte offset directly after the closing quote
     /// (when quoted) or the last alphanumeric byte (when bare), and a flag
     /// indicating whether the segment was quoted.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        clippy::string_slice,
+        reason = "cursor bounded by slice length; the name is sliced between ASCII quotes or up to an ASCII delimiter"
+    )]
     fn read_sheet_segment(reference: &str, start: usize) -> Option<(String, usize, bool)> {
         let bytes = reference.as_bytes();
-        if start >= bytes.len() {
-            return None;
-        }
+        let first = *bytes.get(start)?;
 
-        if bytes[start] == b'\'' {
+        if first == b'\'' {
             // Quoted segment. Excel doubles a literal `'` inside the name.
             let mut i = start + 1;
             let body_start = i;
-            while i < bytes.len() {
-                if bytes[i] == b'\'' {
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+            while let Some(&b) = bytes.get(i) {
+                if b == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
                         i += 2;
                         continue;
                     }
@@ -1182,8 +1237,7 @@ impl ReferenceType {
             // Bare segment. Sheet names cannot contain ':', '!', '\'', or any
             // ASCII-whitespace/operator characters in unquoted form.
             let mut i = start;
-            while i < bytes.len() {
-                let b = bytes[i];
+            while let Some(&b) = bytes.get(i) {
                 match b {
                     b':' | b'!' | b'\'' | b' ' | b'\t' | b'\n' | b'\r' => break,
                     _ => i += 1,
@@ -1199,6 +1253,11 @@ impl ReferenceType {
 
     /// Extract sheet specification (none, single sheet, or 3D sheet range)
     /// from a reference string.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        clippy::string_slice,
+        reason = "byte offset from ASCII delimiter search: after_first, after_second and bang index ASCII `:` or `!` bytes inside reference"
+    )]
     fn extract_sheet_spec(reference: &str) -> (SheetSpec, String) {
         let Some((first_name, after_first, first_quoted)) = Self::read_sheet_segment(reference, 0)
         else {
@@ -1206,17 +1265,14 @@ impl ReferenceType {
             // `!` separator (e.g. external book tokens such as `[1]Sheet!A1`).
             return Self::extract_sheet_spec_fallback(reference);
         };
-        let _ = first_quoted;
-
         let bytes = reference.as_bytes();
 
         // 3D form: Name1:Name2!...
-        if after_first < bytes.len() && bytes[after_first] == b':' {
+        if bytes.get(after_first) == Some(&b':') {
             let second_start = after_first + 1;
             if let Some((second_name, after_second, _)) =
                 Self::read_sheet_segment(reference, second_start)
-                && after_second < bytes.len()
-                && bytes[after_second] == b'!'
+                && bytes.get(after_second) == Some(&b'!')
             {
                 let ref_part = reference[after_second + 1..].to_string();
                 return (
@@ -1233,23 +1289,43 @@ impl ReferenceType {
             // form as a 3D range with an empty `last` so the parser layer
             // can report a precise error rather than silently treating it as
             // a sheet name containing `:`.
-            if second_start < bytes.len() {
-                if let Some(bang) = reference[second_start..].find('!') {
-                    let ref_part = reference[second_start + bang + 1..].to_string();
-                    return (
-                        SheetSpec::Range {
-                            first: first_name,
-                            last: String::new(),
-                        },
-                        ref_part,
-                    );
-                }
+            if let Some(bang) = reference
+                .get(second_start..)
+                .and_then(|rest| rest.find('!'))
+            {
+                let ref_part = reference[second_start + bang + 1..].to_string();
+                return (
+                    SheetSpec::Range {
+                        first: first_name,
+                        last: String::new(),
+                    },
+                    ref_part,
+                );
             }
         }
 
         // Single-sheet form: Name!...
-        if after_first < bytes.len() && bytes[after_first] == b'!' {
+        if bytes.get(after_first) == Some(&b'!') {
             let ref_part = reference[after_first + 1..].to_string();
+            // Excel forbids ':' in sheet names, so one quoted segment holding
+            // a single ':' is a 3D span written the way Excel writes it:
+            // `'Jan 24:Mar 24'!B5`. A book path (`'C:\x\[Book.xlsx]S'!A1`)
+            // is left alone.
+            if first_quoted
+                && !first_name.contains('[')
+                && let Some((first, last)) = first_name.split_once(':')
+                && !first.is_empty()
+                && !last.is_empty()
+                && !last.contains(':')
+            {
+                return (
+                    SheetSpec::Range {
+                        first: first.to_string(),
+                        last: last.to_string(),
+                    },
+                    ref_part,
+                );
+            }
             return (SheetSpec::Single(first_name), ref_part);
         }
 
@@ -1259,19 +1335,18 @@ impl ReferenceType {
     }
 
     fn extract_sheet_spec_fallback(reference: &str) -> (SheetSpec, String) {
-        let bytes = reference.as_bytes();
         // Handle unquoted sheet names containing characters our segment
         // reader rejects (such as bracketed external workbook tokens, e.g.
         // `[1]Sheet1!A1`). The original implementation scanned for the first
         // `!` after byte 0; preserve that behaviour for compatibility.
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'!' && i > 0 {
-                let sheet = reference[..i].to_string();
-                let ref_part = reference[i + 1..].to_string();
-                return (SheetSpec::Single(sheet), ref_part);
-            }
-            i += 1;
+        let mut chars = reference.chars();
+        if chars.next().is_some()
+            && let Some((_, ref_part)) = chars.as_str().split_once('!')
+            && let Some(sheet) = reference
+                .strip_suffix(ref_part)
+                .and_then(|head| head.strip_suffix('!'))
+        {
+            return (SheetSpec::Single(sheet.to_string()), ref_part.to_string());
         }
 
         (SheetSpec::None, reference.to_string())
@@ -1286,64 +1361,68 @@ impl ReferenceType {
     /// non-bracket path) are not pulled in here. Plain A1 cells like `R1`,
     /// `C5`, and `RC1` never reach this function because they don't contain
     /// `[` and are handled by the cell-reference path.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "cursor bounded by slice length"
+    )]
     fn is_r1c1_shape(s: &str) -> bool {
         let bytes = s.as_bytes();
         let len = bytes.len();
         let mut i = 0usize;
         let mut anchored = false;
 
-        if i >= len || bytes[i] != b'R' {
+        if bytes.get(i) != Some(&b'R') {
             return false;
         }
         i += 1;
 
         let row_digits_start = i;
-        while i < len && bytes[i].is_ascii_digit() {
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
             i += 1;
         }
         if i > row_digits_start {
             anchored = true;
         }
 
-        if i < len && bytes[i] == b'[' {
+        if bytes.get(i) == Some(&b'[') {
             i += 1;
-            if i < len && bytes[i] == b'-' {
+            if bytes.get(i) == Some(&b'-') {
                 i += 1;
             }
             let n_start = i;
-            while i < len && bytes[i].is_ascii_digit() {
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
                 i += 1;
             }
-            if i == n_start || i >= len || bytes[i] != b']' {
+            if i == n_start || bytes.get(i) != Some(&b']') {
                 return false;
             }
             i += 1;
             anchored = true;
         }
 
-        if i >= len || bytes[i] != b'C' {
+        if bytes.get(i) != Some(&b'C') {
             return false;
         }
         i += 1;
 
         let col_digits_start = i;
-        while i < len && bytes[i].is_ascii_digit() {
+        while bytes.get(i).is_some_and(u8::is_ascii_digit) {
             i += 1;
         }
         if i > col_digits_start {
             anchored = true;
         }
 
-        if i < len && bytes[i] == b'[' {
+        if bytes.get(i) == Some(&b'[') {
             i += 1;
-            if i < len && bytes[i] == b'-' {
+            if bytes.get(i) == Some(&b'-') {
                 i += 1;
             }
             let n_start = i;
-            while i < len && bytes[i].is_ascii_digit() {
+            while bytes.get(i).is_some_and(u8::is_ascii_digit) {
                 i += 1;
             }
-            if i == n_start || i >= len || bytes[i] != b']' {
+            if i == n_start || bytes.get(i) != Some(&b']') {
                 return false;
             }
             i += 1;
@@ -1359,15 +1438,19 @@ impl ReferenceType {
     /// The specifier syntax is parsed by a real recursive-descent parser
     /// (`structured_ref::SpecifierParser`) following MS-XLSX §18.17.6.2.
     fn parse_table_reference(reference: &str) -> Result<Self, ParsingError> {
-        let bracket_pos = reference.find('[').ok_or_else(|| {
-            ParsingError::InvalidReference(format!("Missing '[' in table reference: {reference}"))
-        })?;
-        let table_name = reference[..bracket_pos].trim();
+        let (table_name, specifier_str) = reference
+            .find('[')
+            .and_then(|bracket_pos| reference.split_at_checked(bracket_pos))
+            .ok_or_else(|| {
+                ParsingError::InvalidReference(format!(
+                    "Missing '[' in table reference: {reference}"
+                ))
+            })?;
+        let table_name = table_name.trim();
         if table_name.is_empty() {
             return Err(ParsingError::InvalidReference(reference.to_string()));
         }
 
-        let specifier_str = &reference[bracket_pos..];
         let specifier = structured_ref::parse_full_specifier(specifier_str)?;
 
         Ok(ReferenceType::Table(TableReference {
@@ -1399,17 +1482,20 @@ impl ReferenceType {
     }
 
     fn parse_openformula_reference(reference: &str) -> Result<Self, ParsingError> {
-        if reference.starts_with('[') && reference.ends_with(']') {
-            let inner = &reference[1..reference.len() - 1];
+        if let Some(inner) = reference
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
             if inner.is_empty() {
                 return Err(ParsingError::InvalidReference(
                     "Empty OpenFormula reference".to_string(),
                 ));
             }
 
-            let mut parts = inner.splitn(2, ':');
-            let start_part_str = parts.next().unwrap();
-            let end_part_str = parts.next();
+            let (start_part_str, end_part_str) = match inner.split_once(':') {
+                Some((start, end)) => (start, Some(end)),
+                None => (inner, None),
+            };
 
             let start_part = Self::parse_openformula_part(start_part_str)?;
             let end_part = if let Some(part) = end_part_str {
@@ -1420,12 +1506,12 @@ impl ReferenceType {
 
             let sheet = match (&start_part.sheet, &end_part) {
                 (Some(sheet), Some(end)) => {
-                    if let Some(end_sheet) = &end.sheet {
-                        if end_sheet != sheet {
-                            return Err(ParsingError::InvalidReference(format!(
-                                "Mismatched sheets in reference: {sheet} vs {end_sheet}"
-                            )));
-                        }
+                    if let Some(end_sheet) = &end.sheet
+                        && end_sheet != sheet
+                    {
+                        return Err(ParsingError::InvalidReference(format!(
+                            "Mismatched sheets in reference: {sheet} vs {end_sheet}"
+                        )));
                     }
                     Some(sheet.clone())
                 }
@@ -1485,8 +1571,13 @@ impl ReferenceType {
         let (sheet, coord_slice) = if let Some(stripped) = trimmed.strip_prefix('.') {
             (None, stripped.trim())
         } else if let Some(dot_idx) = Self::find_openformula_sheet_separator(trimmed) {
-            let sheet_part = trimmed[..dot_idx].trim();
-            let coord_part = trimmed[dot_idx + 1..].trim();
+            #[expect(
+                clippy::string_slice,
+                clippy::arithmetic_side_effects,
+                reason = "byte offset from ASCII delimiter search: dot_idx is the index of a `.`"
+            )]
+            let (sheet_part, coord_part) = (&trimmed[..dot_idx], &trimmed[dot_idx + 1..]);
+            let (sheet_part, coord_part) = (sheet_part.trim(), coord_part.trim());
             if coord_part.is_empty() {
                 return Err(ParsingError::InvalidReference(format!(
                     "Missing coordinate in OpenFormula reference component: {trimmed}"
@@ -1512,28 +1603,31 @@ impl ReferenceType {
     fn normalise_openformula_sheet(sheet: &str) -> Result<String, ParsingError> {
         let without_abs = sheet.trim().trim_start_matches('$');
 
-        if without_abs.starts_with('\'') {
-            if without_abs.len() < 2 || !without_abs.ends_with('\'') {
+        if let Some(quoted) = without_abs.strip_prefix('\'') {
+            let Some(inner) = quoted.strip_suffix('\'') else {
                 return Err(ParsingError::InvalidReference(format!(
                     "Unterminated sheet name in OpenFormula reference: {sheet}"
                 )));
-            }
-            let inner = &without_abs[1..without_abs.len() - 1];
+            };
             Ok(inner.replace("''", "'"))
         } else {
             Ok(without_abs.to_string())
         }
     }
 
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "cursor bounded by slice length"
+    )]
     fn find_openformula_sheet_separator(part: &str) -> Option<usize> {
         let bytes = part.as_bytes();
         let mut i = 0;
         let mut in_quotes = false;
 
-        while i < bytes.len() {
-            match bytes[i] {
+        while let Some(&b) = bytes.get(i) {
+            match b {
                 b'\'' => {
-                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    if bytes.get(i + 1) == Some(&b'\'') {
                         i += 2;
                         continue;
                     }
@@ -1638,6 +1732,178 @@ impl ReferenceType {
     }
 }
 
+/// A supported unary formula operator.
+///
+/// `Debug` prints the quoted spelling to preserve the former string-based
+/// AST's debug output, also embedded in AST display text.
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOperator {
+    Plus,
+    Minus,
+    Percent,
+    Spill,
+    ImplicitIntersection,
+}
+// Serialize as a string even in non-human-readable serde formats. A
+// renamed unit enum would still use a variant index in binary serializers.
+#[cfg(feature = "serde")]
+impl Serialize for UnaryOperator {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for UnaryOperator {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value.as_str()).map_err(serde::de::Error::custom)
+    }
+}
+impl UnaryOperator {
+    /// The operator spelling used in formulas and serialized ASTs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Plus => "+",
+            Self::Minus => "-",
+            Self::Percent => "%",
+            Self::Spill => "#",
+            Self::ImplicitIntersection => "@",
+        }
+    }
+}
+// ASTNodeType's Display embeds Debug for function arguments and arrays.
+// Preserve the former String representation there as well.
+impl fmt::Debug for UnaryOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+impl Display for UnaryOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl TryFrom<&str> for UnaryOperator {
+    type Error = &'static str;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "+" => Ok(Self::Plus),
+            "-" => Ok(Self::Minus),
+            "%" => Ok(Self::Percent),
+            "#" => Ok(Self::Spill),
+            "@" => Ok(Self::ImplicitIntersection),
+            _ => Err("unsupported formula operator"),
+        }
+    }
+}
+impl std::hash::Hash for UnaryOperator {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
+/// A supported binary formula operator.
+///
+/// `Debug` prints the quoted spelling to preserve the former string-based
+/// AST's debug output, also embedded in AST display text.
+#[non_exhaustive]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BinaryOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Power,
+    Concat,
+    Equal,
+    NotEqual,
+    Less,
+    Greater,
+    LessEqual,
+    GreaterEqual,
+    Range,
+    Union,
+    Intersection,
+}
+// Serialize as a string even in non-human-readable serde formats. A
+// renamed unit enum would still use a variant index in binary serializers.
+#[cfg(feature = "serde")]
+impl Serialize for BinaryOperator {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+#[cfg(feature = "serde")]
+impl<'de> Deserialize<'de> for BinaryOperator {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::try_from(value.as_str()).map_err(serde::de::Error::custom)
+    }
+}
+impl BinaryOperator {
+    /// The operator spelling used in formulas and serialized ASTs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "+",
+            Self::Subtract => "-",
+            Self::Multiply => "*",
+            Self::Divide => "/",
+            Self::Power => "^",
+            Self::Concat => "&",
+            Self::Equal => "=",
+            Self::NotEqual => "<>",
+            Self::Less => "<",
+            Self::Greater => ">",
+            Self::LessEqual => "<=",
+            Self::GreaterEqual => ">=",
+            Self::Range => ":",
+            Self::Union => ",",
+            Self::Intersection => " ",
+        }
+    }
+}
+// ASTNodeType's Display embeds Debug for function arguments and arrays.
+// Preserve the former String representation there as well.
+impl fmt::Debug for BinaryOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+impl Display for BinaryOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+impl TryFrom<&str> for BinaryOperator {
+    type Error = &'static str;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "+" => Ok(Self::Add),
+            "-" => Ok(Self::Subtract),
+            "*" => Ok(Self::Multiply),
+            "/" => Ok(Self::Divide),
+            "^" => Ok(Self::Power),
+            "&" => Ok(Self::Concat),
+            "=" => Ok(Self::Equal),
+            "<>" => Ok(Self::NotEqual),
+            "<" => Ok(Self::Less),
+            ">" => Ok(Self::Greater),
+            "<=" => Ok(Self::LessEqual),
+            ">=" => Ok(Self::GreaterEqual),
+            ":" => Ok(Self::Range),
+            "," => Ok(Self::Union),
+            " " => Ok(Self::Intersection),
+            _ => Err("unsupported formula operator"),
+        }
+    }
+}
+impl std::hash::Hash for BinaryOperator {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
+    }
+}
+
 /// The different types of AST nodes.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -1653,11 +1919,11 @@ pub enum ASTNodeType {
         reference: ReferenceType, // Parsed reference
     },
     UnaryOp {
-        op: String,
+        op: UnaryOperator,
         expr: Box<ASTNode>,
     },
     BinaryOp {
-        op: String,
+        op: BinaryOperator,
         left: Box<ASTNode>,
         right: Box<ASTNode>,
     },
@@ -1692,6 +1958,21 @@ impl Display for ASTNodeType {
 }
 
 /// An AST node represents a parsed formula element
+///
+/// # Depth
+///
+/// Hashing ([`Self::fingerprint`], [`Self::calculate_hash`], `Hash`),
+/// pretty-printing, `Display` and the derived `Clone`, `PartialEq`, `Debug`,
+/// serde and drop glue recurse once per tree level. Trees within the default
+/// [`ParserLimits::ast_height`](crate::ParserLimits::ast_height) limit (256)
+/// are supported, which includes every tree the parser returns under default
+/// limits. A taller tree, hand-built or parsed under a raised limit, needs the
+/// caller to provide the stack (see
+/// [`ParserLimits::with_ast_height`](crate::ParserLimits::with_ast_height)).
+/// Reference walks ([`Self::visit_refs`], [`Self::refs`],
+/// [`Self::get_dependencies`], [`Self::collect_references`],
+/// [`Self::update_sheet_references`]) use an explicit stack and have no
+/// depth limit.
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ASTNode {
@@ -1731,11 +2012,31 @@ impl ASTNode {
         self.contains_volatile
     }
 
+    /// Structural fingerprint of this tree; the same value as
+    /// [`Self::calculate_hash`].
+    ///
+    /// # Depth
+    ///
+    /// Recursive in the tree height. Trees within the default
+    /// [`ParserLimits::ast_height`](crate::ParserLimits::ast_height) limit (256)
+    /// are supported, which includes every tree the parser returns under default
+    /// limits. A taller tree, hand-built or parsed under a raised limit, needs the
+    /// caller to provide the stack (see
+    /// [`ParserLimits::with_ast_height`](crate::ParserLimits::with_ast_height)).
     pub fn fingerprint(&self) -> u64 {
         self.calculate_hash()
     }
 
     /// Calculate a hash for this ASTNode
+    ///
+    /// # Depth
+    ///
+    /// Recursive in the tree height. Trees within the default
+    /// [`ParserLimits::ast_height`](crate::ParserLimits::ast_height) limit (256)
+    /// are supported, which includes every tree the parser returns under default
+    /// limits. A taller tree, hand-built or parsed under a raised limit, needs the
+    /// caller to provide the stack (see
+    /// [`ParserLimits::with_ast_height`](crate::ParserLimits::with_ast_height)).
     pub fn calculate_hash(&self) -> u64 {
         let mut hasher = FormulaHasher::new();
         self.hash_node(&mut hasher);
@@ -1755,12 +2056,12 @@ impl ASTNode {
             }
             ASTNodeType::UnaryOp { op, expr } => {
                 hasher.write(&[3]); // Discriminant for UnaryOp
-                hasher.write(op.as_bytes());
+                hasher.write(op.as_str().as_bytes());
                 expr.hash_node(hasher);
             }
             ASTNodeType::BinaryOp { op, left, right } => {
                 hasher.write(&[4]); // Discriminant for BinaryOp
-                hasher.write(op.as_bytes());
+                hasher.write(op.as_str().as_bytes());
                 left.hash_node(hasher);
                 right.hash_node(hasher);
             }
@@ -1808,37 +2109,31 @@ impl ASTNode {
             .collect()
     }
 
+    /// Pre-order walk with an explicit stack, so a deep hand-built tree
+    /// cannot exhaust the call stack. Children are pushed in reverse so they
+    /// are visited in source order.
     fn collect_dependencies<'a>(&'a self, dependencies: &mut Vec<&'a ReferenceType>) {
-        match &self.node_type {
-            ASTNodeType::Reference { reference, .. } => {
-                dependencies.push(reference);
-            }
-            ASTNodeType::UnaryOp { expr, .. } => {
-                expr.collect_dependencies(dependencies);
-            }
-            ASTNodeType::BinaryOp { left, right, .. } => {
-                left.collect_dependencies(dependencies);
-                right.collect_dependencies(dependencies);
-            }
-            ASTNodeType::Function { args, .. } => {
-                for arg in args {
-                    arg.collect_dependencies(dependencies);
+        let mut stack: Vec<&'a ASTNode> = vec![self];
+        while let Some(node) = stack.pop() {
+            match &node.node_type {
+                ASTNodeType::Reference { reference, .. } => dependencies.push(reference),
+                ASTNodeType::UnaryOp { expr, .. } => stack.push(expr),
+                ASTNodeType::BinaryOp { left, right, .. } => {
+                    stack.push(right);
+                    stack.push(left);
                 }
-            }
-            ASTNodeType::Call { callee, args } => {
-                callee.collect_dependencies(dependencies);
-                for arg in args {
-                    arg.collect_dependencies(dependencies);
+                ASTNodeType::Function { args, .. } => stack.extend(args.iter().rev()),
+                ASTNodeType::Call { callee, args } => {
+                    stack.extend(args.iter().rev());
+                    stack.push(callee);
                 }
-            }
-            ASTNodeType::Array(rows) => {
-                for row in rows {
-                    for item in row {
-                        item.collect_dependencies(dependencies);
+                ASTNodeType::Array(rows) => {
+                    for row in rows.iter().rev() {
+                        stack.extend(row.iter().rev());
                     }
                 }
+                ASTNodeType::Literal(_) | ASTNodeType::Omitted => {}
             }
-            _ => {}
         }
     }
 
@@ -1915,29 +2210,31 @@ impl ASTNode {
                 end_col_abs,
             } => {
                 // Optionally expand very small finite ranges into individual cells
-                if policy.expand_small_ranges {
-                    if let (Some(sr), Some(sc), Some(er), Some(ec)) =
+                if policy.expand_small_ranges
+                    && let (Some(sr), Some(sc), Some(er), Some(ec)) =
                         (start_row, start_col, end_row, end_col)
-                    {
-                        let rows = er.saturating_sub(sr) + 1;
-                        let cols = ec.saturating_sub(sc) + 1;
-                        let area = rows.saturating_mul(cols);
-                        if area as usize <= policy.range_expansion_limit {
-                            let row_abs = start_row_abs && end_row_abs;
-                            let col_abs = start_col_abs && end_col_abs;
-                            for r in sr..=er {
-                                for c in sc..=ec {
-                                    out.push(ReferenceType::Cell {
-                                        sheet: sheet.map(|s| s.to_string()),
-                                        row: r,
-                                        col: c,
-                                        row_abs,
-                                        col_abs,
-                                    });
-                                }
+                {
+                    // Widened to u64: a full-height or full-width u32
+                    // span plus one does not fit in u32.
+                    let rows = u64::from(er.saturating_sub(sr)) + 1;
+                    let cols = u64::from(ec.saturating_sub(sc)) + 1;
+                    let area = rows.saturating_mul(cols);
+                    let limit = u64::try_from(policy.range_expansion_limit).unwrap_or(u64::MAX);
+                    if area <= limit {
+                        let row_abs = start_row_abs && end_row_abs;
+                        let col_abs = start_col_abs && end_col_abs;
+                        for r in sr..=er {
+                            for c in sc..=ec {
+                                out.push(ReferenceType::Cell {
+                                    sheet: sheet.map(|s| s.to_string()),
+                                    row: r,
+                                    col: c,
+                                    row_abs,
+                                    col_abs,
+                                });
                             }
-                            return; // handled
                         }
+                        return; // handled
                     }
                 }
                 out.push(ReferenceType::Range {
@@ -2013,70 +2310,67 @@ impl ASTNode {
         });
         out
     }
-    /// Recursively updates sheet references within the AST.
+    /// Updates sheet references within the AST.
     ///
     /// If `target_name` is provided, only references matching that sheet name are updated.
     /// This is used for "healing" specific broken references (Tombstone rescue).
     /// If `target_name` is None, it acts as a global rename (standard sheet rename).
+    ///
+    /// The walk uses an explicit stack, so tree depth is not limited by the
+    /// call stack.
     pub fn update_sheet_references(&mut self, target_name: Option<&str>, new_name: &str) {
-        match &mut self.node_type {
-            ASTNodeType::Reference {
-                reference: ReferenceType::Cell { sheet, .. } | ReferenceType::Range { sheet, .. },
-                ..
-            } => {
-                if let Some(current_sheet) = sheet
-                    && (target_name.is_none() || target_name == Some(current_sheet.as_str()))
-                {
-                    *sheet = Some(new_name.to_string());
-                }
-            }
-            ASTNodeType::Reference {
-                reference:
-                    ReferenceType::Cell3D {
-                        sheet_first,
-                        sheet_last,
-                        ..
-                    }
-                    | ReferenceType::Range3D {
-                        sheet_first,
-                        sheet_last,
-                        ..
-                    },
-                ..
-            } => {
-                if target_name.is_none() || target_name == Some(sheet_first.as_str()) {
-                    *sheet_first = new_name.to_string();
-                }
-                if target_name.is_none() || target_name == Some(sheet_last.as_str()) {
-                    *sheet_last = new_name.to_string();
-                }
-            }
-            ASTNodeType::UnaryOp { expr, .. } => {
-                expr.update_sheet_references(target_name, new_name);
-            }
-            ASTNodeType::BinaryOp { left, right, .. } => {
-                left.update_sheet_references(target_name, new_name);
-                right.update_sheet_references(target_name, new_name);
-            }
-            ASTNodeType::Function { args, .. } => {
-                for arg in args {
-                    arg.update_sheet_references(target_name, new_name);
-                }
-            }
-            ASTNodeType::Call { callee, args } => {
-                callee.update_sheet_references(target_name, new_name);
-                for arg in args {
-                    arg.update_sheet_references(target_name, new_name);
-                }
-            }
-            ASTNodeType::Array(rows) => {
-                for row in rows {
-                    for cell in row {
-                        cell.update_sheet_references(target_name, new_name);
+        let mut stack: Vec<&mut ASTNode> = vec![self];
+        while let Some(node) = stack.pop() {
+            match &mut node.node_type {
+                ASTNodeType::Reference {
+                    reference:
+                        ReferenceType::Cell { sheet, .. } | ReferenceType::Range { sheet, .. },
+                    ..
+                } => {
+                    if let Some(current_sheet) = sheet
+                        && (target_name.is_none() || target_name == Some(current_sheet.as_str()))
+                    {
+                        *sheet = Some(new_name.to_string());
                     }
                 }
+                ASTNodeType::Reference {
+                    reference:
+                        ReferenceType::Cell3D {
+                            sheet_first,
+                            sheet_last,
+                            ..
+                        }
+                        | ReferenceType::Range3D {
+                            sheet_first,
+                            sheet_last,
+                            ..
+                        },
+                    ..
+                } => {
+                    if target_name.is_none() || target_name == Some(sheet_first.as_str()) {
+                        *sheet_first = new_name.to_string();
+                    }
+                    if target_name.is_none() || target_name == Some(sheet_last.as_str()) {
+                        *sheet_last = new_name.to_string();
+                    }
+                }
+                ASTNodeType::UnaryOp { expr, .. } => stack.push(expr),
+                ASTNodeType::BinaryOp { left, right, .. } => {
+                    stack.push(right);
+                    stack.push(left);
+                }
+                ASTNodeType::Function { args, .. } => stack.extend(args.iter_mut().rev()),
+                ASTNodeType::Call { callee, args } => {
+                    stack.extend(args.iter_mut().rev());
+                    stack.push(callee);
+                }
+                ASTNodeType::Array(rows) => {
+                    for row in rows.iter_mut().rev() {
+                        stack.extend(row.iter_mut().rev());
+                    }
+                }
+                ASTNodeType::Reference { .. } | ASTNodeType::Literal(_) | ASTNodeType::Omitted => {}
             }
-            _ => {}
         }
     }
 }
@@ -2324,21 +2618,40 @@ pub struct Parser {
     /// When > 0, treat a top-level `OpInfix(",")` as a terminator (call-arg
     /// separator) instead of the union/list operator. Used by `parse_call_arguments`.
     in_call_args_depth: usize,
-    /// Current recursion depth of `parse_bp`. Bounded by [`MAX_PARSE_DEPTH`] so a
+    /// Current recursion depth of `parse_bp`. Bounded by the configured Pratt-frame limit so a
     /// deeply nested formula (e.g. `=((((...))))`) returns an error instead of
     /// overflowing the stack.
     depth: usize,
+    limits: ParserLimits,
+    nodes: usize,
+    pending_error: Option<ParserError>,
 }
 
-/// Bound active Pratt-parser frames, not Excel function-nesting levels. Leave
-/// headroom for 64 nested calls or parentheses, including IF conditions: the
-/// top-level expression and infix right-hand sides also consume frames. A
-/// right-nested infix expression with parentheses consumes two per level, so
-/// this is deliberately not an exact implementation of Excel's nesting limit.
-/// The boundary is exercised on a 1 MiB thread stack in debug and release tests.
-/// Flat left-associative AST depth and recursive AST destruction are separate
-/// limits; this guard does not bound total AST size.
-const MAX_PARSE_DEPTH: usize = 72;
+/// Ephemeral construction metadata; public AST nodes retain no height field.
+/// Parent admission uses child heights directly, without traversing subtrees.
+struct BuiltNode {
+    node: ASTNode,
+    height: usize,
+}
+#[derive(Default)]
+struct BuiltArgs {
+    nodes: Vec<ASTNode>,
+    height: usize,
+    volatile: bool,
+}
+impl BuiltArgs {
+    fn push(&mut self, child: BuiltNode) {
+        self.height = self.height.max(child.height);
+        self.volatile |= child.node.contains_volatile;
+        self.nodes.push(child.node);
+    }
+}
+impl std::ops::Deref for BuiltNode {
+    type Target = ASTNode;
+    fn deref(&self) -> &ASTNode {
+        &self.node
+    }
+}
 
 impl Parser {
     /// Tokenize a formula using the default Excel dialect and prepare it for parsing.
@@ -2356,17 +2669,35 @@ impl Parser {
         formula: T,
         dialect: FormulaDialect,
     ) -> Result<Self, TokenizerError> {
-        let source: Arc<str> = Arc::from(formula.as_ref());
-        let spans = crate::tokenizer::tokenize_spans_with_dialect(source.as_ref(), dialect)?;
-        Ok(Self::from_source_and_tokens(
-            source,
-            Arc::from(spans.into_boxed_slice()),
-            dialect,
-        ))
+        Self::new_with_limits(formula.as_ref(), dialect, ParserLimits::default())
     }
 
-    /// Build a parser from an existing source-backed token stream.
+    fn new_with_limits(
+        formula: &str,
+        dialect: FormulaDialect,
+        limits: ParserLimits,
+    ) -> Result<Self, TokenizerError> {
+        limits.check_source(formula)?;
+        let spans = crate::tokenizer::tokenize_spans_with_limits(formula, dialect, limits)?;
+        let mut parser = Self::from_source_and_tokens(
+            Arc::from(formula),
+            Arc::from(spans.into_boxed_slice()),
+            dialect,
+        );
+        parser.limits = limits;
+        Ok(parser)
+    }
+
+    /// External streams are mutable: validate admission and all spans before copying.
     pub fn from_token_stream(stream: &TokenStream) -> Self {
+        let limits = ParserLimits::default();
+        let error = stream.admission_error(limits).map(ParserError::from);
+        if let Some(error) = error {
+            let mut parser =
+                Self::from_source_and_tokens(Arc::from(""), Arc::from([]), stream.dialect());
+            parser.pending_error = Some(error);
+            return parser;
+        }
         Self::from_source_and_tokens(
             Arc::from(stream.source()),
             Arc::from(stream.spans.clone().into_boxed_slice()),
@@ -2387,6 +2718,9 @@ impl Parser {
             dialect,
             in_call_args_depth: 0,
             depth: 0,
+            limits: ParserLimits::default(),
+            nodes: 0,
+            pending_error: None,
         }
     }
 
@@ -2400,14 +2734,125 @@ impl Parser {
         self
     }
 
+    // Keep rich AST temporaries out of every active Pratt frame in debug builds.
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "child heights are at most the AST height limit and the number of admitted nodes, so 1 + height cannot overflow"
+    )]
+    fn unary(&mut self, expr: BuiltNode, span: TokenSpan) -> Result<BuiltNode, ParserError> {
+        let height = 1 + expr.height;
+        self.admit(height)?;
+        let token = self.span_to_token(&span);
+        let volatile = expr.contains_volatile;
+        Ok(BuiltNode {
+            height,
+            node: ASTNode::new_with_volatile(
+                ASTNodeType::UnaryOp {
+                    op: UnaryOperator::try_from(token.value.as_str()).map_err(|message| {
+                        ParserError {
+                            message: message.to_string(),
+                            position: Some(span.start),
+                        }
+                    })?,
+                    expr: Box::new(expr.node),
+                },
+                Some(token),
+                volatile,
+            ),
+        })
+    }
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "child heights are at most the AST height limit and the number of admitted nodes, so 1 + height cannot overflow"
+    )]
+    fn binary(
+        &mut self,
+        left: BuiltNode,
+        right: BuiltNode,
+        span: TokenSpan,
+    ) -> Result<BuiltNode, ParserError> {
+        let height = 1 + left.height.max(right.height);
+        self.admit(height)?;
+        let token = self.span_to_token(&span);
+        let volatile = left.contains_volatile || right.contains_volatile;
+        Ok(BuiltNode {
+            height,
+            node: ASTNode::new_with_volatile(
+                ASTNodeType::BinaryOp {
+                    op: BinaryOperator::try_from(token.value.as_str()).map_err(|message| {
+                        ParserError {
+                            message: if token.value == ";" {
+                                "';' is an argument separator, not an operator in this position; OpenFormula union uses '~'".to_string()
+                            } else {
+                                message.to_string()
+                            },
+                            position: Some(span.start),
+                        }
+                    })?,
+                    left: Box::new(left.node),
+                    right: Box::new(right.node),
+                },
+                Some(token),
+                volatile,
+            ),
+        })
+    }
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "child heights are at most the AST height limit and the number of admitted nodes, so 1 + height cannot overflow"
+    )]
+    fn call(&mut self, left: BuiltNode, args: BuiltArgs) -> Result<BuiltNode, ParserError> {
+        let height = 1 + left.height.max(args.height);
+        self.admit(height)?;
+        let volatile = left.contains_volatile || args.volatile;
+        Ok(BuiltNode {
+            height,
+            node: ASTNode::new_with_volatile(
+                ASTNodeType::Call {
+                    callee: Box::new(left.node),
+                    args: args.nodes,
+                },
+                None,
+                volatile,
+            ),
+        })
+    }
+    /// The token at the cursor, if any.
+    #[inline]
+    fn peek(&self) -> Option<TokenSpan> {
+        self.tokens.get(self.position).copied()
+    }
+
+    /// Whether the token at the cursor has this type and subtype.
+    #[inline]
+    fn peek_is(&self, token_type: TokenType, subtype: TokenSubType) -> bool {
+        self.peek()
+            .is_some_and(|t| t.token_type == token_type && t.subtype == subtype)
+    }
+
+    /// Move past the token at the cursor.
+    #[inline]
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "callers advance only past a token they read with peek, so position < tokens.len()"
+    )]
+    fn advance(&mut self) {
+        self.position += 1;
+    }
+
     fn skip_whitespace(&mut self) {
-        while self.position < self.tokens.len()
-            && self.tokens[self.position].token_type == TokenType::Whitespace
+        while self
+            .peek()
+            .is_some_and(|t| t.token_type == TokenType::Whitespace)
         {
-            self.position += 1;
+            self.advance();
         }
     }
 
+    #[expect(
+        clippy::string_slice,
+        reason = "spans come from the span tokenizer on this source (char-boundary invariant), or from an external TokenStream whose spans admission_error checked with source.get"
+    )]
     fn span_value(&self, span: &TokenSpan) -> &str {
         &self.source[span.start..span.end]
     }
@@ -2458,7 +2903,7 @@ impl Parser {
             "," => Some((8, Associativity::Left)),
             "%" => Some((7, Associativity::Left)),
             "u" => Some((6, Associativity::Right)),
-            "^" => Some((5, Associativity::Right)),
+            "^" => Some((5, Associativity::Left)),
             "*" | "/" => Some((4, Associativity::Left)),
             "+" | "-" => Some((3, Associativity::Left)),
             "&" => Some((2, Associativity::Left)),
@@ -2467,7 +2912,42 @@ impl Parser {
         }
     }
 
+    #[cold]
+    fn limit_error(&self, budget: &str, limit: usize) -> ParserError {
+        ParserError {
+            message: format!("Formula {budget} (max {limit})"),
+            position: Some(self.position),
+        }
+    }
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "nodes < ast_nodes is checked before the increment"
+    )]
+    fn admit(&mut self, height: usize) -> Result<(), ParserError> {
+        if self.nodes >= self.limits.ast_nodes {
+            return Err(self.limit_error("AST node limit exceeded", self.limits.ast_nodes));
+        }
+        if height > self.limits.ast_height {
+            return Err(self.limit_error("AST height limit exceeded", self.limits.ast_height));
+        }
+        self.nodes += 1;
+        Ok(())
+    }
+    fn omitted(&mut self) -> Result<BuiltNode, ParserError> {
+        self.admit(1)?;
+        Ok(BuiltNode {
+            node: ASTNode::new(ASTNodeType::Omitted, None),
+            height: 1,
+        })
+    }
     pub fn parse(&mut self) -> Result<ASTNode, ParserError> {
+        if let Some(error) = &self.pending_error {
+            return Err(ParserError {
+                message: error.message.clone(),
+                position: error.position,
+            });
+        }
+        self.nodes = 0;
         if self.tokens.is_empty() {
             return Err(ParserError {
                 message: "No tokens to parse".to_string(),
@@ -2476,28 +2956,26 @@ impl Parser {
         }
 
         self.skip_whitespace();
-        if self.position >= self.tokens.len() {
+        let Some(first) = self.peek() else {
             return Err(ParserError {
                 message: "No tokens to parse".to_string(),
                 position: None,
             });
-        }
+        };
 
-        if self.tokens[self.position].token_type == TokenType::Literal {
-            let span = self.tokens[self.position];
-            self.position += 1;
+        if first.token_type == TokenType::Literal {
+            let span = first;
+            self.advance();
             self.skip_whitespace();
-            if self.position < self.tokens.len() {
+            if let Some(extra) = self.peek() {
                 return Err(ParserError {
-                    message: format!(
-                        "Unexpected token at position {}: {:?}",
-                        self.position, self.tokens[self.position]
-                    ),
+                    message: format!("Unexpected token at position {}: {extra:?}", self.position),
                     position: Some(self.position),
                 });
             }
 
             let token = self.span_to_token(&span);
+            self.admit(1)?;
             return Ok(ASTNode::new(
                 ASTNodeType::Literal(LiteralValue::Text(token.value.clone())),
                 Some(token),
@@ -2506,110 +2984,90 @@ impl Parser {
 
         let ast = self.parse_expression()?;
         self.skip_whitespace();
-        if self.position < self.tokens.len() {
+        if let Some(extra) = self.peek() {
             return Err(ParserError {
-                message: format!(
-                    "Unexpected token at position {}: {:?}",
-                    self.position, self.tokens[self.position]
-                ),
+                message: format!("Unexpected token at position {}: {extra:?}", self.position),
                 position: Some(self.position),
             });
         }
-        Ok(ast)
+        Ok(ast.node)
     }
 
-    fn parse_expression(&mut self) -> Result<ASTNode, ParserError> {
+    fn parse_expression(&mut self) -> Result<BuiltNode, ParserError> {
         self.parse_bp(0)
     }
 
-    fn parse_bp(&mut self, min_precedence: u8) -> Result<ASTNode, ParserError> {
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "depth counts active parse_bp frames: it is incremented once per frame and decremented on every exit, so it is bounded by the call stack"
+    )]
+    fn parse_bp(&mut self, min_precedence: u8) -> Result<BuiltNode, ParserError> {
         // Bound recursion so deeply nested input (e.g. `=((((...))))`) returns
         // an error instead of overflowing the stack.
         self.depth += 1;
-        if self.depth > MAX_PARSE_DEPTH {
+        if self.depth > self.limits.pratt_frames {
             self.depth -= 1;
-            return Err(ParserError {
-                message: format!("Formula nesting too deep (max {MAX_PARSE_DEPTH})"),
-                position: Some(self.position),
-            });
+            return Err(self.limit_error("nesting too deep", self.limits.pratt_frames));
         }
         let result = self.parse_bp_inner(min_precedence);
         self.depth -= 1;
         result
     }
 
-    fn parse_bp_inner(&mut self, min_precedence: u8) -> Result<ASTNode, ParserError> {
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "precedence comes from the span_precedence table (at most 11), so precedence + 1 fits in u8"
+    )]
+    fn parse_bp_inner(&mut self, min_precedence: u8) -> Result<BuiltNode, ParserError> {
         let mut left = self.parse_prefix()?;
 
         loop {
             self.skip_whitespace();
-            if self.position >= self.tokens.len() {
+            let Some(token) = self.peek() else {
                 break;
-            }
+            };
 
             // Postfix call: a `(` directly following a closed expression denotes
             // immediate invocation of a callable result (e.g. LAMBDA IIFE).
-            if self.tokens[self.position].token_type == TokenType::Paren
-                && self.tokens[self.position].subtype == TokenSubType::Open
-            {
-                self.position += 1;
+            if token.token_type == TokenType::Paren && token.subtype == TokenSubType::Open {
+                self.advance();
                 let args = self.parse_call_arguments()?;
-                let call_volatile =
-                    left.contains_volatile || args.iter().any(|a| a.contains_volatile);
-                left = ASTNode::new_with_volatile(
-                    ASTNodeType::Call {
-                        callee: Box::new(left),
-                        args,
-                    },
-                    None,
-                    call_volatile,
-                );
+                left = self.call(left, args)?;
                 continue;
             }
 
-            if self.tokens[self.position].token_type == TokenType::OpPostfix {
+            if token.token_type == TokenType::OpPostfix {
                 let (precedence, _) = self
-                    .span_precedence(&self.tokens[self.position])
+                    .span_precedence(&token)
                     .unwrap_or((0, Associativity::Left));
                 if precedence < min_precedence {
                     break;
                 }
 
-                let op_span = self.tokens[self.position];
-                self.position += 1;
-                let op_token = self.span_to_token(&op_span);
-                let contains_volatile = left.contains_volatile;
-                left = ASTNode::new_with_volatile(
-                    ASTNodeType::UnaryOp {
-                        op: op_token.value.clone(),
-                        expr: Box::new(left),
-                    },
-                    Some(op_token),
-                    contains_volatile,
-                );
+                self.advance();
+                left = self.unary(left, token)?;
                 continue;
             }
 
-            let token = &self.tokens[self.position];
             if token.token_type != TokenType::OpInfix {
                 break;
             }
 
             // Inside a postfix call's argument list, treat top-level `,` as
             // an argument separator, not as the union operator.
-            if self.in_call_args_depth > 0 && self.span_value(token) == "," {
+            if self.in_call_args_depth > 0 && self.span_value(&token) == "," {
                 break;
             }
 
             let (precedence, associativity) = self
-                .span_precedence(token)
+                .span_precedence(&token)
                 .unwrap_or((0, Associativity::Left));
             if precedence < min_precedence {
                 break;
             }
 
-            let op_span = self.tokens[self.position];
-            self.position += 1;
+            let op_span = token;
+            self.advance();
 
             let next_min_precedence = if associativity == Associativity::Left {
                 precedence + 1
@@ -2618,89 +3076,63 @@ impl Parser {
             };
 
             let right = self.parse_bp(next_min_precedence)?;
-            let op_token = self.span_to_token(&op_span);
-            let contains_volatile = left.contains_volatile || right.contains_volatile;
-            left = ASTNode::new_with_volatile(
-                ASTNodeType::BinaryOp {
-                    op: op_token.value.clone(),
-                    left: Box::new(left),
-                    right: Box::new(right),
-                },
-                Some(op_token),
-                contains_volatile,
-            );
+            left = self.binary(left, right, op_span)?;
         }
 
         Ok(left)
     }
 
-    fn parse_prefix(&mut self) -> Result<ASTNode, ParserError> {
+    fn parse_prefix(&mut self) -> Result<BuiltNode, ParserError> {
         self.skip_whitespace();
-        if self.position < self.tokens.len()
-            && self.tokens[self.position].token_type == TokenType::OpPrefix
+        if let Some(op_span) = self.peek()
+            && op_span.token_type == TokenType::OpPrefix
         {
-            let op_span = self.tokens[self.position];
-            self.position += 1;
+            self.advance();
 
             let (precedence, _) = self
                 .span_precedence(&op_span)
                 .unwrap_or((0, Associativity::Right));
 
             let expr = self.parse_bp(precedence)?;
-            let op_token = self.span_to_token(&op_span);
-            let contains_volatile = expr.contains_volatile;
-            return Ok(ASTNode::new_with_volatile(
-                ASTNodeType::UnaryOp {
-                    op: op_token.value.clone(),
-                    expr: Box::new(expr),
-                },
-                Some(op_token),
-                contains_volatile,
-            ));
+            return self.unary(expr, op_span);
         }
 
         self.parse_primary()
     }
 
-    fn parse_primary(&mut self) -> Result<ASTNode, ParserError> {
+    fn parse_primary(&mut self) -> Result<BuiltNode, ParserError> {
         self.skip_whitespace();
-        if self.position >= self.tokens.len() {
+        let Some(token) = self.peek() else {
             return Err(ParserError {
                 message: "Unexpected end of tokens".to_string(),
                 position: Some(self.position),
             });
-        }
+        };
 
-        let token = &self.tokens[self.position];
         match token.token_type {
             TokenType::Operand => {
-                let span = self.tokens[self.position];
-                self.position += 1;
-                self.parse_operand(span)
+                self.advance();
+                self.parse_operand(token)
             }
             TokenType::Func => {
-                let span = self.tokens[self.position];
-                self.position += 1;
-                self.parse_function(span)
+                self.advance();
+                self.parse_function(token)
             }
             TokenType::Paren if token.subtype == TokenSubType::Open => {
-                self.position += 1;
+                self.advance();
                 let expr = self.parse_expression()?;
                 self.skip_whitespace();
-                if self.position >= self.tokens.len()
-                    || self.tokens[self.position].token_type != TokenType::Paren
-                    || self.tokens[self.position].subtype != TokenSubType::Close
-                {
+                if !self.peek_is(TokenType::Paren, TokenSubType::Close) {
                     return Err(ParserError {
                         message: "Expected closing parenthesis".to_string(),
                         position: Some(self.position),
                     });
                 }
-                self.position += 1;
+                self.advance();
                 Ok(expr)
             }
             TokenType::Array if token.subtype == TokenSubType::Open => {
-                self.position += 1;
+                self.advance();
                 self.parse_array()
             }
             _ => Err(ParserError {
@@ -2710,7 +3142,8 @@ impl Parser {
         }
     }
 
-    fn parse_operand(&mut self, span: TokenSpan) -> Result<ASTNode, ParserError> {
+    fn parse_operand(&mut self, span: TokenSpan) -> Result<BuiltNode, ParserError> {
+        self.admit(1)?;
         let value = self.span_value(&span);
         let token = self.span_to_token(&span);
 
@@ -2720,35 +3153,40 @@ impl Parser {
                     message: format!("Invalid number: {value}"),
                     position: Some(self.position),
                 })?;
-                Ok(ASTNode::new(
-                    ASTNodeType::Literal(LiteralValue::Number(value)),
-                    Some(token),
-                ))
+                Ok(BuiltNode {
+                    height: 1,
+                    node: ASTNode::new(
+                        ASTNodeType::Literal(LiteralValue::Number(value)),
+                        Some(token),
+                    ),
+                })
             }
             TokenSubType::Text => {
-                let mut text = value.to_string();
-                if text.starts_with('"') && text.ends_with('"') && text.len() >= 2 {
-                    text = text[1..text.len() - 1].to_string();
-                    text = text.replace("\"\"", "\"");
-                }
-                Ok(ASTNode::new(
-                    ASTNodeType::Literal(LiteralValue::Text(text)),
-                    Some(token),
-                ))
+                let text = match value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
+                    Some(inner) => inner.replace("\"\"", "\""),
+                    None => value.to_string(),
+                };
+                Ok(BuiltNode {
+                    height: 1,
+                    node: ASTNode::new(ASTNodeType::Literal(LiteralValue::Text(text)), Some(token)),
+                })
             }
             TokenSubType::Logical => {
                 let v = value.eq_ignore_ascii_case("TRUE");
-                Ok(ASTNode::new(
-                    ASTNodeType::Literal(LiteralValue::Boolean(v)),
-                    Some(token),
-                ))
+                Ok(BuiltNode {
+                    height: 1,
+                    node: ASTNode::new(ASTNodeType::Literal(LiteralValue::Boolean(v)), Some(token)),
+                })
             }
             TokenSubType::Error => {
                 let error = ExcelError::from_error_string(value);
-                Ok(ASTNode::new(
-                    ASTNodeType::Literal(LiteralValue::Error(error)),
-                    Some(token),
-                ))
+                Ok(BuiltNode {
+                    height: 1,
+                    node: ASTNode::new(
+                        ASTNodeType::Literal(LiteralValue::Error(error)),
+                        Some(token),
+                    ),
+                })
             }
             TokenSubType::Range => {
                 let reference = ReferenceType::from_string_with_dialect(value, self.dialect)
@@ -2756,13 +3194,16 @@ impl Parser {
                         message: format!("Invalid reference '{value}': {e}"),
                         position: Some(self.position),
                     })?;
-                Ok(ASTNode::new(
-                    ASTNodeType::Reference {
-                        original: value.to_string(),
-                        reference,
-                    },
-                    Some(token),
-                ))
+                Ok(BuiltNode {
+                    height: 1,
+                    node: ASTNode::new(
+                        ASTNodeType::Reference {
+                            original: value.to_string(),
+                            reference,
+                        },
+                        Some(token),
+                    ),
+                })
             }
             _ => Err(ParserError {
                 message: format!("Unexpected operand subtype: {:?}", span.subtype),
@@ -2771,15 +3212,18 @@ impl Parser {
         }
     }
 
-    fn parse_function(&mut self, func_span: TokenSpan) -> Result<ASTNode, ParserError> {
-        let func_value = self.span_value(&func_span);
-        if func_value.is_empty() {
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "child heights are at most the AST height limit and the number of admitted nodes, so 1 + height cannot overflow"
+    )]
+    fn parse_function(&mut self, func_span: TokenSpan) -> Result<BuiltNode, ParserError> {
+        let Some(name) = self.span_value(&func_span).strip_suffix('(') else {
             return Err(ParserError {
                 message: "Invalid function token".to_string(),
                 position: Some(self.position),
             });
-        }
-        let name = func_value[..func_value.len() - 1].to_string();
+        };
+        let name = name.to_string();
         let args = self.parse_function_arguments()?;
 
         let this_is_volatile = self
@@ -2787,74 +3231,82 @@ impl Parser {
             .as_ref()
             .map(|f| f(name.as_str()))
             .unwrap_or(false);
-        let args_volatile = args.iter().any(|a| a.contains_volatile);
+        let args_volatile = args.volatile;
 
+        let height = 1 + args.height;
+        self.admit(height)?;
         let func_token = self.span_to_token(&func_span);
-        Ok(ASTNode::new_with_volatile(
-            ASTNodeType::Function { name, args },
-            Some(func_token),
-            this_is_volatile || args_volatile,
-        ))
+        Ok(BuiltNode {
+            height,
+            node: ASTNode::new_with_volatile(
+                ASTNodeType::Function {
+                    name,
+                    args: args.nodes,
+                },
+                Some(func_token),
+                this_is_volatile || args_volatile,
+            ),
+        })
     }
 
     /// Parse arguments for a postfix call (immediate invocation), where the
     /// opening `(` is a `Paren:Open` and the matching `)` is a `Paren:Close`.
     /// Caller has already consumed the opening paren. See the classic parser
     /// version for details on how top-level `,` is handled.
-    fn parse_call_arguments(&mut self) -> Result<Vec<ASTNode>, ParserError> {
-        let mut args: Vec<ASTNode> = Vec::new();
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "in_call_args_depth is incremented and decremented once per call, so it counts active calls and is bounded by the Pratt-frame limit"
+    )]
+    fn parse_call_arguments(&mut self) -> Result<BuiltArgs, ParserError> {
+        let mut args = BuiltArgs::default();
 
         self.skip_whitespace();
-        if self.position < self.tokens.len()
-            && self.tokens[self.position].token_type == TokenType::Paren
-            && self.tokens[self.position].subtype == TokenSubType::Close
-        {
-            self.position += 1;
+        if self.peek_is(TokenType::Paren, TokenSubType::Close) {
+            self.advance();
             return Ok(args);
         }
 
         self.in_call_args_depth += 1;
-        let result = (|| -> Result<Vec<ASTNode>, ParserError> {
+        let result = (|| -> Result<BuiltArgs, ParserError> {
             let mut expecting_argument = true;
             let mut saw_argument = false;
             loop {
                 self.skip_whitespace();
-                if self.position >= self.tokens.len() {
+                let Some(token) = self.peek() else {
                     return Err(ParserError {
                         message: "Unterminated call argument list".to_string(),
                         position: Some(self.position),
                     });
-                }
+                };
 
-                let token = &self.tokens[self.position];
                 let is_separator = (token.token_type == TokenType::Sep
                     && token.subtype == TokenSubType::Arg)
-                    || (token.token_type == TokenType::OpInfix && self.span_value(token) == ",");
+                    || (token.token_type == TokenType::OpInfix && self.span_value(&token) == ",");
                 let is_close =
                     token.token_type == TokenType::Paren && token.subtype == TokenSubType::Close;
 
                 if expecting_argument {
                     if is_close {
                         if saw_argument {
-                            args.push(ASTNode::new(ASTNodeType::Omitted, None));
+                            args.push(self.omitted()?);
                         }
-                        self.position += 1;
+                        self.advance();
                         return Ok(std::mem::take(&mut args));
                     }
                     if is_separator {
-                        args.push(ASTNode::new(ASTNodeType::Omitted, None));
+                        args.push(self.omitted()?);
                         saw_argument = true;
-                        self.position += 1;
+                        self.advance();
                     } else {
                         args.push(self.parse_expression()?);
                         saw_argument = true;
                         expecting_argument = false;
                     }
                 } else if is_separator {
-                    self.position += 1;
+                    self.advance();
                     expecting_argument = true;
                 } else if is_close {
-                    self.position += 1;
+                    self.advance();
                     return Ok(std::mem::take(&mut args));
                 } else {
                     return Err(ParserError {
@@ -2868,15 +3320,12 @@ impl Parser {
         result
     }
 
-    fn parse_function_arguments(&mut self) -> Result<Vec<ASTNode>, ParserError> {
-        let mut args = Vec::new();
+    fn parse_function_arguments(&mut self) -> Result<BuiltArgs, ParserError> {
+        let mut args = BuiltArgs::default();
 
         self.skip_whitespace();
-        if self.position < self.tokens.len()
-            && self.tokens[self.position].token_type == TokenType::Func
-            && self.tokens[self.position].subtype == TokenSubType::Close
-        {
-            self.position += 1;
+        if self.peek_is(TokenType::Func, TokenSubType::Close) {
+            self.advance();
             return Ok(args);
         }
 
@@ -2884,14 +3333,13 @@ impl Parser {
         let mut saw_argument = false;
         loop {
             self.skip_whitespace();
-            if self.position >= self.tokens.len() {
+            let Some(token) = self.peek() else {
                 return Err(ParserError {
                     message: "Unterminated function argument list".to_string(),
                     position: Some(self.position),
                 });
-            }
+            };
 
-            let token = &self.tokens[self.position];
             let is_separator =
                 token.token_type == TokenType::Sep && token.subtype == TokenSubType::Arg;
             let is_close =
@@ -2900,25 +3348,25 @@ impl Parser {
             if expecting_argument {
                 if is_close {
                     if saw_argument {
-                        args.push(ASTNode::new(ASTNodeType::Omitted, None));
+                        args.push(self.omitted()?);
                     }
-                    self.position += 1;
+                    self.advance();
                     return Ok(args);
                 }
                 if is_separator {
-                    args.push(ASTNode::new(ASTNodeType::Omitted, None));
+                    args.push(self.omitted()?);
                     saw_argument = true;
-                    self.position += 1;
+                    self.advance();
                 } else {
                     args.push(self.parse_expression()?);
                     saw_argument = true;
                     expecting_argument = false;
                 }
             } else if is_separator {
-                self.position += 1;
+                self.advance();
                 expecting_argument = true;
             } else if is_close {
-                self.position += 1;
+                self.advance();
                 return Ok(args);
             } else {
                 return Err(ParserError {
@@ -2929,71 +3377,95 @@ impl Parser {
         }
     }
 
-    fn parse_array(&mut self) -> Result<ASTNode, ParserError> {
+    #[expect(
+        clippy::arithmetic_side_effects,
+        reason = "child heights are at most the AST height limit and the number of admitted nodes, so 1 + height cannot overflow"
+    )]
+    fn append_array_item(
+        &mut self,
+        row: &mut Vec<ASTNode>,
+        height: &mut usize,
+        volatile: &mut bool,
+    ) -> Result<(), ParserError> {
+        let child = self.parse_expression()?;
+        *height = (*height).max(1 + child.height);
+        *volatile |= child.contains_volatile;
+        row.push(child.node);
+        Ok(())
+    }
+    fn finish_array(
+        &mut self,
+        rows: Vec<Vec<ASTNode>>,
+        height: usize,
+        volatile: bool,
+    ) -> Result<BuiltNode, ParserError> {
+        self.admit(height)?;
+        Ok(BuiltNode {
+            height,
+            node: ASTNode::new_with_volatile(ASTNodeType::Array(rows), None, volatile),
+        })
+    }
+    fn parse_array(&mut self) -> Result<BuiltNode, ParserError> {
         let mut rows = Vec::new();
         let mut current_row = Vec::new();
+        let mut height = 1;
+        let mut contains_volatile = false;
 
         self.skip_whitespace();
-        if self.position < self.tokens.len()
-            && self.tokens[self.position].token_type == TokenType::Array
-            && self.tokens[self.position].subtype == TokenSubType::Close
-        {
-            self.position += 1;
-            return Ok(ASTNode::new(ASTNodeType::Array(rows), None));
+        if self.peek_is(TokenType::Array, TokenSubType::Close) {
+            self.advance();
+            return self.finish_array(rows, 1, false);
         }
 
-        current_row.push(self.parse_expression()?);
+        self.append_array_item(&mut current_row, &mut height, &mut contains_volatile)?;
 
         while self.position < self.tokens.len() {
             self.skip_whitespace();
-            if self.position >= self.tokens.len() {
+            let Some(token) = self.peek() else {
                 break;
-            }
-            let token = &self.tokens[self.position];
+            };
 
-            if token.token_type == TokenType::Sep {
-                if token.subtype == TokenSubType::Arg {
-                    self.position += 1;
-                    current_row.push(self.parse_expression()?);
-                } else if token.subtype == TokenSubType::Row {
-                    self.position += 1;
-                    rows.push(current_row);
-                    current_row = vec![self.parse_expression()?];
+            // Every arm advances `position` or leaves the loop. A separator
+            // with another subtype (possible in an external TokenStream) is an
+            // unexpected token, not a no-op that would loop forever.
+            match (token.token_type, token.subtype) {
+                (TokenType::Sep, TokenSubType::Arg) => {
+                    self.advance();
+                    self.append_array_item(&mut current_row, &mut height, &mut contains_volatile)?;
                 }
-            } else if token.token_type == TokenType::Array && token.subtype == TokenSubType::Close {
-                self.position += 1;
-                rows.push(current_row);
-                break;
-            } else {
-                return Err(ParserError {
-                    message: format!("Unexpected token in array: {token:?}"),
-                    position: Some(self.position),
-                });
+                (TokenType::Sep, TokenSubType::Row) => {
+                    self.advance();
+                    rows.push(current_row);
+                    current_row = Vec::new();
+                    self.append_array_item(&mut current_row, &mut height, &mut contains_volatile)?;
+                }
+                (TokenType::Array, TokenSubType::Close) => {
+                    self.advance();
+                    rows.push(current_row);
+                    break;
+                }
+                _ => {
+                    return Err(ParserError {
+                        message: format!("Unexpected token in array: {token:?}"),
+                        position: Some(self.position),
+                    });
+                }
             }
         }
 
         // Array evaluation requires a rectangular shape. Reject malformed
         // literals before returning an AST to assignment or ingestion; never
         // silently pad missing elements.
-        if let Some(first) = rows.first() {
-            if rows.iter().any(|row| row.len() != first.len()) {
-                return Err(ParserError {
-                    message: "Array rows must have equal length".to_string(),
-                    position: Some(self.position.saturating_sub(1)),
-                });
-            }
+        if let Some(first) = rows.first()
+            && rows.iter().any(|row| row.len() != first.len())
+        {
+            return Err(ParserError {
+                message: "Array rows must have equal length".to_string(),
+                position: Some(self.position.saturating_sub(1)),
+            });
         }
 
-        let contains_volatile = rows
-            .iter()
-            .flat_map(|r| r.iter())
-            .any(|n| n.contains_volatile);
-
-        Ok(ASTNode::new_with_volatile(
-            ASTNodeType::Array(rows),
-            None,
-            contains_volatile,
-        ))
+        self.finish_array(rows, height, contains_volatile)
     }
 }
 
@@ -3053,9 +3525,14 @@ impl Parser {
 pub struct ParserBuilder {
     dialect: FormulaDialect,
     volatility_classifier: Option<VolatilityClassifierArc>,
+    limits: ParserLimits,
 }
 
 impl ParserBuilder {
+    pub fn limits(mut self, limits: ParserLimits) -> Self {
+        self.limits = limits;
+        self
+    }
     pub fn dialect(mut self, dialect: FormulaDialect) -> Self {
         self.dialect = dialect;
         self
@@ -3070,7 +3547,7 @@ impl ParserBuilder {
     }
 
     pub fn build<T: AsRef<str>>(self, formula: T) -> Result<Parser, TokenizerError> {
-        let mut parser = Parser::new_with_dialect(formula, self.dialect)?;
+        let mut parser = Parser::new_with_limits(formula.as_ref(), self.dialect, self.limits)?;
         if let Some(classifier) = self.volatility_classifier {
             parser = parser.with_volatility_classifier(move |name| classifier(name));
         }
@@ -3135,7 +3612,8 @@ where
 pub struct BatchParser {
     include_whitespace: bool,
     volatility_classifier: Option<VolatilityClassifierArc>,
-    token_cache: std::collections::HashMap<String, (Arc<str>, Arc<[TokenSpan]>)>,
+    token_cache: crate::token_cache::TokenCache,
+    limits: ParserLimits,
     dialect: FormulaDialect,
 }
 
@@ -3146,25 +3624,25 @@ impl BatchParser {
 
     /// Parse a formula using the internal cache and configured classifier.
     pub fn parse(&mut self, formula: &str) -> Result<ASTNode, ParserError> {
-        let (source, spans) = if let Some((source, tokens)) = self.token_cache.get(formula) {
-            (Arc::clone(source), Arc::clone(tokens))
+        self.limits.check_source(formula)?;
+        let (source, spans) = if let Some(pair) = self.token_cache.get(formula) {
+            pair
         } else {
-            let source: Arc<str> = Arc::from(formula);
             let mut spans =
-                crate::tokenizer::tokenize_spans_with_dialect(source.as_ref(), self.dialect)?;
+                crate::tokenizer::tokenize_spans_with_limits(formula, self.dialect, self.limits)?;
+            let source: Arc<str> = Arc::from(formula);
             if !self.include_whitespace {
                 spans.retain(|t| t.token_type != TokenType::Whitespace);
             }
 
             let spans: Arc<[TokenSpan]> = Arc::from(spans.into_boxed_slice());
-            self.token_cache.insert(
-                formula.to_string(),
-                (Arc::clone(&source), Arc::clone(&spans)),
-            );
+            self.token_cache
+                .insert(Arc::clone(&source), Arc::clone(&spans));
             (source, spans)
         };
 
         let mut parser = Parser::from_source_and_tokens(source, spans, self.dialect);
+        parser.limits = self.limits;
         if let Some(classifier) = self.volatility_classifier.clone() {
             parser = parser.with_volatility_classifier(move |name| classifier(name));
         }
@@ -3172,14 +3650,38 @@ impl BatchParser {
     }
 }
 
-#[derive(Default)]
 pub struct BatchParserBuilder {
+    limits: ParserLimits,
+    cache_entries: usize,
+    cache_bytes: usize,
     include_whitespace: bool,
     volatility_classifier: Option<VolatilityClassifierArc>,
     dialect: FormulaDialect,
 }
 
+impl Default for BatchParserBuilder {
+    fn default() -> Self {
+        Self {
+            include_whitespace: false,
+            volatility_classifier: None,
+            dialect: FormulaDialect::default(),
+            limits: ParserLimits::default(),
+            cache_entries: 16_384,
+            cache_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
 impl BatchParserBuilder {
+    pub fn limits(mut self, limits: ParserLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+    /// Set FIFO cache payload bounds. Zero entries disables retention.
+    pub fn cache_capacity(mut self, entries: usize, bytes: usize) -> Self {
+        self.cache_entries = entries;
+        self.cache_bytes = bytes;
+        self
+    }
     pub fn include_whitespace(mut self, include: bool) -> Self {
         self.include_whitespace = include;
         self
@@ -3202,7 +3704,8 @@ impl BatchParserBuilder {
         BatchParser {
             include_whitespace: self.include_whitespace,
             volatility_classifier: self.volatility_classifier,
-            token_cache: std::collections::HashMap::new(),
+            token_cache: crate::token_cache::TokenCache::new(self.cache_entries, self.cache_bytes),
+            limits: self.limits,
             dialect: self.dialect,
         }
     }

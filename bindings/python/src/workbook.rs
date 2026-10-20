@@ -22,8 +22,9 @@ type PyObject = pyo3::Py<pyo3::PyAny>;
 #[cfg(not(target_os = "emscripten"))]
 pub(crate) const DEFAULT_XLSX_BYTE_BACKEND: &str = "calamine";
 
-// Pyodide currently excludes Calamine because its Rust sysroot is older than
-// Calamine 0.36's MSRV. Keep the existing Umya byte path as its default.
+// Pyodide builds Calamine (and source recalculation) since Pyodide 314, but
+// keeps Umya as its default byte backend so existing Pyodide callers see the
+// same loader; pass backend='calamine' to choose it.
 #[cfg(target_os = "emscripten")]
 pub(crate) const DEFAULT_XLSX_BYTE_BACKEND: &str = "umya";
 
@@ -380,18 +381,11 @@ impl PyWorkbook {
         match backend {
             "calamine" => {
                 #[cfg(target_os = "emscripten")]
-                {
-                    let _ = (path, cfg);
-                    let message = if path_source == PyXlsxPathSource::DirectMmap {
-                        "XlsxPathSource.DIRECT_MMAP is unavailable in the Pyodide build; use SHARED_FILE or an in-memory XLSX byte API"
-                    } else {
-                        "backend='calamine' is unavailable in the Pyodide build; use backend='umya' with in-memory XLSX bytes"
-                    };
-                    Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
-                        message,
-                    ))
+                if path_source == PyXlsxPathSource::DirectMmap {
+                    return Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
+                        "XlsxPathSource.DIRECT_MMAP is unavailable in the Pyodide build; use SHARED_FILE or an in-memory XLSX byte API",
+                    ));
                 }
-                #[cfg(not(target_os = "emscripten"))]
                 {
                     use formualizer::workbook::backends::CalamineAdapter;
                     let adapter = CalamineAdapter::open_path_with_source(
@@ -516,7 +510,7 @@ impl PyWorkbook {
         let mut wb = self.write_inner()?;
         wb.add_sheet(name)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
-        let mut sheets = self.sheets.write().unwrap();
+        let mut sheets = self.sheets_write();
         sheets.entry(name.to_string()).or_default();
         Ok(())
     }
@@ -583,6 +577,45 @@ impl PyWorkbook {
             out.push(dict.into());
         }
         Ok(out)
+    }
+
+    /// Non-calculating sheets omitted by the loader.
+    #[getter]
+    pub fn sheet_import_diagnostics(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+        let wb = self.read_inner()?;
+        wb.sheet_import_diagnostics()
+            .iter()
+            .map(|diagnostic| {
+                let dict = PyDict::new(py);
+                dict.set_item("name", &diagnostic.name)?;
+                dict.set_item("kind", &diagnostic.kind)?;
+                Ok(dict.unbind())
+            })
+            .collect()
+    }
+
+    /// Non-fatal defined-name import diagnostics from the loader.
+    #[getter]
+    pub fn name_import_diagnostics(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
+        let wb = self.read_inner()?;
+        wb.name_import_diagnostics()
+            .iter()
+            .map(|diagnostic| {
+                let dict = PyDict::new(py);
+                dict.set_item("name", &diagnostic.name)?;
+                dict.set_item("definition", &diagnostic.definition)?;
+                dict.set_item("scope_sheet", &diagnostic.scope_sheet)?;
+                dict.set_item("local_sheet_id", diagnostic.local_sheet_id)?;
+                dict.set_item("message", &diagnostic.message)?;
+                Ok(dict.unbind())
+            })
+            .collect()
+    }
+
+    /// Linked workbook indices whose cached values were loaded, never refreshed.
+    #[getter]
+    pub fn cached_external_link_indices(&self) -> PyResult<Vec<usize>> {
+        Ok(self.read_inner()?.cached_external_link_indices().to_vec())
     }
 
     #[getter]
@@ -725,6 +758,29 @@ impl PyWorkbook {
 
         let out = PyList::empty(py);
         for entry in entries {
+            if let formualizer::eval::engine::named_range::NamedDefinition::Literal(
+                LiteralValue::Error(error),
+            ) = &entry.definition
+            {
+                let scope_sheet = match entry.scope {
+                    formualizer::eval::engine::named_range::NameScope::Workbook => None,
+                    formualizer::eval::engine::named_range::NameScope::Sheet(id) => {
+                        Some(engine.sheet_name(id))
+                    }
+                };
+                if error.message()
+                    == Some(&format!(
+                        "Defined name `{}` could not be evaluated",
+                        entry.name
+                    ))
+                    && wb
+                        .name_import_diagnostics()
+                        .iter()
+                        .any(|d| d.name == entry.name && d.scope_sheet.as_deref() == scope_sheet)
+                {
+                    continue;
+                }
+            }
             let row = PyDict::new(py);
             row.set_item("name", entry.name)?;
 
@@ -807,12 +863,14 @@ impl PyWorkbook {
     ) -> PyResult<()> {
         validate_cell_coords(row, col)?;
 
-        let literal = py_to_literal(value)?;
+        // NaN and infinities are stored as #NUM! (as `Workbook::set_value`
+        // does), so the compatibility cache below holds the same value.
+        let literal = py_to_literal(value)?.finite_or_num_error();
         let mut wb = self.write_inner()?;
         wb.set_value(sheet, row, col, literal.clone())
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         // Update compatibility cache
-        let mut sheets = self.sheets.write().unwrap();
+        let mut sheets = self.sheets_write();
         let sheet_map = sheets.entry(sheet.to_string()).or_default();
         sheet_map.insert(
             (row, col),
@@ -847,7 +905,7 @@ impl PyWorkbook {
         wb.set_formula(sheet, row, col, formula)
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
         // Update compatibility cache
-        let mut sheets = self.sheets.write().unwrap();
+        let mut sheets = self.sheets_write();
         let sheet_map = sheets.entry(sheet.to_string()).or_default();
         sheet_map.insert(
             (row, col),
@@ -898,8 +956,8 @@ impl PyWorkbook {
     /// on the next recalculation. Takes effect on a live workbook; no
     /// reload is required.
     ///
-    /// `deterministic_timezone` accepts `"utc"`, `"local"`, or a fixed
-    /// offset in seconds — the same spelling as
+    /// `deterministic_timezone` accepts `"utc"`, `"local"`, a fixed offset
+    /// such as `"+02:00"`, or an offset in seconds — the same spelling as
     /// `SheetPortSession.evaluate_once(deterministic_timezone=...)`.
     /// Omitted means UTC.
     #[pyo3(signature = (deterministic_timestamp_utc, deterministic_timezone=None))]
@@ -1055,7 +1113,7 @@ impl PyWorkbook {
             }
         };
         self.write_inner()?.engine_mut().set_temporal_egress(policy);
-        self.sheets.write().unwrap().clear();
+        self.sheets_write().clear();
         Ok(())
     }
 
@@ -1069,7 +1127,7 @@ impl PyWorkbook {
         validate_cell_coords(row, col)?;
 
         if let Some(cached) = {
-            let sheets = self.sheets.read().unwrap();
+            let sheets = self.sheets_read();
             sheets.get(sheet).and_then(|m| m.get(&(row, col)).cloned())
         } {
             if let Some(value) = cached.value {
@@ -1155,10 +1213,7 @@ impl PyWorkbook {
     pub fn undo(&self) -> PyResult<()> {
         let mut wb = self.write_inner()?;
         {
-            let mut sheets = self.sheets.write().map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("lock: {e}"))
-            })?;
-            sheets.clear();
+            self.sheets_write().clear();
         }
         wb.undo()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
@@ -1169,10 +1224,7 @@ impl PyWorkbook {
     pub fn redo(&self) -> PyResult<()> {
         let mut wb = self.write_inner()?;
         {
-            let mut sheets = self.sheets.write().map_err(|e| {
-                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("lock: {e}"))
-            })?;
-            sheets.clear();
+            self.sheets_write().clear();
         }
         wb.redo()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(e.to_string()))?;
@@ -1195,7 +1247,9 @@ impl PyWorkbook {
             let list: &Bound<'_, pyo3::types::PyList> = row.cast()?;
             let mut row_vals: Vec<LiteralValue> = Vec::with_capacity(list.len());
             for v in list.iter() {
-                row_vals.push(py_to_literal(&v)?);
+                // Stored as `Workbook::set_values` stores it (NaN is #NUM!),
+                // so the compatibility cache below matches.
+                row_vals.push(py_to_literal(&v)?.finite_or_num_error());
             }
             rows_vec.push(row_vals);
         }
@@ -1209,7 +1263,7 @@ impl PyWorkbook {
         res?;
         // Update compatibility cache
         {
-            let mut sheets = self.sheets.write().unwrap();
+            let mut sheets = self.sheets_write();
             let sheet_map = sheets.entry(sheet.to_string()).or_default();
             for (r_off, row_vals) in rows_vec.into_iter().enumerate() {
                 for (c_off, v) in row_vals.into_iter().enumerate() {
@@ -1256,7 +1310,7 @@ impl PyWorkbook {
         res?;
         // Update compatibility cache
         {
-            let mut sheets = self.sheets.write().unwrap();
+            let mut sheets = self.sheets_write();
             let sheet_map = sheets.entry(sheet.to_string()).or_default();
             for (r_off, row_vals) in rows_vec.into_iter().enumerate() {
                 for (c_off, s) in row_vals.into_iter().enumerate() {
@@ -1528,34 +1582,22 @@ impl PyWorkbook {
                 Ok(Self::from_inner_workbook(wb))
             }
             "calamine" => {
-                #[cfg(target_os = "emscripten")]
-                {
-                    let _ = (data, cfg);
-                    Err(PyErr::new::<pyo3::exceptions::PyNotImplementedError, _>(
-                        "backend='calamine' is unavailable in the Pyodide build; use backend='umya' with in-memory XLSX bytes",
-                    ))
-                }
-                #[cfg(not(target_os = "emscripten"))]
-                {
-                    use formualizer::workbook::backends::CalamineAdapter;
-                    use formualizer::workbook::traits::SpreadsheetReader;
+                use formualizer::workbook::backends::CalamineAdapter;
+                use formualizer::workbook::traits::SpreadsheetReader;
 
-                    let adapter = <CalamineAdapter as SpreadsheetReader>::open_bytes(data)
-                        .map_err(|e| {
-                            PyErr::new::<pyo3::exceptions::PyIOError, _>(format!(
-                                "open failed: {e}"
-                            ))
-                        })?;
-                    let wb = formualizer::workbook::Workbook::from_reader(
-                        adapter,
-                        formualizer::workbook::LoadStrategy::EagerAll,
-                        cfg,
-                    )
-                    .map_err(|e| {
-                        PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("load failed: {e}"))
+                let adapter =
+                    <CalamineAdapter as SpreadsheetReader>::open_bytes(data).map_err(|e| {
+                        PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("open failed: {e}"))
                     })?;
-                    Ok(Self::from_inner_workbook(wb))
-                }
+                let wb = formualizer::workbook::Workbook::from_reader(
+                    adapter,
+                    formualizer::workbook::LoadStrategy::EagerAll,
+                    cfg,
+                )
+                .map_err(|e| {
+                    PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("load failed: {e}"))
+                })?;
+                Ok(Self::from_inner_workbook(wb))
             }
             other => Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
                 "Unsupported backend: {other}"
@@ -1567,9 +1609,7 @@ impl PyWorkbook {
     /// internal helpers (e.g. SheetPort) bypass it, so it must be invalidated
     /// for `get_value()` to stay correct.
     pub(crate) fn clear_sheet_cache(&self) {
-        if let Ok(mut sheets) = self.sheets.write() {
-            sheets.clear();
-        }
+        self.sheets_write().clear();
     }
 
     /// Stable identity for this workbook, shared by every clone of the handle
@@ -1598,6 +1638,28 @@ impl PyWorkbook {
         self.inner
             .read()
             .map_err(|e| PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("lock: {e}")))
+    }
+
+    /// The compatibility cache, recovering it if a panic poisoned its lock.
+    ///
+    /// Each entry is a cell value or formula copied after the workbook write it
+    /// mirrors succeeded, so an unwind cannot leave an entry half-written; at
+    /// worst the cache misses entries, and readers fall back to the workbook.
+    /// The workbook lock (`inner`) is not recovered: a panic during a mutation
+    /// can leave the engine half-updated (an open deferred-dirty scope, a
+    /// swapped cancellation flag, a partly shifted structural edit), so later
+    /// calls keep reporting the poisoned lock instead of reading that state.
+    pub(crate) fn sheets_write(&self) -> std::sync::RwLockWriteGuard<'_, SheetCache> {
+        self.sheets
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Shared access to the compatibility cache; see [`Self::sheets_write`].
+    pub(crate) fn sheets_read(&self) -> std::sync::RwLockReadGuard<'_, SheetCache> {
+        self.sheets
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// Exclusive access to the engine state, re-entrancy checked.
@@ -1635,7 +1697,7 @@ impl PyWorkbook {
     {
         // Mutations performed through internal helpers (e.g. SheetPort) bypass the
         // legacy `sheets` cache; invalidate it so `get_value()` stays correct.
-        self.sheets.write().unwrap().clear();
+        self.sheets_write().clear();
 
         let mut wb = self.write_inner()?;
         f(&mut wb)
@@ -1696,7 +1758,33 @@ fn resolve_workbook_config(
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_XLSX_BYTE_BACKEND, PyWorkbookConfig, resolve_workbook_config};
+    use super::{DEFAULT_XLSX_BYTE_BACKEND, PyWorkbook, PyWorkbookConfig, resolve_workbook_config};
+
+    /// Poisons `lock` by panicking while holding its write guard.
+    fn poison<T>(lock: &std::sync::RwLock<T>) {
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = lock.write().unwrap();
+            panic!("poison the lock");
+        });
+        assert!(lock.is_poisoned());
+    }
+
+    #[test]
+    fn a_poisoned_cache_lock_is_recovered_and_the_workbook_lock_is_not() {
+        let wb = PyWorkbook::from_inner_workbook(formualizer::workbook::Workbook::new());
+        poison(&wb.sheets);
+        assert!(wb.sheets.is_poisoned());
+        wb.sheets_write()
+            .insert("S".to_string(), Default::default());
+        assert!(wb.sheets_read().contains_key("S"));
+        wb.clear_sheet_cache();
+        assert!(wb.sheets_read().is_empty());
+
+        assert!(wb.read_inner().is_ok());
+        poison(&wb.inner);
+        assert!(wb.write_inner().is_err());
+        assert!(wb.read_inner().is_err());
+    }
     use crate::enums::PyWorkbookMode;
     use formualizer::eval::engine::{EvalConfig, FormulaPlaneMode};
 

@@ -5,13 +5,13 @@ use crate::traits::{
 };
 use formualizer_common::{DateSystem, ExcelError, ExcelErrorKind, LiteralValue};
 use parking_lot::RwLock;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use calamine::{Data, DataRef, Range, Reader, Xlsx, XlsxFormulaMetadata, open_workbook_from_rs};
+use calamine::{Data, DataRef, Reader, Xlsx, XlsxFormulaMetadata, open_workbook_from_rs};
 use formualizer_common::RangeAddress;
 use formualizer_eval::arrow_store::{IngestBuilder, OverlayValue, map_error_code};
 use formualizer_eval::engine::ingest::EngineLoadStream;
@@ -31,6 +31,8 @@ use zip::ZipArchive;
 
 mod compressed_evidence;
 mod formula_replay;
+mod inert_sheets;
+pub(crate) mod name_references;
 
 use compressed_evidence::{EvidenceRecord, MonotonicFormulaEvidence};
 use formula_replay::{
@@ -354,13 +356,65 @@ impl Seek for CancellableReader {
 
 struct CalamineWorkbook(Xlsx<CancellableReader>);
 
+/// Cells of one worksheet as `((row0, col0), value)` in file order: memory in
+/// proportion to the cells present. Calamine's `worksheet_range` /
+/// `worksheet_formula` build a dense rectangle from the first to the last used
+/// cell, so one cell at XFD1048576 asks for hundreds of gigabytes.
+type SparseCells<T> = Vec<((u32, u32), T)>;
+
 impl CalamineWorkbook {
-    fn worksheet_range(&mut self, sheet: &str) -> Result<Range<Data>, calamine::Error> {
-        self.0.worksheet_range(sheet).map_err(Into::into)
+    /// Non-empty cell values, as `worksheet_range` would hold them.
+    fn worksheet_cells(&mut self, sheet: &str) -> Result<SparseCells<Data>, calamine::Error> {
+        let mut reader = match self.0.worksheet_cells_reader(sheet) {
+            Ok(reader) => reader,
+            Err(calamine::XlsxError::NotAWorksheet(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut cells = Vec::new();
+        while let Some(cell) = reader.next_cell()? {
+            if !matches!(cell.get_value(), DataRef::Empty) {
+                let pos = cell.get_position();
+                cells.push((pos, Data::from(cell.get_value().clone())));
+            }
+        }
+        Ok(cells)
     }
 
-    fn worksheet_formula(&mut self, sheet: &str) -> Result<Range<String>, calamine::Error> {
-        self.0.worksheet_formula(sheet).map_err(Into::into)
+    /// Non-empty formula texts, as `worksheet_formula` would hold them.
+    fn worksheet_formulas(&mut self, sheet: &str) -> Result<SparseCells<String>, calamine::Error> {
+        let mut reader = match self.0.worksheet_cells_reader(sheet) {
+            Ok(reader) => reader,
+            Err(calamine::XlsxError::NotAWorksheet(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut formulas = Vec::new();
+        while let Some(cell) = reader.next_formula()? {
+            if !cell.get_value().is_empty() {
+                let pos = cell.get_position();
+                formulas.push((pos, cell.get_value().clone()));
+            }
+        }
+        Ok(formulas)
+    }
+}
+
+/// `(height, width)` of the rectangle from the first to the last used cell,
+/// what calamine's `Range::height` / `width` report; `(0, 0)` with no cells.
+fn sparse_extent<T>(cells: &[((u32, u32), T)]) -> (u32, u32) {
+    let mut rows: Option<(u32, u32)> = None;
+    let mut cols: Option<(u32, u32)> = None;
+    for &((r, c), _) in cells {
+        rows = Some(rows.map_or((r, r), |(lo, hi)| (lo.min(r), hi.max(r))));
+        cols = Some(cols.map_or((c, c), |(lo, hi)| (lo.min(c), hi.max(c))));
+    }
+    match (rows, cols) {
+        // 0-based positions below 2^32, so the widened span fits u64 and the
+        // grid bound keeps it in u32 for any real sheet.
+        (Some((r0, r1)), Some((c0, c1))) => (
+            u32::try_from(u64::from(r1 - r0) + 1).unwrap_or(u32::MAX),
+            u32::try_from(u64::from(c1 - c0) + 1).unwrap_or(u32::MAX),
+        ),
+        _ => (0, 0),
     }
 }
 
@@ -372,9 +426,58 @@ struct DebugTimer {
 struct DenseState {
     aib: IngestBuilder,
     row_vals: Vec<LiteralValue>,
+    /// Number formats of the pending row's date-formatted cells; consulted
+    /// only when `row_formatted` is set, so plain rows pay nothing.
+    row_formats: Vec<Option<formualizer_eval::format::FormatId>>,
+    row_formatted: bool,
     current_row0: usize,
     rows_appended: usize,
     row_started: bool,
+}
+
+impl DenseState {
+    fn set(
+        &mut self,
+        col: usize,
+        value: LiteralValue,
+        format: Option<formualizer_eval::format::FormatId>,
+    ) {
+        self.row_vals[col] = value;
+        if format.is_some() || self.row_formatted {
+            self.row_formats[col] = format;
+            self.row_formatted |= format.is_some();
+        }
+    }
+
+    /// Append the pending row. A row holding date-formatted numbers goes
+    /// through the typed-token path so each serial keeps its exact value and
+    /// its format; other rows use the literal path unchanged.
+    fn append_pending_row(&mut self) -> Result<(), ExcelError> {
+        if !self.row_formatted {
+            return self.aib.append_row(&self.row_vals);
+        }
+        use formualizer_eval::arrow_store::CellIngest;
+        let cells = self
+            .row_vals
+            .iter()
+            .zip(&self.row_formats)
+            .map(|(value, format)| match (value, format) {
+                (LiteralValue::Number(n), Some(format)) => CellIngest::FormattedNumber(*n, *format),
+                (LiteralValue::Number(n), None) => CellIngest::Number(*n),
+                (LiteralValue::Int(i), _) => CellIngest::Number(*i as f64),
+                (LiteralValue::Boolean(b), _) => CellIngest::Boolean(*b),
+                (LiteralValue::Text(s), _) => CellIngest::Text(s),
+                (LiteralValue::Error(e), _) => CellIngest::ErrorCode(map_error_code(e.kind)),
+                (LiteralValue::Pending, _) => CellIngest::Pending,
+                (LiteralValue::Empty, _) => CellIngest::Empty,
+                // The value plane never stages other variants.
+                _ => CellIngest::ErrorCode(map_error_code(ExcelErrorKind::Value)),
+            });
+        let result = self.aib.append_row_cells_iter(cells);
+        self.row_formats.fill(None);
+        self.row_formatted = false;
+        result
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -384,6 +487,7 @@ struct WorkbookSpoolUsage {
 }
 
 struct StreamWorksheetOptions {
+    refused_external_formulas: HashSet<(u32, u32)>,
     chunk_rows: usize,
     debug: bool,
     workbook_spool_usage: WorkbookSpoolUsage,
@@ -435,15 +539,35 @@ struct StreamedSheet {
     stream_millis: u128,
 }
 
+/// A stored cell value for the dense value plane. A zero-length string is
+/// empty text (Excel counts it with `COUNTA` and `ISBLANK` is FALSE), not a
+/// blank cell. A date-formatted number keeps its exact serial; the date
+/// format travels separately through [`data_ref_format`].
+/// A numeric cell. `<v>NaN</v>` and `<v>inf</v>` parse as non-finite floats,
+/// which no spreadsheet value can hold: they are stored as `#NUM!`, as the CSV
+/// loader rejects them. One `is_finite` per numeric cell.
 #[inline]
-fn data_ref_to_literal(value: &DataRef<'_>, date_system: DateSystem) -> Option<LiteralValue> {
+fn number_literal(n: f64) -> LiteralValue {
+    LiteralValue::Number(n).finite_or_num_error()
+}
+
+/// [`number_literal`] for the sparse overlay.
+#[inline]
+fn number_overlay(n: f64) -> OverlayValue {
+    if n.is_finite() {
+        OverlayValue::Number(n)
+    } else {
+        OverlayValue::Error(map_error_code(ExcelErrorKind::Num))
+    }
+}
+
+#[inline]
+fn data_ref_to_literal(value: &DataRef<'_>) -> Option<LiteralValue> {
     match value {
         DataRef::Empty => None,
-        DataRef::String(s) if s.is_empty() => None,
-        DataRef::SharedString("") => None,
         DataRef::String(s) => Some(LiteralValue::Text(s.clone())),
         DataRef::SharedString(s) => Some(LiteralValue::Text((*s).to_string())),
-        DataRef::Float(f) => Some(LiteralValue::Number(*f)),
+        DataRef::Float(f) => Some(number_literal(*f)),
         DataRef::Int(i) => Some(LiteralValue::Number(*i as f64)),
         DataRef::Bool(b) => Some(LiteralValue::Boolean(*b)),
         DataRef::Error(e) => Some(LiteralValue::Error(ExcelError::new(
@@ -458,10 +582,7 @@ fn data_ref_to_literal(value: &DataRef<'_>, date_system: DateSystem) -> Option<L
                 _ => ExcelErrorKind::Error,
             },
         ))),
-        DataRef::DateTime(dt) => Some(
-            LiteralValue::try_from_serial_number_for(date_system, dt.as_f64())
-                .unwrap_or_else(LiteralValue::Error),
-        ),
+        DataRef::DateTime(dt) => Some(number_literal(dt.as_f64())),
         DataRef::DateTimeIso(s) => Some(LiteralValue::Text(s.clone())),
         DataRef::DurationIso(s) => Some(LiteralValue::Text(s.clone())),
     }
@@ -518,15 +639,13 @@ impl SparseValueBatch {
 fn data_ref_to_overlay(value: &DataRef<'_>) -> Option<OverlayValue> {
     match value {
         DataRef::Empty => None,
-        DataRef::String(s) if s.is_empty() => None,
-        DataRef::SharedString("") => None,
         DataRef::String(s) => Some(OverlayValue::Text(Arc::from(s.as_str()))),
         DataRef::SharedString(s) => Some(OverlayValue::Text(Arc::from(*s))),
-        DataRef::Float(f) => Some(OverlayValue::Number(*f)),
+        DataRef::Float(f) => Some(number_overlay(*f)),
         DataRef::Int(i) => Some(OverlayValue::Number(*i as f64)),
         DataRef::Bool(b) => Some(OverlayValue::Boolean(*b)),
         DataRef::Error(e) => Some(OverlayValue::Error(CalamineAdapter::calamine_error_code(e))),
-        DataRef::DateTime(dt) => Some(OverlayValue::Number(dt.as_f64())),
+        DataRef::DateTime(dt) => Some(number_overlay(dt.as_f64())),
         DataRef::DateTimeIso(s) => Some(OverlayValue::Text(Arc::from(s.as_str()))),
         DataRef::DurationIso(s) => Some(OverlayValue::Text(Arc::from(s.as_str()))),
     }
@@ -570,6 +689,25 @@ impl DebugTimer {
 
 type ShadowRelocationComparator = Arc<dyn Fn(&ASTNode, &ASTNode) -> bool + Send + Sync>;
 
+#[derive(Default)]
+struct CalculationNameAnalysis {
+    dependencies: Vec<Vec<usize>>,
+    cyclic: HashSet<usize>,
+}
+
+#[derive(Default)]
+struct CalculationNameCandidates {
+    ordinary_first: Option<usize>,
+    legacy_first: Option<usize>,
+    legacy_last: Option<usize>,
+}
+
+#[derive(Default)]
+struct CalculationNameIndex {
+    names: HashMap<(Option<usize>, String), CalculationNameCandidates>,
+    sheets: HashMap<String, usize>,
+}
+
 /// Read-only XLSX adapter backed by one shared source acquisition.
 ///
 /// [`SpreadsheetReader::open_path`] retains one opened file and uses serialized
@@ -584,6 +722,7 @@ pub struct CalamineAdapter {
     cancel: Option<CancelToken>,
     loaded_sheets: HashSet<String>,
     cached_names: Option<Vec<String>>,
+    sheet_import_diagnostics: Vec<crate::traits::SheetImportDiagnostic>,
     /// Calamine's already-parsed `(name, formula)` pairs, captured at open time.
     ///
     /// Held outside `workbook` on purpose: [`Self::lazy_defined_names`] must not
@@ -591,10 +730,28 @@ pub struct CalamineAdapter {
     /// reentrant and any caller holding the write lock would self-deadlock.
     calamine_defined_names: Vec<(String, String)>,
     defined_names: OnceLock<Vec<DefinedName>>,
+    calculation_names: OnceLock<Vec<(String, String, Option<usize>)>>,
+    name_index: OnceLock<CalculationNameIndex>,
+    name_analysis: OnceLock<CalculationNameAnalysis>,
+    grounded_names: OnceLock<Vec<Option<ASTNode>>>,
+    referenced_only_names: bool,
+    strict_calculation_names: bool,
+    name_import_diagnostics: Vec<crate::traits::NameImportDiagnostic>,
+    unregistrable_names: HashSet<String>,
     external_link_targets: OnceLock<BTreeMap<u32, String>>,
     calc_settings: OnceLock<Option<CalcSettings>>,
     load_stats: AdapterLoadStats,
     shadow_relocation_comparator: Option<ShadowRelocationComparator>,
+    /// Cached external link values a recalculation serves: calculation
+    /// names may read exactly these external references.
+    #[cfg(feature = "calamine")]
+    external_values: Option<Arc<crate::cached_external_links::ExternalValues>>,
+    /// Lowercased names that read external links but that nothing
+    /// references: kept as raw metadata, like unsupported `_xlnm.*` names.
+    #[cfg(feature = "calamine")]
+    skipped_external_names: Vec<String>,
+    refused_external_names: HashSet<String>,
+    refused_external_formulas: HashMap<String, HashSet<(u32, u32)>>,
     #[cfg(test)]
     lazy_scan_counts: LazyScanCounts,
     #[cfg(test)]
@@ -680,6 +837,7 @@ impl CalamineAdapter {
         sheet: &str,
         position: (u32, u32),
         formula: &str,
+        shared: Option<usize>,
         debug: bool,
         staging: &mut FormulaStaging,
     ) -> Result<(), calamine::Error> {
@@ -697,7 +855,9 @@ impl CalamineAdapter {
             engine.stage_formula_text(sheet, excel_row, excel_col, normalized);
             staging.handed_to_engine += 1;
         } else {
+            staging.grouper.note_formula();
             let record = if let Some(cached) = staging.parse_cache.get(&normalized) {
+                staging.grouper.note_parse_cache_hit();
                 cached.map(|ast_id| {
                     engine.note_staged_formula(&mut staging.grouper, excel_row, excel_col, ast_id);
                     FormulaIngestRecord::new(
@@ -707,8 +867,19 @@ impl CalamineAdapter {
                         Some(Arc::<str>::from(normalized.as_str())),
                     )
                 })
+            } else if let Some(record) = engine.stage_relocated_text(
+                &mut staging.grouper,
+                excel_row,
+                excel_col,
+                &normalized,
+                shared.map(|index| index as u64),
+            ) {
+                Some(record)
             } else {
-                let parsed = match formualizer_parse::parser::parse(&normalized) {
+                staging.grouper.note_parse(normalized.len());
+                let parsed = formualizer_parse::parser::parse(&normalized);
+                let parsed_text = parsed.is_ok();
+                let parsed = match parsed {
                     Ok(parsed) => Some(parsed),
                     Err(error) => engine
                         .handle_formula_parse_error(
@@ -731,6 +902,17 @@ impl CalamineAdapter {
                             &ast,
                             None,
                         );
+                        if parsed_text {
+                            engine.note_parsed_text(
+                                &mut staging.grouper,
+                                excel_row,
+                                excel_col,
+                                &normalized,
+                                &ast,
+                                &record,
+                                shared.map(|index| index as u64),
+                            );
+                        }
                         // A member's text is not worth caching: relative
                         // copies do not repeat their text.
                         if record.is_family_member() {
@@ -777,6 +959,7 @@ impl CalamineAdapter {
         Self::cancellation_checkpoint(cancel)?;
         let timer = DebugTimer::start();
         let StreamWorksheetOptions {
+            refused_external_formulas,
             chunk_rows,
             debug,
             workbook_spool_usage,
@@ -802,6 +985,8 @@ impl CalamineAdapter {
         let mut dense = (!force_sparse_from_start).then(|| DenseState {
             aib: IngestBuilder::new(sheet, dims_cols, chunk_rows, engine.config.date_system),
             row_vals: vec![LiteralValue::Empty; dims_cols],
+            row_formats: vec![None; dims_cols],
+            row_formatted: false,
             current_row0: 0,
             rows_appended: 0,
             row_started: false,
@@ -993,7 +1178,7 @@ impl CalamineAdapter {
                     && state.current_row0 == row
                     && col < state.row_vals.len()
                 {
-                    state.row_vals[col] = LiteralValue::Empty;
+                    state.set(col, LiteralValue::Empty, None);
                 }
                 formula_count += 1;
             }
@@ -1003,8 +1188,7 @@ impl CalamineAdapter {
             if has_formula {
                 continue;
             }
-            let Some(literal) = data_ref_to_literal(&record.value, engine.config.date_system)
-            else {
+            let Some(literal) = data_ref_to_literal(&record.value) else {
                 continue;
             };
             value_cells_observed += 1;
@@ -1052,7 +1236,7 @@ impl CalamineAdapter {
             if non_monotonic || col_overflow || large_gap || would_exceed_dense_budget {
                 let mut state = dense.take().expect("dense state present");
                 if state.row_started && state.current_row0 == state.rows_appended {
-                    state.aib.append_row(&state.row_vals).map_err(|error| {
+                    state.append_pending_row().map_err(|error| {
                         calamine::Error::Io(std::io::Error::other(error.to_string()))
                     })?;
                     state.rows_appended += 1;
@@ -1093,7 +1277,7 @@ impl CalamineAdapter {
                 state.current_row0 = row;
                 state.row_started = true;
             } else if row > state.current_row0 {
-                state.aib.append_row(&state.row_vals).map_err(|error| {
+                state.append_pending_row().map_err(|error| {
                     calamine::Error::Io(std::io::Error::other(error.to_string()))
                 })?;
                 state.rows_appended += 1;
@@ -1109,7 +1293,7 @@ impl CalamineAdapter {
                 }
                 state.current_row0 = row;
             }
-            state.row_vals[col] = literal;
+            state.set(col, literal, data_ref_format(&record.value));
             values_handed_to_engine += 1;
         }
 
@@ -1243,7 +1427,12 @@ impl CalamineAdapter {
                         engine,
                         sheet,
                         (coord0.row, coord0.col),
-                        formula,
+                        if refused_external_formulas.contains(&(coord0.row, coord0.col)) {
+                            "#REF!"
+                        } else {
+                            formula
+                        },
+                        shared_index,
                         debug,
                         &mut formula_staging,
                     )
@@ -1255,6 +1444,8 @@ impl CalamineAdapter {
                 });
             }
         }
+
+        engine.finish_family_grouper(&mut formula_staging.grouper);
 
         if u64::try_from(value_cells_observed)
             .unwrap_or(u64::MAX)
@@ -1282,7 +1473,7 @@ impl CalamineAdapter {
         } else {
             let mut state = dense.take().expect("dense state present");
             if state.row_started {
-                state.aib.append_row(&state.row_vals).map_err(|error| {
+                state.append_pending_row().map_err(|error| {
                     calamine::Error::Io(std::io::Error::other(error.to_string()))
                 })?;
             }
@@ -1339,9 +1530,41 @@ impl CalamineAdapter {
         source: SharedXlsxReader,
         cancel: Option<CancelToken>,
     ) -> Result<Self, calamine::Error> {
+        // calamine parses the workbook parts here; a panic in it is an I/O
+        // error of the open (see `panic_guard`).
+        crate::panic_guard::catch_load_panic(
+            || Self::from_shared_source_unguarded(source, cancel),
+            |message| calamine::Error::Io(std::io::Error::other(message)),
+        )
+    }
+
+    fn from_shared_source_unguarded(
+        source: SharedXlsxReader,
+        cancel: Option<CancelToken>,
+    ) -> Result<Self, calamine::Error> {
+        let (projection, original_names, mut sheet_import_diagnostics) =
+            inert_sheets::omit_modules(&source, cancel.clone())?;
+        let source = projection
+            .map(SharedXlsxReader::from_bytes)
+            .unwrap_or(source);
         let workbook: Xlsx<CancellableReader> =
             open_workbook_from_rs(CancellableReader::new(source.reader(), cancel.clone()))?;
-        let sheet_names = workbook.sheet_names().to_vec();
+        for sheet in workbook.sheets_metadata() {
+            let kind = match sheet.typ {
+                calamine::SheetType::ChartSheet => "chartsheet",
+                calamine::SheetType::DialogSheet => "dialogsheet",
+                _ => continue,
+            };
+            sheet_import_diagnostics.push(crate::traits::SheetImportDiagnostic {
+                name: sheet.name.clone(),
+                kind: kind.into(),
+            });
+        }
+        let sheet_names = if original_names.is_empty() {
+            workbook.sheet_names().to_vec()
+        } else {
+            original_names
+        };
         let calamine_defined_names = workbook.defined_names().to_vec();
 
         Ok(Self {
@@ -1350,17 +1573,44 @@ impl CalamineAdapter {
             cancel,
             loaded_sheets: HashSet::new(),
             cached_names: Some(sheet_names),
+            sheet_import_diagnostics,
             calamine_defined_names,
             defined_names: OnceLock::new(),
+            calculation_names: OnceLock::new(),
+            name_index: OnceLock::new(),
+            name_analysis: OnceLock::new(),
+            grounded_names: OnceLock::new(),
+            referenced_only_names: false,
+            strict_calculation_names: false,
+            name_import_diagnostics: Vec::new(),
+            unregistrable_names: HashSet::new(),
             external_link_targets: OnceLock::new(),
             calc_settings: OnceLock::new(),
             load_stats: AdapterLoadStats::default(),
             shadow_relocation_comparator: None,
+            #[cfg(feature = "calamine")]
+            external_values: None,
+            #[cfg(feature = "calamine")]
+            skipped_external_names: Vec::new(),
+            refused_external_names: HashSet::new(),
+            refused_external_formulas: HashMap::new(),
             #[cfg(test)]
             lazy_scan_counts: LazyScanCounts::default(),
             #[cfg(test)]
             stream_row_checkpoint_hook: None,
         })
+    }
+
+    fn is_inert_sheet(&self, name: &str) -> bool {
+        self.sheet_import_diagnostics
+            .iter()
+            .any(|s| s.name.to_lowercase() == name.to_lowercase())
+    }
+
+    fn inert_scope(&self, scope: Option<usize>) -> bool {
+        scope
+            .and_then(|i| self.cached_names.as_ref()?.get(i))
+            .is_some_and(|s| self.is_inert_sheet(s))
     }
 
     fn cancellable_reader(&self) -> CancellableReader {
@@ -1421,14 +1671,703 @@ impl CalamineAdapter {
             }
 
             let sheet_names = self.cached_names.as_deref().unwrap_or_default();
-            let parsed =
-                Self::scan_defined_names_from_reader(self.cancellable_reader(), sheet_names);
+            let parsed = self
+                .raw_calculation_names()
+                .iter()
+                .filter_map(|(name, value, scope)| {
+                    Self::convert_defined_name(name, value, *scope, sheet_names)
+                })
+                .collect::<Vec<_>>();
             if parsed.is_empty() {
                 Self::fallback_defined_names(&self.calamine_defined_names, sheet_names)
             } else {
                 parsed
             }
         })
+    }
+
+    // Private calculation metadata: the public reader DTO intentionally describes
+    // only ranges and literals. Do not extend its JSON schema for formula names.
+    fn raw_calculation_names(&self) -> &Vec<(String, String, Option<usize>)> {
+        self.calculation_names.get_or_init(|| {
+            let names = Self::scan_defined_names_from_reader(self.cancellable_reader());
+            if names.is_empty() {
+                self.calamine_defined_names
+                    .iter()
+                    .map(|(n, f)| (n.clone(), f.clone(), None))
+                    .collect()
+            } else {
+                names
+            }
+        })
+    }
+
+    /// Serve exactly these cached external references to calculation names.
+    #[cfg(feature = "calamine")]
+    pub(crate) fn admit_external_references(
+        &mut self,
+        values: Arc<crate::cached_external_links::ExternalValues>,
+    ) {
+        self.external_values = Some(values);
+        self.name_analysis.take();
+        self.grounded_names.take();
+    }
+
+    /// Leave these unreferenced external-link names out of the calculation.
+    #[cfg(feature = "calamine")]
+    pub(crate) fn skip_external_names(&mut self, names: Vec<String>) {
+        self.skipped_external_names = names;
+        self.name_index.take();
+        self.name_analysis.take();
+        self.grounded_names.take();
+    }
+
+    /// Whether a name's external reference reads an admitted cached value.
+    fn external_admitted(&self, raw: &str) -> bool {
+        #[cfg(feature = "calamine")]
+        {
+            self.external_values
+                .as_ref()
+                .is_some_and(|values| values.contains(raw))
+        }
+        #[cfg(not(feature = "calamine"))]
+        {
+            let _ = raw;
+            false
+        }
+    }
+
+    fn grounded_calculation_name(&self, i: usize) -> Option<ASTNode> {
+        if self.inert_scope(self.raw_calculation_names()[i].2) {
+            return None;
+        }
+        let name = &self.raw_calculation_names()[i].0;
+        if self.referenced_only_names
+            && !self.legacy_calculation_name(name)
+            && self.unregistrable_names.contains(&name.to_lowercase())
+        {
+            return None;
+        }
+        self.grounded_names
+            .get_or_init(|| {
+                self.raw_calculation_names()
+                    .iter()
+                    .map(|(name, text, scope)| self.grounded_name_ast(name, text, *scope))
+                    .collect()
+            })
+            .get(i)
+            .cloned()
+            .flatten()
+    }
+
+    fn grounded_name_ast(&self, name: &str, text: &str, scope: Option<usize>) -> Option<ASTNode> {
+        if self
+            .refused_external_names
+            .contains(&name.to_ascii_lowercase())
+        {
+            return formualizer_parse::parser::parse("=#REF!").ok();
+        }
+        use formualizer_parse::parser::ASTNodeType as N;
+        if Self::cancellation_checkpoint(self.cancel.as_ref()).is_err() {
+            return None;
+        }
+        let sheets = self.cached_names.as_deref().unwrap_or_default();
+        if scope.is_some_and(|id| id >= sheets.len()) {
+            return None;
+        }
+        let external = |raw: &str| self.external_admitted(raw);
+        fn ground(
+            ast: &mut ASTNode,
+            base: Option<&String>,
+            sheets: &[String],
+            external: &dyn Fn(&str) -> bool,
+        ) -> bool {
+            match &mut ast.node_type {
+                N::Literal(LiteralValue::Number(n)) => n.is_finite(),
+                N::Literal(_) => true,
+                N::Reference { reference, .. } => match reference {
+                    ReferenceType::NamedRange(_) => true,
+                    ReferenceType::Cell {
+                        sheet,
+                        row,
+                        col,
+                        row_abs,
+                        col_abs,
+                    } => {
+                        if sheet.is_none() {
+                            *sheet = base.cloned();
+                        }
+                        *row_abs
+                            && *col_abs
+                            && *row > 0
+                            && *row <= CalamineAdapter::EXCEL_MAX_ROWS
+                            && *col > 0
+                            && *col <= CalamineAdapter::EXCEL_MAX_COLS
+                            && sheet.as_ref().is_some_and(|s| sheets.contains(s))
+                    }
+                    ReferenceType::Range {
+                        sheet,
+                        start_row,
+                        start_col,
+                        end_row,
+                        end_col,
+                        start_row_abs,
+                        start_col_abs,
+                        end_row_abs,
+                        end_col_abs,
+                    } => {
+                        if sheet.is_none() {
+                            *sheet = base.cloned();
+                        }
+                        let rows = start_row.zip(*end_row);
+                        let cols = start_col.zip(*end_col);
+                        let rows_ok = rows.is_some_and(|(s, e)| {
+                            *start_row_abs
+                                && *end_row_abs
+                                && s > 0
+                                && s <= e
+                                && e <= CalamineAdapter::EXCEL_MAX_ROWS
+                        }) || (start_row.is_none() && end_row.is_none());
+                        let cols_ok = cols.is_some_and(|(s, e)| {
+                            *start_col_abs
+                                && *end_col_abs
+                                && s > 0
+                                && s <= e
+                                && e <= CalamineAdapter::EXCEL_MAX_COLS
+                        }) || (start_col.is_none() && end_col.is_none());
+                        rows_ok && cols_ok && sheet.as_ref().is_some_and(|s| sheets.contains(s))
+                    }
+                    // An absolute reference whose cached value a
+                    // recalculation serves (never on other load paths).
+                    ReferenceType::External(ext) => {
+                        use formualizer_parse::parser::ExternalRefKind as K;
+                        let absolute = match ext.kind {
+                            K::Cell {
+                                row_abs, col_abs, ..
+                            } => row_abs && col_abs,
+                            K::Range {
+                                start_row_abs,
+                                start_col_abs,
+                                end_row_abs,
+                                end_col_abs,
+                                ..
+                            } => start_row_abs && start_col_abs && end_row_abs && end_col_abs,
+                        };
+                        absolute && external(&ext.raw)
+                    }
+                    _ => false,
+                },
+                N::UnaryOp { op, expr } => {
+                    matches!(op.as_str(), "+" | "-" | "%") && ground(expr, base, sheets, external)
+                }
+                N::BinaryOp { op, left, right } => {
+                    matches!(
+                        op.as_str(),
+                        "+" | "-" | "*" | "/" | "^" | "&" | "=" | "<>" | "<" | ">" | "<=" | ">="
+                    ) && ground(left, base, sheets, external)
+                        && ground(right, base, sheets, external)
+                }
+                N::Function { name, args } => {
+                    // Context-dependent/reference-producing functions (INDIRECT,
+                    // OFFSET, ROW(), etc.) require separate name semantics. Admit
+                    // only this explicit pure scalar/aggregation subset.
+                    matches!(
+                        name.to_ascii_uppercase().as_str(),
+                        "SUM"
+                            | "AVERAGE"
+                            | "MIN"
+                            | "MAX"
+                            | "COUNT"
+                            | "COUNTA"
+                            | "ABS"
+                            | "ROUND"
+                            | "ROUNDUP"
+                            | "ROUNDDOWN"
+                            | "IF"
+                            | "AND"
+                            | "OR"
+                            | "NOT"
+                    ) && args.iter_mut().all(|a| ground(a, base, sheets, external))
+                }
+                // Arrays, generic calls and omitted arguments are outside this packet.
+                _ => false,
+            }
+        }
+        let mut ast = formualizer_parse::parser::parse(format!(
+            "={}",
+            text.trim().strip_prefix('=').unwrap_or(text.trim())
+        ))
+        .ok()?;
+        let mut names_exist = true;
+        ast.visit_refs(|r| {
+            if let formualizer_parse::parser::RefView::NamedRange { name } = r {
+                names_exist &= self.calculation_name_index(name, scope).is_some();
+            }
+        });
+        ((!self.referenced_only_names || self.legacy_calculation_name(name) || names_exist)
+            && ground(
+                &mut ast,
+                scope.and_then(|id| sheets.get(id)),
+                sheets,
+                &external,
+            ))
+        .then_some(ast)
+    }
+
+    /// Lowercased unevaluable names kept as raw metadata. No source
+    /// calculation may reference one.
+    #[cfg(feature = "xlsx-recalc")]
+    pub(crate) fn unimported_document_names(&self) -> Vec<String> {
+        let cyclic = self.cyclic_calculation_names();
+        let mut names = Vec::new();
+        for (i, (name, _, _)) in self.raw_calculation_names().iter().enumerate() {
+            if Self::cancellation_checkpoint(self.cancel.as_ref()).is_err() {
+                return Vec::new();
+            }
+            if cyclic.contains(&i) || self.grounded_calculation_name(i).is_none() {
+                names.push(if self.legacy_calculation_name(name) {
+                    name.to_ascii_lowercase()
+                } else {
+                    name.to_lowercase()
+                });
+            }
+        }
+        names
+    }
+
+    fn calculation_name_dependencies(&self) -> Vec<Vec<usize>> {
+        let raw = self.raw_calculation_names();
+        raw.iter()
+            .enumerate()
+            .map(|(i, (name, text, scope))| {
+                if Self::cancellation_checkpoint(self.cancel.as_ref()).is_err() {
+                    return Vec::new();
+                }
+                let mut deps = HashSet::new();
+                let referenced_only =
+                    self.referenced_only_names && !self.legacy_calculation_name(name);
+                let ast = if referenced_only {
+                    formualizer_parse::parser::parse(format!(
+                        "={}",
+                        text.trim().trim_start_matches('=')
+                    ))
+                    .ok()
+                } else {
+                    self.grounded_calculation_name(i)
+                };
+                if let Some(ast) = ast {
+                    let mut reader = |name: &str| {
+                        let index = if referenced_only {
+                            self.calculation_name_index(name, *scope)
+                        } else {
+                            self.legacy_name_index(name, *scope)
+                        };
+                        if let Some(j) = index {
+                            deps.insert(j);
+                        }
+                    };
+                    if referenced_only {
+                        name_references::visit(&ast, |name, _| reader(name));
+                    } else {
+                        ast.visit_refs(|r| {
+                            if let formualizer_parse::parser::RefView::NamedRange { name } = r {
+                                reader(name);
+                            }
+                        });
+                    }
+                }
+                deps.into_iter().collect()
+            })
+            .collect()
+    }
+
+    fn calculation_name_index(&self, name: &str, scope: Option<usize>) -> Option<usize> {
+        if !self.referenced_only_names {
+            return self.legacy_name_index(name, scope);
+        }
+        let (name, scope) = if let Some((sheet, name)) = name.rsplit_once('!') {
+            let sheet = sheet
+                .strip_prefix('\'')
+                .and_then(|s| s.strip_suffix('\''))
+                .unwrap_or(sheet)
+                .replace("''", "'");
+            let scope = *self
+                .calculation_name_index_map()
+                .sheets
+                .get(&sheet.to_lowercase())?;
+            (name, Some(scope))
+        } else {
+            (name, scope)
+        };
+        let index = self.calculation_name_index_map();
+        let key = name.to_lowercase();
+        let lookup = |scope| {
+            let ordinary = index
+                .names
+                .get(&(scope, key.clone()))
+                .and_then(|n| n.ordinary_first);
+            let legacy = index
+                .names
+                .get(&(scope, name.to_ascii_lowercase()))
+                .and_then(|n| n.legacy_first);
+            ordinary.into_iter().chain(legacy).min()
+        };
+        scope.and_then(|s| lookup(Some(s))).or_else(|| lookup(None))
+    }
+
+    fn calculation_name_index_map(&self) -> &CalculationNameIndex {
+        self.name_index.get_or_init(|| {
+            let mut index = CalculationNameIndex::default();
+            for (i, (name, _, scope)) in self.raw_calculation_names().iter().enumerate() {
+                if Self::cancellation_checkpoint(self.cancel.as_ref()).is_err() {
+                    return index;
+                }
+                let ascii = index
+                    .names
+                    .entry((*scope, name.to_ascii_lowercase()))
+                    .or_default();
+                // Generic import chooses the last ASCII match; strict import
+                // chooses the first match with Unicode folding for ordinary names.
+                ascii.legacy_last = Some(i);
+                if self.legacy_calculation_name(name) {
+                    ascii.legacy_first.get_or_insert(i);
+                } else {
+                    index
+                        .names
+                        .entry((*scope, name.to_lowercase()))
+                        .or_default()
+                        .ordinary_first
+                        .get_or_insert(i);
+                }
+            }
+            for (i, sheet) in self
+                .cached_names
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+            {
+                if Self::cancellation_checkpoint(self.cancel.as_ref()).is_err() {
+                    return index;
+                }
+                index.sheets.entry(sheet.to_lowercase()).or_insert(i);
+            }
+            index
+        })
+    }
+
+    fn legacy_name_index(&self, name: &str, scope: Option<usize>) -> Option<usize> {
+        let index = &self.calculation_name_index_map().names;
+        let key = name.to_ascii_lowercase();
+        index
+            .get(&(scope, key.clone()))
+            .and_then(|n| n.legacy_last)
+            .or_else(|| index.get(&(None, key)).and_then(|n| n.legacy_last))
+    }
+
+    fn legacy_calculation_name(&self, name: &str) -> bool {
+        let name = name.to_ascii_lowercase();
+        let legacy = name.starts_with("_xlnm.");
+        #[cfg(feature = "calamine")]
+        let legacy = legacy || self.skipped_external_names.contains(&name);
+        legacy
+    }
+
+    fn skippable_name_registration_error(&self, name: &str, error: &ExcelError) -> bool {
+        self.referenced_only_names
+            && !self.legacy_calculation_name(name)
+            && error.kind == ExcelErrorKind::Name
+            && error
+                .message()
+                .is_some_and(|m| m.starts_with("Invalid name: "))
+    }
+
+    fn reads_unregistrable_name(&self, ast: &ASTNode, scope: Option<usize>) -> bool {
+        let mut reads = false;
+        ast.visit_refs(|r| {
+            if let formualizer_parse::parser::RefView::NamedRange { name } = r
+                && let Some(i) = self.calculation_name_index(name, scope)
+            {
+                reads |= self
+                    .unregistrable_names
+                    .contains(&self.raw_calculation_names()[i].0.to_lowercase());
+            }
+        });
+        reads
+    }
+
+    fn calculation_name_analysis(&self) -> &CalculationNameAnalysis {
+        self.name_analysis.get_or_init(|| {
+            let dependencies = self.calculation_name_dependencies();
+            let mut reverse = vec![Vec::new(); dependencies.len()];
+            let mut seen = vec![false; dependencies.len()];
+            let mut finish = Vec::with_capacity(dependencies.len());
+            // Iterative postorder and reverse traversal identify exactly the
+            // strongly connected components, not names downstream of cycles.
+            for (root, deps) in dependencies.iter().enumerate() {
+                if Self::cancellation_checkpoint(self.cancel.as_ref()).is_err() {
+                    return CalculationNameAnalysis::default();
+                }
+                for &j in deps {
+                    reverse[j].push(root);
+                }
+                if seen[root] {
+                    continue;
+                }
+                seen[root] = true;
+                let mut stack = vec![(root, 0)];
+                while let Some((i, next)) = stack.last_mut() {
+                    if Self::cancellation_checkpoint(self.cancel.as_ref()).is_err() {
+                        return CalculationNameAnalysis::default();
+                    }
+                    if let Some(&j) = dependencies[*i].get(*next) {
+                        *next += 1;
+                        if !seen[j] {
+                            seen[j] = true;
+                            stack.push((j, 0));
+                        }
+                    } else {
+                        finish.push(*i);
+                        stack.pop();
+                    }
+                }
+            }
+            seen.fill(false);
+            let mut cyclic = HashSet::new();
+            for root in finish.into_iter().rev() {
+                if Self::cancellation_checkpoint(self.cancel.as_ref()).is_err() {
+                    return CalculationNameAnalysis::default();
+                }
+                if seen[root] {
+                    continue;
+                }
+                seen[root] = true;
+                let mut component = Vec::new();
+                let mut stack = vec![root];
+                while let Some(i) = stack.pop() {
+                    if Self::cancellation_checkpoint(self.cancel.as_ref()).is_err() {
+                        return CalculationNameAnalysis::default();
+                    }
+                    component.push(i);
+                    for &j in &reverse[i] {
+                        if !seen[j] {
+                            seen[j] = true;
+                            stack.push(j);
+                        }
+                    }
+                }
+                if component.len() > 1 || dependencies[root].contains(&root) {
+                    cyclic.extend(component);
+                }
+            }
+            CalculationNameAnalysis {
+                dependencies,
+                cyclic,
+            }
+        })
+    }
+
+    fn cyclic_calculation_names(&self) -> &HashSet<usize> {
+        &self.calculation_name_analysis().cyclic
+    }
+
+    #[cfg(feature = "xlsx-recalc")]
+    pub(crate) fn validate_calculation_names(
+        &mut self,
+        formulas: &[(String, String)],
+        admitted_inert_sheets: bool,
+    ) -> Result<(), crate::IoError> {
+        self.strict_calculation_names = true;
+        if !self.referenced_only_names {
+            self.name_analysis.take();
+            self.grounded_names.take();
+            self.referenced_only_names = true;
+        }
+        let references = |ast: &ASTNode, scope: Option<usize>, out: &mut HashSet<usize>| {
+            name_references::visit(ast, |name, indirect| {
+                if let Some(i) = self.calculation_name_index(name, scope) {
+                    let name = self.raw_calculation_names()[i].0.to_ascii_lowercase();
+                    // Retain the existing document/external-name policy.
+                    if !indirect
+                        || (!name.starts_with("_xlnm.")
+                            && !self.skipped_external_names.contains(&name))
+                    {
+                        out.insert(i);
+                    }
+                }
+            })
+        };
+        let fail = |name: &str| crate::IoError::Unsupported {
+            feature: "unsupported or cyclic calculation name".into(),
+            context: name.into(),
+        };
+        let raw = self.raw_calculation_names();
+        let mut used = HashSet::new();
+        let mut legacy_used = HashSet::new();
+        let legacy_references = |ast: &ASTNode, out: &mut HashSet<String>| {
+            ast.visit_refs(|r| {
+                if let formualizer_parse::parser::RefView::NamedRange { name } = r {
+                    out.insert(name.rsplit('!').next().unwrap_or(name).to_ascii_lowercase());
+                }
+            });
+        };
+        let cyclic = self.cyclic_calculation_names();
+        let newly_admitted = admitted_inert_sheets
+            || raw.iter().enumerate().any(|(i, (name, _, _))| {
+                !self.legacy_calculation_name(name)
+                    && (cyclic.contains(&i) || self.grounded_calculation_name(i).is_none())
+            });
+        let mut nonliteral = false;
+        for (sheet, f) in formulas {
+            Self::cancellation_checkpoint(self.cancel.as_ref())
+                .map_err(crate::IoError::Calamine)?;
+            if let Ok(ast) = formualizer_parse::parser::parse(format!(
+                "={}",
+                f.trim().strip_prefix('=').unwrap_or(f.trim())
+            )) {
+                let scope = self
+                    .cached_names
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .position(|s| s.to_lowercase() == sheet.to_lowercase());
+                nonliteral |= references(&ast, scope, &mut used);
+                legacy_references(&ast, &mut legacy_used);
+            }
+        }
+        if raw
+            .iter()
+            .any(|(name, _, _)| self.legacy_calculation_name(name))
+        {
+            for (_, text, _) in raw {
+                Self::cancellation_checkpoint(self.cancel.as_ref())
+                    .map_err(crate::IoError::Calamine)?;
+                if let Ok(ast) = formualizer_parse::parser::parse(format!(
+                    "={}",
+                    text.trim().trim_start_matches('=')
+                )) {
+                    legacy_references(&ast, &mut legacy_used);
+                }
+            }
+        }
+        for (i, (_, _, scope)) in raw.iter().enumerate() {
+            Self::cancellation_checkpoint(self.cancel.as_ref())
+                .map_err(crate::IoError::Calamine)?;
+            if !cyclic.contains(&i)
+                && let Some(ast) = self.grounded_calculation_name(i)
+            {
+                references(&ast, *scope, &mut used);
+            }
+        }
+        for (i, (name, _, scope)) in raw.iter().enumerate() {
+            Self::cancellation_checkpoint(self.cancel.as_ref())
+                .map_err(crate::IoError::Calamine)?;
+            let grounded = self.grounded_calculation_name(i).is_some();
+            let legacy = self.legacy_calculation_name(name);
+            if newly_admitted
+                && legacy
+                && let Some(ast) = self.grounded_calculation_name(i)
+            {
+                let mut unresolved = false;
+                ast.visit_refs(|r| {
+                    if let formualizer_parse::parser::RefView::NamedRange { name } = r {
+                        unresolved |= self.calculation_name_index(name, *scope).is_none();
+                    }
+                });
+                // Keep a previously masked legacy name failure a refusal.
+                // Legacy-only workbooks still use the original import path.
+                if unresolved {
+                    return Err(fail(name));
+                }
+            }
+            if legacy && !grounded && legacy_used.contains(&name.to_ascii_lowercase()) {
+                return Err(fail(name));
+            }
+            if used.contains(&i) || (legacy && grounded && cyclic.contains(&i)) {
+                if cyclic.contains(&i) {
+                    return Err(crate::IoError::Unsupported {
+                        feature: "cyclic calculation name".into(),
+                        context: name.clone(),
+                    });
+                }
+                if !grounded {
+                    return Err(fail(name));
+                }
+            }
+        }
+        if nonliteral && self.has_new_unimported_names() {
+            return Err(crate::IoError::Unsupported {
+                feature: "nonliteral INDIRECT in a workbook with unevaluable names".into(),
+                context: "calculation formula".into(),
+            });
+        }
+        self.calculation_name_order().map(|_| ())
+    }
+
+    #[cfg(feature = "xlsx-recalc")]
+    pub(crate) fn has_new_unimported_names(&self) -> bool {
+        self.unimported_document_names()
+            .iter()
+            .any(|name| !name.starts_with("_xlnm.") && !self.skipped_external_names.contains(name))
+    }
+
+    #[cfg(feature = "xlsx-recalc")]
+    pub(crate) fn calculation_name_asts(&self) -> Result<Vec<ASTNode>, crate::IoError> {
+        Ok(self
+            .calculation_name_order()?
+            .into_iter()
+            .filter_map(|i| self.grounded_calculation_name(i))
+            .collect())
+    }
+
+    fn calculation_name_order(&self) -> Result<Vec<usize>, crate::IoError> {
+        use std::collections::VecDeque;
+        let raw = self.raw_calculation_names();
+        let cyclic = self.cyclic_calculation_names();
+        let dependencies = &self.calculation_name_analysis().dependencies;
+        let mut pending = vec![0usize; raw.len()];
+        let mut readers = vec![Vec::new(); raw.len()];
+        for (i, _) in raw.iter().enumerate() {
+            Self::cancellation_checkpoint(self.cancel.as_ref())
+                .map_err(crate::IoError::Calamine)?;
+            if (self.referenced_only_names && cyclic.contains(&i))
+                || self.grounded_calculation_name(i).is_none()
+            {
+                if self.referenced_only_names {
+                    pending[i] = usize::MAX;
+                }
+                continue;
+            }
+            let deps = &dependencies[i];
+            pending[i] = deps.len();
+            for &j in deps {
+                readers[j].push(i);
+            }
+        }
+        let mut ready: VecDeque<_> = pending
+            .iter()
+            .enumerate()
+            .filter_map(|(i, n)| (*n == 0).then_some(i))
+            .collect();
+        let mut order = Vec::with_capacity(raw.len());
+        while let Some(i) = ready.pop_front() {
+            Self::cancellation_checkpoint(self.cancel.as_ref())
+                .map_err(crate::IoError::Calamine)?;
+            order.push(i);
+            for &reader in &readers[i] {
+                pending[reader] -= 1;
+                if pending[reader] == 0 {
+                    ready.push_back(reader);
+                }
+            }
+        }
+        if !self.referenced_only_names && order.len() != raw.len() {
+            return Err(crate::IoError::Unsupported {
+                feature: "cyclic calculation name".into(),
+                context: raw[pending.iter().position(|n| *n != 0).unwrap()].0.clone(),
+            });
+        }
+        Ok(order)
     }
 
     pub fn external_link_target(&self, index: u32) -> Option<&str> {
@@ -1493,10 +2432,41 @@ impl CalamineAdapter {
         if let Some(rest) = trimmed.strip_prefix('=') {
             trimmed = rest.trim();
         }
-        if trimmed.is_empty() || trimmed.contains(',') {
+        if trimmed.is_empty() {
             return None;
         }
 
+        let scope_sheet = local_sheet_id.and_then(|idx| sheet_names.get(idx).cloned());
+        if local_sheet_id.is_some() && scope_sheet.is_none() {
+            return None;
+        }
+        let literal = trimmed
+            .parse::<f64>()
+            .ok()
+            .filter(|n| n.is_finite())
+            .map(LiteralValue::Number)
+            .or_else(|| {
+                let ast = formualizer_parse::parser::parse(format!("={trimmed}")).ok()?;
+                match ast.node_type {
+                    formualizer_parse::parser::ASTNodeType::Literal(value) => Some(value),
+                    _ => None,
+                }
+            });
+        if let Some(value) = literal {
+            return Some(DefinedName {
+                name: name.to_owned(),
+                scope: if scope_sheet.is_some() {
+                    DefinedNameScope::Sheet
+                } else {
+                    DefinedNameScope::Workbook
+                },
+                scope_sheet,
+                definition: DefinedNameDefinition::Literal { value },
+            });
+        }
+        if super::has_union_comma(trimmed) {
+            return None;
+        }
         let reference = ReferenceType::from_string(trimmed).ok()?;
         let scope_sheet = local_sheet_id.and_then(|idx| sheet_names.get(idx).cloned());
         let scope = if scope_sheet.is_some() {
@@ -1605,7 +2575,7 @@ impl CalamineAdapter {
         out
     }
 
-    fn scan_defined_names_from_reader<R>(reader: R, sheet_names: &[String]) -> Vec<DefinedName>
+    fn scan_defined_names_from_reader<R>(reader: R) -> Vec<(String, String, Option<usize>)>
     where
         R: Read + Seek,
     {
@@ -1630,7 +2600,6 @@ impl CalamineAdapter {
         xml.config_mut().trim_text(false);
 
         let mut out = Vec::new();
-        let mut seen: HashSet<(DefinedNameScope, Option<String>, String)> = HashSet::new();
         let mut buf = Vec::new();
         let mut inner_buf = Vec::new();
         let mut in_defined_names = false;
@@ -1671,18 +2640,8 @@ impl CalamineAdapter {
                         }
                     }
 
-                    if let Some(name) = name
-                        && let Some(converted) =
-                            Self::convert_defined_name(&name, &value, local_sheet_id, sheet_names)
-                    {
-                        let key = (
-                            converted.scope.clone(),
-                            converted.scope_sheet.clone(),
-                            converted.name.clone(),
-                        );
-                        if seen.insert(key) {
-                            out.push(converted);
-                        }
+                    if let Some(name) = name {
+                        out.push((name, value, local_sheet_id));
                     }
                 }
                 Ok(Event::Eof) => break,
@@ -1767,30 +2726,22 @@ impl CalamineAdapter {
     }
 
     fn range_to_cells(
-        range: &Range<Data>,
-        formulas: Option<&Range<String>>,
+        values: &[((u32, u32), Data)],
+        formulas: Option<&[((u32, u32), String)]>,
         date_system: DateSystem,
     ) -> BTreeMap<(u32, u32), CellData> {
         let mut cells = BTreeMap::new();
 
-        // We use the cells() iterator which gives us actual positions
-
-        // Process values using actual positions
-
-        let start_row = range.start().unwrap_or_default().0 as usize;
-        let start_col = range.start().unwrap_or_default().1 as usize;
-
-        for (row, col, val) in range.used_cells() {
-            // Calamine uses 0-based indexing, convert to 1-based for Excel
-            let excel_row = (row + start_row + 1) as u32;
-            let excel_col = (col + start_col + 1) as u32;
+        for ((row, col), val) in values {
+            // Calamine uses 0-based indexing, convert to 1-based for Excel.
+            let excel_row = row.saturating_add(1);
+            let excel_col = col.saturating_add(1);
 
             // Convert value (skip empty cells and empty strings)
             let value = match val {
                 Data::Empty => None,
-                Data::String(s) if s.is_empty() => None, // Treat empty strings as no value
                 Data::String(s) => Some(LiteralValue::Text(s.clone())),
-                Data::Float(f) => Some(LiteralValue::Number(*f)),
+                Data::Float(f) => Some(number_literal(*f)),
                 Data::Int(i) => Some(LiteralValue::Int(*i)),
                 Data::Bool(b) => Some(LiteralValue::Boolean(*b)),
                 Data::Error(e) => {
@@ -1827,15 +2778,12 @@ impl CalamineAdapter {
         }
 
         // Process formulas using their actual positions
-        if let Some(frm_range) = formulas {
-            let start_row = frm_range.start().unwrap_or_default().0 as usize;
-            let start_col = frm_range.start().unwrap_or_default().1 as usize;
-
-            for (row, col, formula) in frm_range.used_cells() {
+        if let Some(formulas) = formulas {
+            for ((row, col), formula) in formulas {
                 if !formula.is_empty() {
                     // Convert to 1-based Excel coordinates
-                    let excel_row = (row + start_row + 1) as u32;
-                    let excel_col = (col + start_col + 1) as u32;
+                    let excel_row = row.saturating_add(1);
+                    let excel_col = col.saturating_add(1);
 
                     // Ensure formula starts with '=' for proper parsing
                     let formula_with_eq = if formula.starts_with('=') {
@@ -1889,11 +2837,64 @@ impl SpreadsheetReader for CalamineAdapter {
     }
 
     fn sheet_names(&self) -> Result<Vec<String>, Self::Error> {
-        Ok(self.cached_names.clone().unwrap_or_default())
+        Ok(self
+            .cached_names
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|name| !self.is_inert_sheet(name))
+            .collect())
+    }
+
+    fn cached_external_link_values(&mut self) -> Option<Arc<crate::CachedExternalLinkValues>> {
+        if !crate::cached_external_links::has_links(self.cancellable_reader()) {
+            return None;
+        }
+        let mut formulas = Vec::new();
+        for sheet in self.cached_names.as_deref().unwrap_or_default() {
+            if let Ok(cells) = self.workbook.write().worksheet_formulas(sheet) {
+                for ((row, col), text) in cells {
+                    formulas.push((
+                        sheet.clone(),
+                        row.saturating_add(1),
+                        col.saturating_add(1),
+                        text,
+                    ));
+                }
+            }
+        }
+        let options = crate::xlsx_cache_options::CacheOptions {
+            cancel: self.cancel.clone(),
+            ..Default::default()
+        };
+        let snapshot = Arc::new(crate::cached_external_links::load(
+            self.cancellable_reader(),
+            &formulas,
+            self.raw_calculation_names(),
+            &options,
+        ));
+        self.admit_external_references(snapshot.values.clone());
+        self.skip_external_names(snapshot.skipped_names.clone());
+        self.refused_external_names = snapshot.refused_names.clone();
+        for (sheet, row, col) in snapshot.refused_formulas.keys() {
+            self.refused_external_formulas
+                .entry(sheet.clone())
+                .or_default()
+                .insert((row - 1, col - 1));
+        }
+        Some(snapshot)
     }
 
     fn load_stats(&self) -> Option<AdapterLoadStats> {
         Some(self.load_stats.clone())
+    }
+
+    fn sheet_import_diagnostics(&self) -> Vec<crate::traits::SheetImportDiagnostic> {
+        self.sheet_import_diagnostics.clone()
+    }
+
+    fn name_import_diagnostics(&self) -> Vec<crate::traits::NameImportDiagnostic> {
+        self.name_import_diagnostics.clone()
     }
 
     fn defined_names(&mut self) -> Result<Vec<DefinedName>, Self::Error> {
@@ -1945,15 +2946,14 @@ impl SpreadsheetReader for CalamineAdapter {
     fn read_sheet(&mut self, sheet: &str) -> Result<SheetData, Self::Error> {
         // Values
         let mut wb = self.workbook.write();
-        let range = wb.worksheet_range(sheet)?;
-        // Formulas (same dims as range, may be empty strings)
-        let formulas = wb.worksheet_formula(sheet).ok();
+        let values = wb.worksheet_cells(sheet)?;
+        let formulas = wb.worksheet_formulas(sheet).ok();
 
-        let dims = (range.height() as u32, range.width() as u32);
+        let dims = sparse_extent(&values);
         // Calamine's ordinary reader API does not currently expose the
         // workbook date system at this boundary. Keep that policy explicit so
         // future metadata support only changes this selection point.
-        let cells = Self::range_to_cells(&range, formulas.as_ref(), DateSystem::Excel1900);
+        let cells = Self::range_to_cells(&values, formulas.as_deref(), DateSystem::Excel1900);
 
         self.loaded_sheets.insert(sheet.to_string());
 
@@ -1974,9 +2974,9 @@ impl SpreadsheetReader for CalamineAdapter {
 
     fn sheet_bounds(&self, sheet: &str) -> Option<(u32, u32)> {
         let mut wb = self.workbook.write();
-        wb.worksheet_range(sheet)
+        wb.worksheet_cells(sheet)
             .ok()
-            .map(|r| (r.height() as u32, r.width() as u32))
+            .map(|cells| sparse_extent(&cells))
     }
 
     fn is_loaded(&self, sheet: &str, _row: Option<u32>, _col: Option<u32>) -> bool {
@@ -2012,6 +3012,13 @@ where
             .is_some_and(|v| v != "0");
         let t0 = DebugTimer::start();
         let names = self.sheet_names()?;
+        let scope_names = self.cached_names.clone().unwrap_or_default();
+        let ordinary_name_import = !self.strict_calculation_names;
+        if ordinary_name_import && !self.referenced_only_names {
+            self.name_analysis.take();
+            self.grounded_names.take();
+            self.referenced_only_names = true;
+        }
         if debug {
             eprintln!("[fz][load] calamine: {} sheets", names.len());
         }
@@ -2034,6 +3041,15 @@ where
         let prev_range_limit = engine.config.range_expansion_limit;
         engine.config.range_expansion_limit = 0;
         let prev_first_load = engine.first_load_assume_new();
+        let prev_deferred = engine.config.defer_graph_building;
+        let prev_formula_plane = engine.config.formula_plane_mode;
+        if self.external_values.is_some() {
+            // Cached sources need the per-cell dependency ingestion path.
+            engine.config.formula_plane_mode = formualizer_eval::engine::FormulaPlaneMode::Off;
+        }
+        if !self.refused_external_formulas.is_empty() {
+            engine.config.defer_graph_building = false;
+        }
         engine.set_first_load_assume_new(true);
         engine.reset_ensure_touched();
 
@@ -2076,6 +3092,11 @@ where
                         engine,
                         sheet_instance as u32,
                         StreamWorksheetOptions {
+                            refused_external_formulas: self
+                                .refused_external_formulas
+                                .get(n)
+                                .cloned()
+                                .unwrap_or_default(),
                             chunk_rows,
                             debug,
                             workbook_spool_usage: WorkbookSpoolUsage {
@@ -2215,11 +3236,43 @@ where
                 use rustc_hash::FxHashSet;
 
                 Self::cancellation_checkpoint(cancel.as_ref())?;
-                let defined = self.defined_names()?;
+                let mut defined: Vec<_> = if !self.referenced_only_names {
+                    self.defined_names()?
+                } else {
+                    self.calculation_name_order()
+                        .map_err(|e| calamine::Error::Io(std::io::Error::other(e.to_string())))?
+                        .into_iter()
+                        .filter_map(|i| {
+                            let (name, text, scope) = &self.raw_calculation_names()[i];
+                            Self::convert_defined_name(name, text, *scope, &scope_names)
+                        })
+                        .collect()
+                };
+                if self.referenced_only_names {
+                    // Keep legacy document-name range/literal import unchanged,
+                    // including malformed ranges that create a missing sheet.
+                    defined.extend(
+                        self.defined_names()?
+                            .into_iter()
+                            .filter(|dn| dn.name.to_ascii_lowercase().starts_with("_xlnm.")),
+                    );
+                }
                 let mut seen: FxHashSet<(DefinedNameScope, Option<String>, String)> =
                     FxHashSet::default();
 
                 for dn in defined {
+                    if dn
+                        .scope_sheet
+                        .as_deref()
+                        .is_some_and(|s| self.is_inert_sheet(s))
+                    {
+                        continue;
+                    }
+                    if let DefinedNameDefinition::Range { address } = &dn.definition
+                        && self.is_inert_sheet(&address.sheet)
+                    {
+                        continue;
+                    }
                     Self::cancellation_checkpoint(cancel.as_ref())?;
                     let key = (dn.scope.clone(), dn.scope_sheet.clone(), dn.name.clone());
                     if !seen.insert(key) {
@@ -2261,13 +3314,21 @@ where
                             let er0 = address.end_row.saturating_sub(1);
                             let ec0 = address.end_col.saturating_sub(1);
 
-                            let start_ref =
-                                CellRef::new(sheet_id, Coord::new(sr0, sc0, true, true));
+                            // A range past the grid (a built-in `_xlnm.Print_Area`
+                            // ending at row 1048577, say) is left undefined, as an
+                            // ordinary name with such a range is: references to it
+                            // are #NAME?.
+                            let (Ok(start), Ok(end)) = (
+                                Coord::try_new(sr0, sc0, true, true),
+                                Coord::try_new(er0, ec0, true, true),
+                            ) else {
+                                continue;
+                            };
+                            let start_ref = CellRef::new(sheet_id, start);
                             if sr0 == er0 && sc0 == ec0 {
                                 NamedDefinition::Cell(start_ref)
                             } else {
-                                let end_ref =
-                                    CellRef::new(sheet_id, Coord::new(er0, ec0, true, true));
+                                let end_ref = CellRef::new(sheet_id, end);
                                 let range_ref =
                                     formualizer_eval::reference::RangeRef::new(start_ref, end_ref);
                                 NamedDefinition::Range(range_ref)
@@ -2276,9 +3337,127 @@ where
                         DefinedNameDefinition::Literal { value } => NamedDefinition::Literal(value),
                     };
 
-                    engine
-                        .define_name(&dn.name, definition, scope)
-                        .map_err(|e| calamine::Error::Io(std::io::Error::other(e.to_string())))?;
+                    if let Err(error) = engine.define_name(&dn.name, definition, scope) {
+                        if self.skippable_name_registration_error(&dn.name, &error) {
+                            self.unregistrable_names.insert(dn.name.to_lowercase());
+                        } else {
+                            return Err(calamine::Error::Io(std::io::Error::other(
+                                error.to_string(),
+                            )));
+                        }
+                    }
+                }
+            }
+
+            // Formula-valued names remain private to Calamine calculation import;
+            // Engine::define_name owns cell/range/name dependency registration and
+            // rebinds formulas that were ingested before these definitions.
+            for index in self
+                .calculation_name_order()
+                .map_err(|e| calamine::Error::Io(std::io::Error::other(e.to_string())))?
+            {
+                let (name, text, local) = &self.raw_calculation_names()[index];
+                Self::cancellation_checkpoint(cancel.as_ref())?;
+                if Self::convert_defined_name(name, text, *local, &scope_names).is_some() {
+                    continue;
+                }
+                let Some(ast) = self.grounded_calculation_name(index) else {
+                    continue;
+                };
+                if self.referenced_only_names && self.reads_unregistrable_name(&ast, *local) {
+                    // Leave the evaluated reader for the post-ingest name guard,
+                    // rather than surfacing a masked name failure as an I/O error.
+                    continue;
+                }
+                let scope = match local {
+                    Some(id) => {
+                        NameScope::Sheet(engine.sheet_id(&scope_names[*id]).ok_or_else(|| {
+                            calamine::Error::Io(std::io::Error::other("name scope sheet missing"))
+                        })?)
+                    }
+                    None => NameScope::Workbook,
+                };
+                if let Err(error) = engine.define_name(
+                    name,
+                    NamedDefinition::Formula {
+                        ast,
+                        dependencies: Vec::new(),
+                        range_deps: Vec::new(),
+                    },
+                    scope,
+                ) {
+                    if self.skippable_name_registration_error(name, &error) {
+                        let name = name.to_lowercase();
+                        self.unregistrable_names.insert(name);
+                    } else {
+                        return Err(calamine::Error::Io(std::io::Error::other(
+                            error.to_string(),
+                        )));
+                    }
+                }
+            }
+
+            if ordinary_name_import {
+                let imported: HashSet<_> = self
+                    .calculation_name_order()
+                    .map_err(|e| calamine::Error::Io(std::io::Error::other(e.to_string())))?
+                    .into_iter()
+                    .collect();
+                self.name_import_diagnostics = self
+                    .raw_calculation_names()
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, (name, _, _))| {
+                        self.inert_scope(self.raw_calculation_names()[*i].2)
+                            || (!self.legacy_calculation_name(name) && !imported.contains(i))
+                    })
+                    .map(
+                        |(_, (name, text, local))| crate::traits::NameImportDiagnostic {
+                            name: name.clone(),
+                            definition: text.clone(),
+                            scope_sheet: local.and_then(|i| scope_names.get(i).cloned()),
+                            local_sheet_id: *local,
+                            message: if self.inert_scope(*local) {
+                                "Defined name scoped to an omitted non-worksheet sheet".into()
+                            } else {
+                                "Unevaluable or cyclic defined name omitted from calculation".into()
+                            },
+                        },
+                    )
+                    .collect();
+                for diagnostic in &self.name_import_diagnostics {
+                    if diagnostic.local_sheet_id.is_some() && diagnostic.scope_sheet.is_none() {
+                        continue;
+                    }
+                    let scope = match diagnostic.scope_sheet.as_deref() {
+                        Some(sheet) => {
+                            let Some(id) = engine.sheet_id(sheet) else {
+                                continue;
+                            };
+                            NameScope::Sheet(id)
+                        }
+                        None => NameScope::Workbook,
+                    };
+                    let error = formualizer_common::ExcelError::new(
+                        formualizer_common::ExcelErrorKind::Name,
+                    )
+                    .with_message(format!(
+                        "Defined name `{}` could not be evaluated",
+                        diagnostic.name
+                    ));
+                    // Retain only the failed key/scope, not the rejected definition.
+                    // Otherwise an omitted local name could fall back to a global
+                    // definition after an edit or an INDIRECT lookup.
+                    if let Err(error) = engine.define_name(
+                        &diagnostic.name,
+                        NamedDefinition::Literal(LiteralValue::Error(error)),
+                        scope,
+                    ) && !self.skippable_name_registration_error(&diagnostic.name, &error)
+                    {
+                        return Err(calamine::Error::Io(std::io::Error::other(
+                            error.to_string(),
+                        )));
+                    }
                 }
             }
 
@@ -2288,6 +3467,10 @@ where
                     total_values,
                     total_formulas,
                     t0.elapsed_millis(),
+                );
+                eprintln!(
+                    "[fz][families] {}",
+                    engine.source_family_counters().debug_line()
                 );
             }
             for n in &names {
@@ -2310,6 +3493,8 @@ where
         engine.reset_ensure_touched();
         engine.set_sheet_index_mode(prev_index_mode);
         engine.config.range_expansion_limit = prev_range_limit;
+        engine.config.defer_graph_building = prev_deferred;
+        engine.config.formula_plane_mode = prev_formula_plane;
         load_result
     }
 }
@@ -2467,6 +3652,92 @@ mod tests {
             CalamineAdapter::open_path_with_source(file.path(), XlsxPathSource::DirectMmap)
                 .unwrap();
         assert!(matches!(adapter.source, SharedXlsxReader::Mapped { .. }));
+    }
+
+    fn name_analysis_adapter(names: Vec<(String, String, Option<usize>)>) -> CalamineAdapter {
+        let mut adapter = CalamineAdapter::open_bytes(metadata_fixture()).unwrap();
+        adapter.calculation_names = OnceLock::from(names);
+        adapter.referenced_only_names = true;
+        adapter
+    }
+
+    #[test]
+    fn name_analysis_cycles_scopes_and_stable_order() {
+        let mut adapter = name_analysis_adapter(vec![
+            ("First".into(), "Second+1".into(), None),
+            ("Second".into(), "Root+1".into(), None),
+            ("Root".into(), "1".into(), None),
+            ("SelfCycle".into(), "SelfCycle".into(), None),
+            ("CycleA".into(), "CycleB".into(), None),
+            ("CycleB".into(), "CycleA".into(), None),
+            ("Downstream".into(), "CycleA".into(), None),
+            ("Ñame.x\\y".into(), "2".into(), None),
+            ("Ñame.x\\y".into(), "3".into(), Some(0)),
+        ]);
+        adapter.cached_names = Some(vec!["Dáta".into()]);
+        assert_eq!(
+            adapter.calculation_name_index("ñame.x\\y", Some(0)),
+            Some(8)
+        );
+        assert_eq!(
+            adapter.calculation_name_index("'dáta'!ñame.x\\y", None),
+            Some(8)
+        );
+        assert_eq!(adapter.calculation_name_index("ñame.x\\y", None), Some(7));
+        assert_eq!(
+            adapter.cyclic_calculation_names(),
+            &HashSet::from([3, 4, 5])
+        );
+        assert_eq!(
+            adapter.calculation_name_order().unwrap(),
+            vec![2, 7, 8, 1, 0]
+        );
+        let analysis = adapter.calculation_name_analysis() as *const _;
+        assert_eq!(analysis, adapter.calculation_name_analysis() as *const _);
+    }
+
+    #[test]
+    fn name_analysis_preserves_legacy_lookup_and_registration_filtering() {
+        let mut adapter = name_analysis_adapter(vec![
+            ("Root".into(), "1".into(), None),
+            ("ROOT".into(), "2".into(), None),
+            ("Root".into(), "3".into(), Some(0)),
+            ("Root".into(), "4".into(), Some(0)),
+            ("_xlnm.Ñame".into(), "5".into(), None),
+        ]);
+        assert_eq!(adapter.calculation_name_index("root", None), Some(0));
+        assert_eq!(adapter.calculation_name_index("root", Some(0)), Some(2));
+        assert_eq!(adapter.calculation_name_index("_xlnm.ñame", None), None);
+        let analysis = adapter.calculation_name_analysis() as *const _;
+        adapter.unregistrable_names.insert("root".into());
+        assert!(adapter.grounded_calculation_name(0).is_none());
+        assert_eq!(analysis, adapter.calculation_name_analysis() as *const _);
+        adapter.referenced_only_names = false;
+        adapter.grounded_names.take();
+        adapter.name_analysis.take();
+        assert_eq!(adapter.calculation_name_index("root", None), Some(1));
+        assert_eq!(adapter.calculation_name_index("root", Some(0)), Some(3));
+        assert_eq!(
+            adapter.calculation_name_order().unwrap(),
+            vec![0, 1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn calculation_name_chain_analysis_scales_linearly() {
+        let count = 5_000;
+        let mut names: Vec<_> = (0..count - 1)
+            .map(|i| (format!("nm_{i}"), format!("nm_{}+1", i + 1), None))
+            .collect();
+        names.push((format!("nm_{}", count - 1), "1".into(), None));
+        let adapter = name_analysis_adapter(names);
+        let started = std::time::Instant::now();
+        assert!(adapter.cyclic_calculation_names().is_empty());
+        assert_eq!(
+            adapter.calculation_name_order().unwrap(),
+            (0..count).rev().collect::<Vec<_>>()
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 
     #[test]
@@ -2730,7 +4001,7 @@ mod tests {
     fn new_calamine_error_variants_preserve_generic_error_semantics() {
         let error = calamine::CellErrorType::GettingData;
         assert!(matches!(
-            data_ref_to_literal(&DataRef::Error(error.clone()), DateSystem::Excel1900),
+            data_ref_to_literal(&DataRef::Error(error.clone())),
             Some(LiteralValue::Error(ref value)) if value.kind == ExcelErrorKind::Error
         ));
         assert!(matches!(

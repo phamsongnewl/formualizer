@@ -65,10 +65,10 @@ impl<'a, R: EvaluationContext> DynamicRefCollector<'a, R> {
                 continue;
             }
             match self.engine.graph.get_vertex_kind(u) {
-                VertexKind::FormulaScalar | VertexKind::FormulaArray => {
-                    if self.engine.graph.is_dirty(u) || self.engine.graph.is_volatile(u) {
-                        out.insert(u);
-                    }
+                VertexKind::FormulaScalar | VertexKind::FormulaArray
+                    if (self.engine.graph.is_dirty(u) || self.engine.graph.is_volatile(u)) =>
+                {
+                    out.insert(u);
                 }
                 _ => {}
             }
@@ -220,6 +220,10 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
         self.engine.cancellation_token()
     }
 
+    fn materialized_array_cells(&self) -> u64 {
+        self.engine.materialized_array_cells()
+    }
+
     fn resolve_cell_format(
         &self,
         sheet: Option<&str>,
@@ -291,6 +295,31 @@ impl<'a, R: EvaluationContext> EvaluationContext for DynamicRefCollector<'a, R> 
         }
 
         self.engine.resolve_range_view(reference, current_sheet)
+    }
+
+    fn resolve_spill_reference(
+        &self,
+        anchor: &ReferenceType,
+        current_sheet: &str,
+    ) -> Result<ReferenceType, ExcelError> {
+        // The anchor is a dependency whether or not it currently spills.
+        match anchor {
+            ReferenceType::Cell {
+                sheet, row, col, ..
+            } => {
+                let sheet_name = sheet.as_deref().unwrap_or(current_sheet);
+                self.collect_formula_vertices_in_rect(sheet_name, *row, *col, *row, *col);
+            }
+            ReferenceType::NamedRange(name) => {
+                if let Some(sheet_id) = self.engine.sheet_id(current_sheet)
+                    && let Some(named) = self.engine.graph.resolve_name_entry(name, sheet_id)
+                {
+                    self.collected.lock().unwrap().insert(named.vertex);
+                }
+            }
+            _ => {}
+        }
+        self.engine.resolve_spill_reference(anchor, current_sheet)
     }
 }
 
@@ -365,12 +394,11 @@ impl RangeVirtualDepProvider {
                             continue;
                         }
                         match engine.graph.get_vertex_kind(u) {
-                            VertexKind::FormulaScalar | VertexKind::FormulaArray => {
+                            VertexKind::FormulaScalar | VertexKind::FormulaArray
                                 if (engine.graph.is_dirty(u) || engine.graph.is_volatile(u))
-                                    && u != v
-                                {
-                                    deps.push(u);
-                                }
+                                    && u != v =>
+                            {
+                                deps.push(u);
                             }
                             _ => {}
                         }
@@ -486,7 +514,14 @@ impl DynamicRefVirtualDepProvider {
             .graph
             .get_cell_ref(v)
             .unwrap_or_else(|| engine.graph.make_cell_ref(sheet_name, 0, 0));
+        // This query is public and may run outside an evaluation request, when
+        // the per-request function table can be empty or stale: use it only
+        // when it is current, otherwise resolve through the provider.
         let interpreter = Interpreter::new_with_cell(&collector, sheet_name, cell_ref);
+        let interpreter = match engine.current_resolved_functions() {
+            Some(table) => interpreter.with_resolved_functions(table),
+            None => interpreter,
+        };
         let _ = interpreter.evaluate_formula_view(
             view,
             engine.graph.data_store(),
@@ -529,5 +564,41 @@ impl DynamicRefVirtualDepProvider {
         v: VertexId,
     ) -> Vec<Region> {
         Self::collect(engine, v).1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DynamicRefVirtualDepProvider;
+    use crate::engine::{Engine, EvalConfig};
+    use crate::test_workbook::TestWorkbook;
+
+    /// The query is public and may run before any evaluation request has
+    /// refreshed the per-request function table.
+    #[test]
+    fn virtual_deps_before_any_evaluation_request() {
+        crate::builtins::load_builtins();
+        let mut engine = Engine::new(TestWorkbook::new(), EvalConfig::default());
+        engine.add_sheet("S").expect("sheet");
+        engine
+            .set_cell_formula("S", 1, 1, formualizer_parse::parse("=42").expect("parse"))
+            .expect("A1");
+        engine
+            .set_cell_formula(
+                "S",
+                1,
+                2,
+                formualizer_parse::parse("=INDIRECT(\"A1\")+0").expect("parse"),
+            )
+            .expect("B1");
+        let found: usize = engine
+            .evaluation_vertices()
+            .into_iter()
+            .map(|v| DynamicRefVirtualDepProvider::get_virtual_deps(&engine, v).len())
+            .sum();
+        assert!(
+            found > 0,
+            "INDIRECT's target must be found before the first request"
+        );
     }
 }

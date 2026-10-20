@@ -1,6 +1,6 @@
 [package]
 name = "formualizer-parse"
-version = "3.1.4"
+version = "4.0.0"
 edition = "2024"
 description = "High-performance Excel/OpenFormula tokenizer + parser with a stable AST surface"
 homepage.workspace = true
@@ -10,6 +10,9 @@ documentation.workspace = true
 readme = "README.md"
 keywords = ["spreadsheet", "excel", "formula", "parser", "tokenizer"]
 categories = ["parser-implementations", "text-processing"]
+
+[lints]
+workspace = true
 
 [features]
 default = []

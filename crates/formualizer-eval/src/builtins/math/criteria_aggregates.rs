@@ -1,12 +1,10 @@
 use super::super::utils::{ARG_ANY_ONE, coerce_num, criteria_match};
 use super::{AggregateArgument, resolve_aggregate_argument};
 use crate::args::ArgSchema;
-use crate::compute_prelude::{boolean, cmp, filter_array};
+use crate::compute_prelude::{boolean, cmp};
 use crate::function::Function;
 use crate::function_contract::{CriteriaValueRange, FunctionArityRule, FunctionDependencyContract};
 use crate::traits::{ArgumentHandle, FunctionContext};
-use arrow::compute::kernels::aggregate::sum_array;
-use arrow_array::types::Float64Type;
 use arrow_array::{Array as _, BooleanArray, Float64Array};
 use formualizer_common::{ExcelError, LiteralValue};
 use formualizer_macros::func_caps;
@@ -394,6 +392,14 @@ fn eval_if_family<'a, 'b>(
                 .as_ref()
                 .map(|v| v.slice_numbers(row_start, row_len));
 
+            // Preserve row positions while building each column's criteria mask.
+            let mut contributions = if agg_type == AggregationType::Count {
+                Vec::new()
+            } else {
+                // Unmatched columns share this immutable all-null lane.
+                let empty = std::sync::Arc::new(Float64Array::new_null(row_len));
+                vec![empty; dims.1]
+            };
             for c in 0..dims.1 {
                 let mut mask_opt: Option<BooleanArray> = None;
                 let mut impossible = false;
@@ -517,8 +523,8 @@ fn eval_if_family<'a, 'b>(
                                         if m0.null_count() == 0 {
                                             m0
                                         } else {
-                                            // Fill nulls using per-cell matching so blanks can still match numeric
-                                            // criteria (e.g. blank == 0 in Excel criteria semantics).
+                                            // Fill nulls using per-cell matching so numeric text can still match
+                                            // numeric criteria ("5" == 5); blanks never equal a number.
                                             let view = crit_specs[j].0.as_ref().unwrap();
                                             let mut bb =
                                                 arrow_array::builder::BooleanBuilder::with_capacity(
@@ -539,7 +545,7 @@ fn eval_if_family<'a, 'b>(
                                     } else {
                                         // If the criteria range has no numeric fast-path column (e.g. text column
                                         // or mixed types), fall back to per-cell matching so numeric criteria can
-                                        // still match blanks / numeric text values (Excel semantics).
+                                        // still match numeric text values (Excel semantics).
                                         let mut bb =
                                             arrow_array::builder::BooleanBuilder::with_capacity(
                                                 row_len,
@@ -761,20 +767,28 @@ fn eval_if_family<'a, 'b>(
                                 .as_ref()
                                 .and_then(|cols| cols.get(c).and_then(|a| a.as_ref()));
                             if let Some(tc) = target_col {
-                                let filtered = filter_array(tc.as_ref(), &mask).unwrap();
-                                let f64_arr =
-                                    filtered.as_any().downcast_ref::<Float64Array>().unwrap();
-                                if let Some(s) = sum_array::<Float64Type, _>(f64_arr) {
-                                    total_sum += s;
+                                let selected = Float64Array::from_iter(tc.iter().enumerate().map(
+                                    |(i, value)| {
+                                        value.filter(|_| mask.is_valid(i) && mask.value(i))
+                                    },
+                                ));
+                                total_count += (selected.len() - selected.null_count()) as i64;
+                                if let Some(slot) = contributions.get_mut(c) {
+                                    *slot = std::sync::Arc::new(selected);
                                 }
-                                total_count += f64_arr.len() as i64 - f64_arr.null_count() as i64;
                             } else if let Some(ref s) = sum_scalar
                                 && let Ok(n) = coerce_num(s)
                             {
                                 let count = (0..mask.len())
                                     .filter(|&i| mask.is_valid(i) && mask.value(i))
                                     .count() as i64;
-                                total_sum += n * count as f64;
+                                if let Some(slot) = contributions.get_mut(c) {
+                                    *slot = std::sync::Arc::new(Float64Array::from_iter(
+                                        (0..row_len).map(|i| {
+                                            (mask.is_valid(i) && mask.value(i)).then_some(n)
+                                        }),
+                                    ));
+                                }
                                 total_count += count;
                             }
                         }
@@ -788,20 +802,24 @@ fn eval_if_family<'a, 'b>(
                                 .as_ref()
                                 .and_then(|cols| cols.get(c).and_then(|a| a.as_ref()));
                             if let Some(tc) = target_col {
-                                if let Some(s) = sum_array::<Float64Type, _>(tc.as_ref()) {
-                                    total_sum += s;
+                                if let Some(slot) = contributions.get_mut(c) {
+                                    *slot = tc.clone();
                                 }
                                 total_count += tc.len() as i64 - tc.null_count() as i64;
                             } else if let Some(ref s) = sum_scalar
                                 && let Ok(n) = coerce_num(s)
                             {
-                                total_sum += n * row_len as f64;
+                                if let Some(slot) = contributions.get_mut(c) {
+                                    *slot =
+                                        std::sync::Arc::new(Float64Array::from(vec![n; row_len]));
+                                }
                                 total_count += row_len as i64;
                             }
                         }
                     }
                 }
             }
+            super::aggregate::add_number_columns(&mut total_sum, &contributions);
         }
         // COUNTIF's logical range can extend beyond physically stored rows.
         // Every cell in that tail is Empty: account for it arithmetically,
@@ -829,7 +847,9 @@ fn eval_if_family<'a, 'b>(
             } else if let Some(ref s) = sum_scalar
                 && let Ok(n) = coerce_num(s)
             {
-                total_sum = n * (dims.0 * dims.1) as f64;
+                for _ in 0..dims.0 * dims.1 {
+                    total_sum += n;
+                }
                 total_count = (dims.0 * dims.1) as i64;
             }
         }
@@ -1692,7 +1712,7 @@ impl Function for CountBlankFn {
                         let (_, _, tag_cols) = tag_res?;
                         let (_, _, text_cols) = text_res?;
 
-                        for (tc, xc) in tag_cols.into_iter().zip(text_cols.into_iter()) {
+                        for (tc, xc) in tag_cols.into_iter().zip(text_cols) {
                             visited_cells += tc.len() as u64;
                             let text_arr = xc
                                 .as_any()
@@ -1933,9 +1953,10 @@ mod tests {
     }
 
     #[test]
-    fn sumif_numeric_zero_matches_blank_in_text_column() {
-        // Regression test: if the criteria range is text-typed (no numeric fast-path column),
-        // numeric criteria should still match blanks (Excel semantics: blank coerces to 0).
+    fn sumif_numeric_zero_skips_blank_in_text_column() {
+        // If the criteria range is text-typed (no numeric fast-path column), the
+        // per-cell fallback applies Excel's rule: a number criterion never matches
+        // a blank cell (COUNTIF(range,0) does not count blanks).
         let wb = TestWorkbook::new().with_function(std::sync::Arc::new(SumIfFn));
         let ctx = interp(&wb);
 
@@ -1960,7 +1981,7 @@ mod tests {
             f.dispatch(&args, &ctx.function_context(None))
                 .unwrap()
                 .into_literal(),
-            LiteralValue::Number(5.0)
+            LiteralValue::Number(0.0)
         );
     }
 
